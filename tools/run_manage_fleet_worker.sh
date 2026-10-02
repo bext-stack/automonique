@@ -33,6 +33,49 @@ if (( max_concurrency < 1 || max_concurrency > 8 || poll_seconds < 1 || heartbea
     exit 2
 fi
 
+# Wall-clock limit of one provider run, in seconds. An invalid or out-of-range
+# value falls back to the default rather than stopping the worker.
+job_timeout_seconds=${AUTOMONIQUE_FLEET_JOB_TIMEOUT_SECONDS:-7200}
+if [[ ! "$job_timeout_seconds" =~ ^[1-9][0-9]{2,4}$ ]] \
+    || (( job_timeout_seconds < 300 || job_timeout_seconds > 21600 )); then
+    job_timeout_seconds=7200
+fi
+# How long a stopped run gets between TERM and KILL.
+kill_grace_seconds=20
+
+# Memory guard: no new job is claimed while the host has less available memory
+# than this many MiB, or while the 10 second "some" memory pressure average is
+# above this percentage. 0 disables the corresponding check.
+min_available_mb=${AUTOMONIQUE_FLEET_MIN_AVAILABLE_MB:-6144}
+[[ "$min_available_mb" =~ ^(0|[1-9][0-9]{0,7})$ ]] || min_available_mb=6144
+max_memory_pressure=${AUTOMONIQUE_FLEET_MAX_MEMORY_PRESSURE:-20}
+[[ "$max_memory_pressure" =~ ^(0|[1-9][0-9]?|100)([.][0-9]{1,2})?$ ]] || max_memory_pressure=20
+meminfo_path=/proc/meminfo
+memory_pressure_path=/proc/pressure/memory
+
+# Test hooks, for the executable tests of this script only. They exist because
+# a test cannot wait five minutes for the smallest production limit nor starve
+# its host of memory. Never set them on a real worker.
+if [[ "${AUTOMONIQUE_FLEET_TEST_JOB_TIMEOUT_SECONDS:-}" =~ ^[1-9][0-9]{0,4}$ ]]; then
+    job_timeout_seconds=$AUTOMONIQUE_FLEET_TEST_JOB_TIMEOUT_SECONDS
+fi
+if [[ "${AUTOMONIQUE_FLEET_TEST_KILL_GRACE_SECONDS:-}" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    kill_grace_seconds=$AUTOMONIQUE_FLEET_TEST_KILL_GRACE_SECONDS
+fi
+if [[ "${AUTOMONIQUE_FLEET_TEST_MEMINFO_PATH:-}" == /* ]]; then
+    meminfo_path=$AUTOMONIQUE_FLEET_TEST_MEMINFO_PATH
+fi
+if [[ "${AUTOMONIQUE_FLEET_TEST_MEMORY_PRESSURE_PATH:-}" == /* ]]; then
+    memory_pressure_path=$AUTOMONIQUE_FLEET_TEST_MEMORY_PRESSURE_PATH
+fi
+
+# Every provider run gets its own session so that stopping it reaches its
+# children and nothing else.
+if ! command -v setsid >/dev/null 2>&1; then
+    printf '%s\n' 'setsid (util-linux) is required to isolate provider runs' >&2
+    exit 2
+fi
+
 fleet_config=$state_dir/support/fleet.conf
 provider_config=$state_dir/provider
 runtime_dir=$state_dir/manage-fleet-worker
@@ -641,11 +684,68 @@ active_jobs() {
 
 refresh_process_snapshot || true
 
+# "12.3" -> 1230. Fails on anything that is not a small non-negative decimal.
+hundredths() {
+    local whole fraction
+    [[ "$1" =~ ^([0-9]{1,6})([.]([0-9]{1,2})[0-9]*)?$ ]] || return 1
+    whole=${BASH_REMATCH[1]}
+    fraction=${BASH_REMATCH[3]:-0}
+    [[ ${#fraction} -eq 2 ]] || fraction=${fraction}0
+    printf '%s' "$(( 10#$whole * 100 + 10#$fraction ))"
+}
+max_memory_pressure_hundredths=$(hundredths "$max_memory_pressure") || max_memory_pressure_hundredths=2000
+
+# Sets memory_wait to a plain-words reason when the host is too short of memory
+# to start another provider run, and to the empty string otherwise. Reads two
+# small kernel files with shell builtins only, so it is cheap enough for every
+# poll. A file that is missing or unreadable is not evidence of pressure.
+#
+# Once engaged the guard lifts only with a margin (a tenth more memory, a fifth
+# less pressure), so a host sitting on a threshold does not flap every poll.
+memory_wait=
+check_memory_guard() {
+    local key value rest available_kb='' tenths pressure='' pressure_hundredths
+    local floor_kb=$(( min_available_mb * 1024 )) ceiling=$max_memory_pressure_hundredths
+    if [[ -n "$memory_wait" ]]; then
+        floor_kb=$(( floor_kb + floor_kb / 10 ))
+        ceiling=$(( ceiling * 4 / 5 ))
+    fi
+    memory_wait=
+    if (( min_available_mb > 0 )) && [[ -r "$meminfo_path" ]]; then
+        while read -r key value rest; do
+            if [[ "$key" == MemAvailable: ]]; then
+                available_kb=$value
+                break
+            fi
+        done <"$meminfo_path"
+        if [[ "$available_kb" =~ ^[0-9]{1,15}$ ]] \
+            && (( 10#$available_kb < floor_kb )); then
+            tenths=$(( 10#$available_kb * 10 / 1048576 ))
+            memory_wait="waiting for memory: $(( tenths / 10 )).$(( tenths % 10 )) GB available"
+            return
+        fi
+    fi
+    if (( max_memory_pressure_hundredths > 0 )) && [[ -r "$memory_pressure_path" ]]; then
+        while read -r key rest; do
+            if [[ "$key" == some && "$rest" =~ avg10=([0-9]+([.][0-9]+)?) ]]; then
+                pressure=${BASH_REMATCH[1]}
+                break
+            fi
+        done <"$memory_pressure_path"
+        if pressure_hundredths=$(hundredths "$pressure") \
+            && (( pressure_hundredths > ceiling )); then
+            memory_wait="waiting for memory: pressure ${pressure}% over the last 10 seconds"
+        fi
+    fi
+}
+
 heartbeat() {
     status=$1
     active=$2
     auth_status=$(auth_health_status)
     detail="Monique ${selected_provider} worker: ${active}/${max_concurrency} active; auth ${auth_status}"
+    # Say why nothing starts while the memory guard holds claims back.
+    [[ -z "$memory_wait" ]] || detail="$detail; $memory_wait"
     body=$(jq -cn \
         --arg id "$fleet_instance" \
         --arg status "$status" \
@@ -669,14 +769,104 @@ report_job() {
     status=$2
     result=$3
     session_id=${4:-}
+    # Run telemetry rides the terminal report itself: Manage drops anything
+    # sent after a job is final. Only the fields its `job` action accepts.
+    telemetry=${5:-}
+    [[ -n "$telemetry" ]] || telemetry='{}'
     body=$(jq -cn \
         --arg job "$job_id" \
         --arg status "$status" \
         --arg result "${result:0:2000}" \
         --arg session "$session_id" \
-        '{action:"job",jobId:$job,status:$status,result:$result} + (if $session == "" then {} else {session_id:$session} end)')
+        --argjson telemetry "$telemetry" \
+        '($telemetry | if type == "object" then . else {} end)
+         + {action:"job",jobId:$job,status:$status,result:$result}
+         + (if $session == "" then {} else {session_id:$session} end)') || return 1
     response=$(platform_runtime "$body") || return 1
     jq -e '.ok == true' >/dev/null <<<"$response"
+}
+
+# One pass over a run's provider output: the counters Manage accepts on the
+# terminal job report, plus the session id of a run that never reached its
+# final event. Lines are parsed one by one, so a line cut short by a stopped
+# provider costs only itself and the file is never held in memory whole.
+#
+# input_tokens excludes cached input. Manage shows input + output as the run's
+# tokens and the cache reads as a separate figure (the convention of Claude's
+# own usage report), while JCode and Codex both count the cached part inside
+# `input`; sending their number unchanged would count every cached token twice.
+#
+# No cost is sent for JCode or Codex: these are flat subscriptions and their
+# events carry none. Claude reports its own figure, which is passed through.
+run_telemetry() {
+    local output_file=$1 duration_ms=$2 timed_out=$3
+    jq -Rnc \
+        --arg provider "$selected_provider" \
+        --argjson duration "$duration_ms" \
+        --argjson timed_out "$timed_out" '
+        def count: if type == "number" and . >= 0 then . else 0 end;
+        def text($limit): if type == "string" and length > 0 then .[0:$limit] else null end;
+        def present: with_entries(select(.value != null));
+        reduce (inputs | fromjson? | select(type == "object")) as $event (
+            {turns: 0, fresh: 0, cached: 0, output: 0, created: null, usage: false,
+             session: null, model: null, provider: null, upstream: null, final: null};
+            if $provider == "jcode" then
+                if $event.type == "tokens" then
+                    .turns += 1 | .usage = true
+                    | .fresh += ([($event.input | count) - ($event.cache_read_input | count), 0] | max)
+                    | .cached += ($event.cache_read_input | count)
+                    | .output += ($event.output | count)
+                    | if ($event.cache_creation_input | type) == "number"
+                      then .created = ((.created // 0) + ($event.cache_creation_input | count))
+                      else . end
+                elif $event.type == "start" or $event.type == "done" then
+                    .session = (($event.session_id | text(200)) // .session)
+                    | .model = (($event.model | text(80)) // .model)
+                    | .provider = (($event.provider | text(40)) // .provider)
+                    | .upstream = (($event.upstream_provider | text(120)) // .upstream)
+                else . end
+            elif $provider == "codex" then
+                if $event.type == "thread.started" then
+                    .session = (($event.thread_id | text(200)) // .session)
+                elif $event.type == "turn.completed" and ($event.usage | type) == "object" then
+                    .usage = true
+                    | .fresh += ([($event.usage.input_tokens | count) - ($event.usage.cached_input_tokens | count), 0] | max)
+                    | .cached += ($event.usage.cached_input_tokens | count)
+                    | .output += ($event.usage.output_tokens | count)
+                else . end
+            else
+                if $event.type == "result" then
+                    .session = (($event.session_id | text(200)) // .session)
+                    | .final = ($event | del(.result))
+                elif $event.type == "system" then
+                    .session = (($event.session_id | text(200)) // .session)
+                else . end
+            end)
+        | (if .upstream != null then .upstream
+           elif .provider != null and .model != null then (.provider + "/" + .model)
+           else (.provider // .model) end) as $upstream
+        | (if $provider == "claude" and .final != null then {
+                cost_usd: (.final.total_cost_usd | if type == "number" and . >= 0 then . else null end),
+                num_turns: (.final.num_turns | if type == "number" and . >= 0 then . else null end),
+                input_tokens: (.final.usage.input_tokens | if type == "number" then count else null end),
+                output_tokens: (.final.usage.output_tokens | if type == "number" then count else null end),
+                cache_read_input_tokens: (.final.usage.cache_read_input_tokens | if type == "number" then count else null end),
+                cache_creation_input_tokens: (.final.usage.cache_creation_input_tokens | if type == "number" then count else null end),
+                stop_reason: (.final.stop_reason | text(80))
+            }
+           elif .usage then {
+                num_turns: (if .turns > 0 then .turns else null end),
+                input_tokens: .fresh,
+                output_tokens: .output,
+                cache_read_input_tokens: .cached,
+                cache_creation_input_tokens: .created,
+                upstream_provider: $upstream
+            }
+           else {upstream_provider: $upstream} end)
+        + {duration_ms: $duration, session_id: .session}
+        + (if $timed_out then {timed_out: true, stop_reason: "timeout"} else {} end)
+        | present
+    ' "$output_file" 2>/dev/null
 }
 
 record_job_output() {
@@ -953,6 +1143,66 @@ completion_report_is_structured() {
     grep -q 'Demande 1' <<<"$1"
 }
 
+# The process group this worker itself lives in; never a target.
+worker_group=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]') || worker_group=
+
+# Whether any process is left in the process group of one provider run.
+process_group_alive() {
+    kill -0 -- "-$1" 2>/dev/null
+}
+
+# Stop everything in one provider run's process group: TERM, then KILL for
+# whatever is still there once the grace period is over. The group id is the
+# pid of the provider, which `setsid` made the leader of a new session, so the
+# signal reaches the agent's children (browsers, type-checkers) and no process
+# of the worker or of another run. A group that no longer exists is a no-op.
+terminate_process_group() {
+    local group=$1 waited=0
+    [[ "$group" =~ ^[1-9][0-9]*$ ]] || return 0
+    (( group > 1 && group != $$ )) || return 0
+    [[ "$group" != "$worker_group" ]] || return 0
+    kill -TERM -- "-$group" 2>/dev/null || return 0
+    while process_group_alive "$group"; do
+        if (( waited >= kill_grace_seconds * 10 )); then
+            kill -KILL -- "-$group" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
+# Arm the wall-clock limit of the current run. When it elapses the watchdog
+# leaves a marker (the only evidence run_job accepts for `timed_out`) and stops
+# the run's process group. It is disarmed by TERM, which also ends its timer.
+start_job_watchdog() {
+    (
+        trap 'kill "$timer_pid" 2>/dev/null; exit 0' TERM
+        sleep "$job_timeout_seconds" &
+        timer_pid=$!
+        wait "$timer_pid" || exit 0
+        # Past this point the stop is committed; do not abandon it half-way.
+        trap '' TERM
+        process_group_alive "$provider_pid" || exit 0
+        : >"$timeout_marker" || exit 0
+        printf 'job %s reached the %s second wall-clock limit; stopping its provider\n' \
+            "$job_id" "$job_timeout_seconds" >&2
+        terminate_process_group "$provider_pid"
+    ) &
+    watchdog_pid=$!
+}
+
+# The worker process running this job was told to terminate. Take the run's
+# processes down with it and leave without a terminal report: this is not a
+# timeout, and the next worker start hands the job back as `interrupted`.
+abort_job_run() {
+    trap - TERM
+    [[ -z "${watchdog_pid:-}" ]] || kill "$watchdog_pid" 2>/dev/null
+    terminate_process_group "$provider_pid"
+    rm -f -- "$timeout_marker"
+    exit 143
+}
+
 wait_for_provider() {
     local provider_pid=$1
     local stdout_logger stderr_logger exit_status=0
@@ -1016,18 +1266,25 @@ run_job() {
     }
     output=$runtime_dir/$job_id.jsonl
     error_output=$runtime_dir/$job_id.stderr
+    timeout_marker=$runtime_dir/$job_id.timed-out
     : >"$output"
     : >"$error_output"
     chmod 600 -- "$output"
     chmod 600 -- "$error_output"
+    rm -f -- "$timeout_marker"
 
     report_job "$job_id" running "${selected_provider} started by Monique." || return
     post_job_log "$job_id" lifecycle "${selected_provider} started by Monique."
 
+    # Each provider is started through `setsid`: it becomes the leader of its
+    # own session and process group, whose id is the pid recorded below. A
+    # background pipeline member of a script is never a group leader, so
+    # setsid execs in place and `$!` is the provider itself.
+    started_ms=$(date +%s%3N)
     set +e
     if [[ "$selected_provider" == codex ]]; then
         printf '%s\n' "$provider_prompt" \
-            | CODEX_HOME="$selected_home" "$selected_binary" exec \
+            | CODEX_HOME="$selected_home" setsid "$selected_binary" exec \
                 --json \
                 --dangerously-bypass-approvals-and-sandbox \
                 --skip-git-repo-check \
@@ -1043,7 +1300,7 @@ run_job() {
             | JCODE_HOME="$selected_home" \
                 JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
                 JCODE_SERVER_EXECUTABLE="$selected_binary" \
-                "$selected_binary" --quiet --no-update --no-selfdev run --ndjson \
+                setsid "$selected_binary" --quiet --no-update --no-selfdev run --ndjson \
                     --disabled-tools browser,swarm,integration_tools - \
                 >"$output" 2>"$error_output" &
     else
@@ -1053,15 +1310,31 @@ run_job() {
             return
         }
         printf '%s\n' "$provider_prompt" \
-            | CLAUDE_CONFIG_DIR="$selected_home" "$selected_binary" \
+            | CLAUDE_CONFIG_DIR="$selected_home" setsid "$selected_binary" \
                 --print \
                 --output-format stream-json \
                 --verbose \
                 --dangerously-skip-permissions \
                 >"$output" 2>"$error_output" &
     fi
-    wait_for_provider "$!"
+    provider_pid=$!
+    watchdog_pid=
+    trap abort_job_run TERM
+    start_job_watchdog
+    wait_for_provider "$provider_pid"
     provider_status=$?
+    duration_ms=$(( $(date +%s%3N) - started_ms ))
+    # Disarm the limit. A watchdog that already fired ignores this and is
+    # waited for, so the stop it started is complete before the report.
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    # Agents leave type-check daemons and headless browsers behind. Whatever is
+    # still in this run's process group goes now, whichever way the run ended.
+    if process_group_alive "$provider_pid"; then
+        printf 'job %s left processes behind; stopping its process group\n' "$job_id" >&2
+        terminate_process_group "$provider_pid"
+    fi
+    trap - TERM
     set -u
 
     if [[ "$selected_provider" == codex ]]; then
@@ -1074,31 +1347,52 @@ run_job() {
         session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
         result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
     fi
-    if (( provider_status == 0 )); then
+    # The limit counts only when the watchdog really stopped the run; a
+    # provider that delivered its answer as the limit fell is a finished run.
+    timed_out=false
+    if [[ -e "$timeout_marker" ]] && ! { (( provider_status == 0 )) && [[ -n "$result" ]]; }; then
+        timed_out=true
+    fi
+    rm -f -- "$timeout_marker"
+    telemetry=$(run_telemetry "$output" "$duration_ms" "$timed_out") || telemetry='{}'
+    [[ -n "$telemetry" ]] || telemetry='{}'
+    # A run stopped before its final event still named its session when it
+    # started; Manage needs that to resume it.
+    [[ -n "$session_id" ]] || session_id=$(jq -r '.session_id // ""' <<<"$telemetry" 2>/dev/null) || session_id=
+    if [[ "$timed_out" == true ]]; then
+        if (( job_timeout_seconds % 60 == 0 )); then
+            limit="$(( job_timeout_seconds / 60 )) minutes"
+        else
+            limit="$job_timeout_seconds seconds"
+        fi
+        result="Timed out after ${limit}: ${selected_provider} was still working at the worker's wall-clock limit and was stopped."
+        report_job "$job_id" "failed" "$result" "$session_id" "$telemetry" || true
+        post_job_log "$job_id" lifecycle "${selected_provider} timed out after ${limit}."
+    elif (( provider_status == 0 )); then
         probe_local_auth || true
         write_auth_health authenticated execution_succeeded "$(date +%s%3N)" || true
         completion_permalink=$(completion_comment_permalink "$result" "$expected_issue_url") || completion_permalink=
         if [[ -n "$completion_permalink" ]]; then
             completion_body=$(completion_comment_body "$completion_permalink") || completion_body=
             if [[ -z "$completion_body" ]]; then
-                report_job "$job_id" "done" "$result" "$session_id" || true
+                report_job "$job_id" "done" "$result" "$session_id" "$telemetry" || true
                 post_job_log "$job_id" lifecycle "${selected_provider} completed with a GitHub receipt; the report shape could not be read back."
             elif completion_report_is_structured "$completion_body"; then
-                report_job "$job_id" "done" "$result" "$session_id" || true
+                report_job "$job_id" "done" "$result" "$session_id" "$telemetry" || true
                 post_job_log "$job_id" lifecycle "${selected_provider} completed with a verified, per-request GitHub report."
             else
                 result="Completion receipt rejected: the completion comment ${completion_permalink} does not follow the per-request report format (no 'Demande 1' section with Vérification and Preuve). Delivery remains unverified. Last provider message: ${result:-none}"
-                report_job "$job_id" "failed" "$result" "$session_id" || true
+                report_job "$job_id" "failed" "$result" "$session_id" "$telemetry" || true
                 post_job_log "$job_id" lifecycle "${selected_provider} completion report was rejected for its shape."
             fi
         else
             result="Completion receipt rejected: ${selected_provider} exited successfully but did not return the required GitHub completion-comment permalink. Delivery remains unverified. Last provider message: ${result:-none}"
-            report_job "$job_id" "failed" "$result" "$session_id" || true
+            report_job "$job_id" "failed" "$result" "$session_id" "$telemetry" || true
             post_job_log "$job_id" lifecycle "${selected_provider} completion receipt was rejected."
         fi
     else
         [[ -n "$result" ]] || result="${selected_provider} exited with status $provider_status."
-        report_job "$job_id" "failed" "$result" "$session_id" || true
+        report_job "$job_id" "failed" "$result" "$session_id" "$telemetry" || true
         post_job_log "$job_id" lifecycle "${selected_provider} failed."
         if reason=$(auth_failure_reason "$output" "$error_output"); then
             probe_local_auth || true
@@ -1167,6 +1461,17 @@ while (( stopping == 0 )); do
         write_auth_health unavailable provider_unavailable "$(previous_verified_at)" || true
         selection_key=invalid
     fi
+    # The guard only holds back new job claims for this poll. Heartbeats and
+    # platform commands carry on, and the heartbeat says what it is waiting for.
+    previous_memory_wait=$memory_wait
+    check_memory_guard
+    if [[ -n "$memory_wait" && -z "$previous_memory_wait" ]]; then
+        printf 'memory guard engaged, no new job is claimed: %s\n' "$memory_wait" >&2
+        last_heartbeat=0
+    elif [[ -z "$memory_wait" && -n "$previous_memory_wait" ]]; then
+        printf '%s\n' 'memory guard lifted, claiming jobs again' >&2
+        last_heartbeat=0
+    fi
     active=$(active_jobs)
     now=$(date +%s)
     if (( now - last_heartbeat >= heartbeat_seconds )); then
@@ -1189,6 +1494,7 @@ while (( stopping == 0 )); do
             active=$((active + 1))
             continue
         fi
+        [[ -z "$memory_wait" ]] || break
         job=$(claim_one) || break
         [[ "$job" != null ]] || break
         run_job "$job" &

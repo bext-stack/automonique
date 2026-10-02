@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -19,6 +20,20 @@ def function(name):
     if match is None:
         raise AssertionError(f"missing worker function {name}")
     return match.group(0)
+
+
+def running(pid, patience=5.0):
+    """Whether a process is still running after a short wait for its exit."""
+    deadline = time.monotonic() + patience
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0]
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        if state == "Z":
+            return False
+        time.sleep(0.05)
+    return True
 
 
 PROVIDER = r'''#!/usr/bin/env python3
@@ -65,7 +80,11 @@ sys.exit(int(os.environ["TEST_EXIT_CODE"]))
 STUBS = r'''
 local_work_brief() { return 1; }
 workspace_for() { printf '%s\n' "$runtime_dir"; }
-report_job() { printf '%s\n' "$2" >> "$runtime_dir/reports"; }
+report_job() {
+    printf '%s\n' "$2" >> "$runtime_dir/reports"
+    # The wall-clock figure differs run to run; the rest is exact.
+    jq -c 'del(.duration_ms)' <<<"${5:-null}" >> "$runtime_dir/telemetry"
+}
 post_job_log() {
     printf '%s\t%s\n' "$2" "$3" >> "$runtime_dir/logs"
     if [[ "$2" == item.started || "$2" == tool_start || "$2" == assistant ]]; then
@@ -95,6 +114,11 @@ class ProviderLifecycleTests(unittest.TestCase):
                     for name in (
                         "log_provider_line",
                         "completion_report_is_structured",
+                        "process_group_alive",
+                        "terminate_process_group",
+                        "start_job_watchdog",
+                        "abort_job_run",
+                        "run_telemetry",
                         "wait_for_provider",
                         "run_job",
                     )
@@ -108,6 +132,9 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "selected_provider": provider,
                 "selected_home": directory,
                 "selected_binary": str(binary),
+                "job_timeout_seconds": "7200",
+                "kill_grace_seconds": "20",
+                "worker_group": "",
                 "TEST_PROVIDER": provider,
                 "TEST_EXIT_CODE": str(exit_code),
                 "TEST_LOG_READY": str(root / "log-ready"),
@@ -126,11 +153,20 @@ class ProviderLifecycleTests(unittest.TestCase):
             try:
                 stdout, stderr = process.communicate(timeout=8)
                 self.assertEqual(process.returncode, 0, (stdout, stderr))
+                self.assertNotIn(b"command not found", stderr)
                 child = int((root / "child-pid").read_text())
-                # Completion must not depend on killing the inherited writer.
-                os.kill(child, 0)
+                # The provider's exit alone ends the run: its child would hold
+                # the output open for 30 seconds, far past this test's bound.
+                # What the run left behind is then stopped with its process
+                # group rather than kept in the worker's service.
+                self.assertIn(b"left processes behind", stderr)
+                self.assertFalse(running(child), "the run's leftover child survived")
                 expected = "done" if exit_code == 0 else "failed"
                 self.assertEqual((root / "reports").read_text().splitlines(), ["running", expected])
+                self.assertEqual(
+                    (root / "telemetry").read_text().splitlines()[-1:],
+                    [json.dumps({"session_id": "fixture-session"}, separators=(",", ":"))],
+                )
                 logs = (root / "logs").read_text().splitlines()
                 self.assertEqual(
                     sum(line.startswith("provider_stderr\tfixture diagnostic") for line in logs),
