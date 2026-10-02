@@ -49,7 +49,13 @@ pub const MAX_API_KEY_BYTES: u64 = 512;
 /// A 384-token response proved too small for a dozen compact issue statuses:
 /// the provider occasionally returned `finish_reason=length`, which this
 /// adapter correctly refuses rather than displaying as a complete audit.
-pub const MAX_OUTPUT_TOKENS: u16 = 768;
+/// 768 then proved too small once chat turns read every referenced issue with
+/// its latest comment authors: those answers hit the cap and the whole turn
+/// failed. A cut-off answer is now kept but visibly marked as shortened (see
+/// [`SHORTENED_ANSWER_NOTE`]), so it still never reads as complete.
+pub const MAX_OUTPUT_TOKENS: u16 = 2_048;
+/// Appended to an answer the model stopped at [`MAX_OUTPUT_TOKENS`].
+pub const SHORTENED_ANSWER_NOTE: &str = "\n\n[Answer shortened: the reply reached its length limit. Ask for the rest or a narrower question.]";
 /// Whole provider request budget.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -390,9 +396,11 @@ pub fn decode_response(bytes: &[u8]) -> Result<String, ChatProviderFailure> {
         .get("finish_reason")
         .and_then(serde_json::Value::as_str)
         .ok_or(ChatProviderFailure::Response)?;
-    if finish_reason != "stop" {
-        return Err(ChatProviderFailure::Answer);
-    }
+    let shortened = match finish_reason {
+        "stop" => false,
+        "length" => true,
+        _ => return Err(ChatProviderFailure::Answer),
+    };
     let answer = choice
         .get("message")
         .and_then(serde_json::Value::as_object)
@@ -401,12 +409,16 @@ pub fn decode_response(bytes: &[u8]) -> Result<String, ChatProviderFailure> {
         .ok_or(ChatProviderFailure::Answer)?;
     let answer = answer.trim();
     if answer.is_empty()
-        || answer.len() > MAX_ANSWER_BYTES
+        || answer.len() + SHORTENED_ANSWER_NOTE.len() > MAX_ANSWER_BYTES
         || answer.chars().any(|character| character == '\0')
     {
         return Err(ChatProviderFailure::Answer);
     }
-    Ok(answer.to_owned())
+    Ok(if shortened {
+        format!("{answer}{SHORTENED_ANSWER_NOTE}")
+    } else {
+        answer.to_owned()
+    })
 }
 
 /// Decode and validate DeepSeek's documented balance projection.
@@ -584,7 +596,7 @@ mod tests {
             serde_json::from_str(&request_body(prompt)).expect("request JSON");
         assert_eq!(value["model"], DEEPSEEK_FLASH_MODEL);
         assert_eq!(value["thinking"]["type"], "disabled");
-        assert_eq!(value["max_tokens"], 768);
+        assert_eq!(value["max_tokens"], 2_048);
         assert!(value.get("tool_choice").is_none());
         assert_eq!(value["stream"], false);
         assert_eq!(value["messages"][1]["content"], prompt);
@@ -604,7 +616,8 @@ mod tests {
     fn response_refuses_partial_empty_multiple_and_oversized_answers() {
         for body in [
             br#"{"choices":[]}"#.as_slice(),
-            br#"{"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}"#,
+            br#"{"choices":[{"finish_reason":"content_filter","message":{"content":"partial"}}]}"#,
+            br#"{"choices":[{"finish_reason":"length","message":{"content":""}}]}"#,
             br#"{"choices":[{"finish_reason":"stop","message":{"content":""}}]}"#,
             br#"{"choices":[{"finish_reason":"stop","message":{"content":null}}]}"#,
         ] {
@@ -618,6 +631,14 @@ mod tests {
         }))
         .expect("fixture");
         assert_eq!(decode_response(&body), Err(ChatProviderFailure::Answer));
+    }
+
+    #[test]
+    fn a_length_capped_answer_is_kept_and_visibly_marked_shortened() {
+        let body = br#"{"choices":[{"finish_reason":"length","message":{"content":" | #1119 | open | benfavre "}}]}"#;
+        let answer = decode_response(body).expect("kept");
+        assert!(answer.starts_with("| #1119 | open | benfavre"));
+        assert!(answer.ends_with(SHORTENED_ANSWER_NOTE));
     }
 
     #[test]
