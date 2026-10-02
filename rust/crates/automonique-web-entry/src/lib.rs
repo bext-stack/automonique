@@ -2955,7 +2955,7 @@ impl WebIntegration {
                 primary_configured: provider_configured,
                 conversation_configured: exists("conversation-provider"),
                 egress_policy_configured: exists("egress-destinations"),
-                execution: "durable contained run lane",
+                execution: "Sandboxed runs, kept on disk",
             },
             connectors: ConnectorConfigurationView {
                 slack: exists("slack/slack.conf"),

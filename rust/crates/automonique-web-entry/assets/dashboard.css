@@ -1511,3 +1511,5 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 /* The message box stays reachable however long the conversation gets. */
 #chat-form { position: sticky; z-index: 5; bottom: 12px; }
 .ticket-message-body a { color: var(--accent-text); overflow-wrap: anywhere; text-decoration: underline; text-underline-offset: 2px; }
+.capability-codes { display: block; margin-top: 2px; color: var(--quiet); font: var(--font-2xs) var(--font-code); overflow-wrap: anywhere; }
+.platform-history-notice.is-empty { color: var(--muted); background: var(--panel-2); }

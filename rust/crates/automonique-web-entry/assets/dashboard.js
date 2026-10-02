@@ -143,7 +143,21 @@ function consoleShortId(id) {
   return text.length <= 14 ? text : `${text.slice(0, 12)}…`;
 }
 
+// What each conversation was about, learned in this page session only (from
+// a task started here or the first message of a conversation opened here).
+// Kept in memory on purpose: task text is never written to browser storage.
+const consoleLearnedTitles = new Map();
+
+function consoleLearnTitle(sessionId, text) {
+  const title = String(text || "").replace(/\s+/g, " ").trim();
+  if (!sessionId || !title || consoleLearnedTitles.get(sessionId) === title) return;
+  consoleLearnedTitles.set(sessionId, title.length > 90 ? `${title.slice(0, 89)}…` : title);
+  if (platformSnapshot) renderRetainedPlatform(platformSnapshot);
+}
+
 function consoleSessionTitle(session) {
+  const learned = consoleLearnedTitles.get(session?.session?.resource?.id);
+  if (learned) return learned;
   const observed = consoleSessionObservedMs(session);
   if (!observed) return `${translatePhrase("Session")} ${consoleShortId(session?.session?.resource?.id)}`;
   const when = new Intl.DateTimeFormat(localeTag(), { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(observed);
@@ -1254,6 +1268,10 @@ const frenchUi = Object.freeze({
   "Read only": "Lecture seule",
   "View run": "Voir l’exécution",
   "Show runs": "Voir les exécutions",
+  "No messages were saved in this conversation.": "Aucun message n’a été enregistré dans cette conversation.",
+  "Missing details are left blank rather than guessed, and workspace actions stay read-only.": "Les détails manquants restent vides au lieu d’être devinés, et les actions sur les espaces restent en lecture seule.",
+  "Saved conversations still work.": "Les conversations enregistrées restent disponibles.",
+  "Sandboxed runs, kept on disk": "Exécutions isolées, conservées sur disque",
   "Agent runs": "Exécutions d’agent",
   "Waiting for approval": "En attente d’approbation",
   "to approve": "à approuver",
@@ -2151,7 +2169,7 @@ function renderAttention(status) {
   lastNotifiedAttentionKey = attentionKey;
   byId("attention-title").textContent = items.length === 0 ? "Everything is running normally" : `${items.length} item${items.length === 1 ? " needs" : "s need"} attention`;
   byId("attention-bar").dataset.state = items.length === 0 ? "clear" : "attention";
-  byId("attention-detail").textContent = items.length === 0 ? "Agents, new work and deliveries all look fine." : items.map((item) => item.title).join(" · ");
+  byId("attention-detail").textContent = items.length === 0 ? "Agents, new work and deliveries all look fine." : items.map((item) => translatePhrase(item.title)).join(" · ");
   setMetric("metric-attention", items.length);
   const list = byId("attention-list");
   list.replaceChildren();
@@ -3198,10 +3216,25 @@ function renderHostedCockpit(view) {
   const capabilityTitle = document.createElement("strong");
   capabilityTitle.textContent = cockpitPresentation.mode === "v2" ? "Workspaces are up to date." : cockpitPresentation.mode === "partial" ? "Some workspace details are missing." : "Workspaces are not available on this server.";
   const capabilityDetail = document.createElement("span");
+  // The shared core explains degradation in technical terms; show a plain
+  // sentence and keep the exact reason codes beside it for diagnosis.
+  const reasonCodes = (cockpitPresentation.degradation || "").match(/\(([^)]+)\)/)?.[1] || "";
   capabilityDetail.textContent = cockpitPresentation.stale
     ? "This data is out of date. Workspace actions are paused until it refreshes."
-    : cockpitPresentation.degradation || "Projects, servers, workspaces and their status are listed below.";
+    : cockpitPresentation.mode === "partial"
+      ? "Missing details are left blank rather than guessed, and workspace actions stay read-only."
+      : cockpitPresentation.mode === "v1"
+        ? "Saved conversations still work."
+        : "Projects, servers, workspaces and their status are listed below.";
   capability.append(capabilityTitle, capabilityDetail);
+  if (!cockpitPresentation.stale && reasonCodes) {
+    const codes = document.createElement("code");
+    codes.className = "capability-codes";
+    codes.setAttribute("data-i18n-skip", "");
+    codes.textContent = reasonCodes;
+    codes.title = cockpitPresentation.degradation;
+    capability.append(codes);
+  }
 
   byId("cockpit-project-count").textContent = count(cockpitPresentation.projects.length);
   byId("cockpit-host-count").textContent = count(cockpitPresentation.hosts.length);
@@ -3260,9 +3293,11 @@ function renderHostedCockpit(view) {
   byId("cockpit-workspace-branch").textContent = workspace?.branch ? `Branch ${workspace.branch}` : "No branch yet";
   cockpitSignal("cockpit-external-signal", "OUTSIDE WORK", workspace?.external_work);
   cockpitSignal("cockpit-agent-signal", "AGENT", workspace?.internal_agent);
-  // With structured workspaces the selected workspace is the primary context,
-  // so its drawer starts open until the operator closes it.
-  if (workspace && !consoleState.taskDrawerDismissed && !consoleDrawerIsOpen("task-drawer")) {
+  // With fully available workspaces the selected one is the primary context,
+  // so its drawer starts open until the operator closes it. When the
+  // workspace service is only partial, the drawer would open on blank fields
+  // and unavailable actions, so it waits until a workspace is picked.
+  if (workspace && cockpitPresentation.mode === "v2" && !consoleState.taskDrawerDismissed && !consoleDrawerIsOpen("task-drawer")) {
     consoleDrawer("task-drawer", true);
     if (byId("platform-session-detail").hidden) consoleShowTaskPane("workspace");
   }
@@ -3568,6 +3603,9 @@ function renderPlatformHistory(history, replace = false) {
   const events = Array.isArray(history.events) ? history.events : [];
   events.forEach((event) => {
     if (event.kind === "message") {
+      if (replace && event.role === "user" && !root.querySelector('[data-role="user"]')) {
+        consoleLearnTitle(platformSelectedSession, event.text);
+      }
       root.append(historyMessage(event));
       return;
     }
@@ -3583,6 +3621,12 @@ function renderPlatformHistory(history, replace = false) {
     addHistoryStep(historyStepGroup(root), event);
   });
   const more = history.has_more === true;
+  if (replace && events.length === 0 && !more) {
+    const empty = document.createElement("div");
+    empty.className = "platform-history-notice is-empty";
+    empty.textContent = "No messages were saved in this conversation.";
+    root.append(empty);
+  }
   byId("platform-history-more").hidden = !more;
   // The answer usually sits on a later page, so keep reading (bounded)
   // instead of leaving it behind a button.
@@ -6349,6 +6393,8 @@ document.addEventListener("keydown", (event) => {
   } else if (!editing && event.key.toLowerCase() === "n") {
     event.preventDefault();
     showView("sessions");
+    // "New task" means ready to type, not just the right page.
+    window.setTimeout(() => byId("platform-task-text").focus(), 0);
   } else if (event.key === "Escape" && newChatArmed) {
     resetNewChatButton();
   } else if (event.key === "Escape" && !byId("appearance-panel").hidden) {
@@ -6658,6 +6704,11 @@ function consoleSyncStats() {
     badge.hidden = !show;
     badge.textContent = show ? value : "";
     badge.dataset.tone = tone;
+  });
+  // Assistant header chips mean nothing before a turn: hide "-" placeholders.
+  ["chat-memory-count", "chat-latency"].forEach((id) => {
+    const value = byId(id);
+    if (value?.parentElement) value.parentElement.hidden = value.textContent.trim() === "-";
   });
   // Agents: failures first; otherwise runs waiting for approval.
   const failed = Number((byId("process-failed")?.textContent || "").replace(/[^0-9]/g, "")) || 0;
