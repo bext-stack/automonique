@@ -556,7 +556,11 @@ fn work_brief_command(values: Vec<std::ffi::OsString>) -> ExitCode {
     let binary =
         std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("automonique"));
     let method = automonique_daemon::work_method::render(state_dir, &binary);
-    println!("{method}\n\n{brief}");
+    // Where this ticket's code lives is operator policy too.
+    match automonique_daemon::ticket_routing::render(state_dir) {
+        Some(routing) => println!("{method}\n\n{routing}\n\n{brief}"),
+        None => println!("{method}\n\n{brief}"),
+    }
     ExitCode::SUCCESS
 }
 
