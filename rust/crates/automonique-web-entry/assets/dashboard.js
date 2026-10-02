@@ -25,6 +25,7 @@ let platformSnapshot = null;
 let cockpitSnapshot = null;
 let platformSelectedSession = null;
 let platformHistoryCursor = null;
+let platformHistoryAutoPages = 0;
 let platformMutation = null;
 let platformBusy = false;
 let platformExactRevision = null;
@@ -1151,6 +1152,14 @@ const frenchUi = Object.freeze({
   "Show fewer": "Afficher moins",
   "Closed": "Fermé",
   "Has a linked run": "Exécution liée",
+  "Can reply": "Réponse possible",
+  "Ready, sandboxed": "Prêt, isolé",
+  "Sandbox ready, no agent connected": "Isolation prête, aucun agent connecté",
+  "Blocked: sandbox unavailable": "Bloqué : isolation indisponible",
+  "Not answering": "Ne répond pas",
+  "NO REPORT YET": "PAS ENCORE DE RAPPORT",
+  "Worked": "Travail",
+  "Shortened by the server.": "Raccourci par le serveur.",
   "History only": "Historique seulement",
   "Can be opened": "Peut être ouverte",
   "Updated": "Mis à jour",
@@ -1656,6 +1665,8 @@ function translatePhraseForFrench(value) {
     [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
     [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
+    [/^Worked: (.+) · (\d+) steps?$/, (match) => `Travail : ${match[1]} · ${match[2]} étape${match[2] === "1" ? "" : "s"}`],
+    [/^Working · (\d+) steps?$/, (match) => `En cours · ${match[1]} étape${match[1] === "1" ? "" : "s"}`],
     [/^Updated (.+)$/, (match) => `Mis à jour ${translatePhraseForFrench(match[1])}`],
     [/^(\d+) items? needs? attention$/, (match) => `${match[1]} élément${match[1] === "1" ? " requiert" : "s requièrent"} votre attention`],
     [/^(.+?) of (.+?) runs$/, (match) => `${match[1]} exécution${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
@@ -1671,7 +1682,7 @@ function translatePhraseForFrench(value) {
     [/^Ready to reply \(version (\d+)\)\.$/, (match) => `Prêt à répondre (version ${match[1]}).`],
     [/^(\d+) \/ (\d+) accounts$/, (match) => `${match[1]} / ${match[2]} comptes`],
     [/^(\S+) (memory|memories)(?: for “(.+)”)?$/, (match) => `${match[1]} souvenir${match[2] === "memory" ? "" : "s"}${match[3] ? ` pour « ${match[3]} »` : ""}`],
-    [/^(Live|Saved history) · (Has a linked run|No linked run) · (?:nothing to approve|(\d+) to approve)$/, (match) => `${match[1] === "Live" ? "En direct" : "Historique enregistré"} · ${match[2] === "No linked run" ? "Aucune exécution liée" : "Exécution liée"} · ${match[3] ? `${match[3]} à approuver` : "rien à approuver"}`],
+    [/^(Live|Saved history)(?: · (\d+) to approve)?$/, (match) => `${match[1] === "Live" ? "En direct" : "Historique enregistré"}${match[2] ? ` · ${match[2]} à approuver` : ""}`],
     [/^Show all \((\d+)\)$/, (match) => `Tout afficher (${match[1]})`],
     [/^Could not open · (.+)$/, (match) => `Ouverture impossible · ${match[1]}`],
     [/^Conversation not available: (.+)$/, (match) => `Conversation indisponible : ${match[1]}`],
@@ -2196,6 +2207,26 @@ function setMetric(id, value) {
   if (card) card.dataset.zero = String(value === 0);
 }
 
+// The daemon's state names are precise but internal; show what they mean.
+const EXECUTION_STATES = {
+  sandbox_enforceable_lane_wired: ["Ready, sandboxed", "ok"],
+  sandbox_enforceable_no_lane: ["Sandbox ready, no agent connected", "warn"],
+  sandbox_unavailable_lane_wired: ["Blocked: sandbox unavailable", "bad"],
+  sandbox_unavailable_no_lane: ["Off", "warn"],
+};
+const TELEGRAM_STATES = {
+  polling_live: ["Connected", "ok"],
+  lease_owned_no_client: ["Not answering", "warn"],
+  disabled_no_client: ["Off", "muted"],
+};
+
+function setRuntimeFact(id, known, raw) {
+  const element = byId(id);
+  element.textContent = known ? known[0] : words(raw);
+  element.dataset.tone = known ? known[1] : "";
+  element.title = raw ? String(raw) : "";
+}
+
 function renderStatus(status) {
   lastStatusSnapshot = status;
   const health = ["operational", "degraded", "unavailable"].includes(status.health) ? status.health : "unavailable";
@@ -2212,8 +2243,8 @@ function renderStatus(status) {
   byId("runtime-daemon").textContent = words(status.state);
   byId("runtime-provider").textContent = status.provider_available === true ? "Available" : status.provider_available === false ? "Unavailable" : "-";
   byId("runtime-intake").textContent = status.accepting_intake === true ? "Yes" : status.accepting_intake === false ? "No" : "-";
-  byId("runtime-execution").textContent = words(status.execution_state);
-  byId("runtime-telegram").textContent = words(status.telegram_state);
+  setRuntimeFact("runtime-execution", EXECUTION_STATES[status.execution_state], status.execution_state);
+  setRuntimeFact("runtime-telegram", TELEGRAM_STATES[status.telegram_state], status.telegram_state);
   byId("runtime-snapshot").textContent = status.stale ? "Out of date" : "Up to date";
   byId("runtime-tag").textContent = issues.length === 0 ? "ALL GOOD" : "CHECK";
   byId("runtime-tag").dataset.state = issues.length === 0 ? "operational" : "degraded";
@@ -2768,8 +2799,10 @@ function renderProcesses(view) {
   const jobs = Array.isArray(view.jobs) ? view.jobs : [];
   if (lastStatusSnapshot) renderAttention(lastStatusSnapshot);
   const health = String(view.health || "unavailable");
-  byId("processes-health").textContent = health.toUpperCase();
-  byId("processes-health").dataset.state = health;
+  // No worker report yet is a waiting state, not an outage.
+  const waiting = health === "unavailable" && !view.worker && jobs.length === 0;
+  byId("processes-health").textContent = waiting ? "NO REPORT YET" : health.toUpperCase();
+  byId("processes-health").dataset.state = waiting ? "waiting" : health;
   const observed = Number.isSafeInteger(view.observed_at_ms) ? new Date(view.observed_at_ms).toISOString() : null;
   byId("process-observed").textContent = observed ? `Updated ${processTimeLabel(observed)}` : "Waiting for the worker";
   byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
@@ -3353,7 +3386,7 @@ function renderRetainedPlatform(retained) {
     title.setAttribute("data-i18n-skip", "");
     title.textContent = consoleSessionTitle(session);
     const detail = document.createElement("small");
-    detail.textContent = [session.run ? "Has a linked run" : null, session.attachable === false ? "History only" : null].filter(Boolean).join(" · ") || "Can be opened";
+    detail.textContent = session.attachable === false ? "Read only" : "Can reply";
     main.append(title, detail);
     const stateWord = String(record.summary || "").trim().toLowerCase();
     const state = consoleSessionWorking(coordinate.id)
@@ -3451,30 +3484,147 @@ function renderPlatformHistory(history, replace = false) {
     return;
   }
   if (history.state !== "page") return;
+  if (replace) platformHistoryAutoPages = 0;
   platformHistoryCursor = history.terminal_cursor;
   const events = Array.isArray(history.events) ? history.events : [];
   events.forEach((event) => {
-    const item = document.createElement("article");
-    item.className = `platform-history-event is-${event.kind || "unknown"}`;
-    item.dataset.cursor = event.cursor || "";
-    if (event.kind === "message") item.dataset.role = event.role === "user" ? "user" : "assistant";
-    const head = document.createElement("div");
-    const kind = document.createElement("strong");
-    kind.textContent = event.kind === "message" ? (event.role === "user" ? "You" : event.role === "assistant" ? "Monique" : words(event.role || "message")) : words(event.kind || "event");
-    const cursor = document.createElement("small");
-    cursor.textContent = `#${event.cursor || "-"}`;
-    head.append(kind, cursor);
-    const content = document.createElement("p");
-    content.setAttribute("data-i18n-skip", "");
-    if (event.kind === "message") content.textContent = event.text || "";
-    else if (event.kind === "tool_state") content.textContent = `${event.label || "Tool step"}: ${words(event.state)}`;
-    else if (event.kind === "run_state") content.textContent = { running: "Monique started working", completed: "Monique finished", failed: "The run failed", cancelled: "The run was cancelled" }[event.state] || `Run ${words(event.state)}`;
-    else content.textContent = `Event from ${words(event.source || "unknown source")}`;
-    item.append(head, content);
-    root.append(item);
+    if (event.kind === "message") {
+      root.append(historyMessage(event));
+      return;
+    }
+    if (event.kind === "run_state" && (event.state === "failed" || event.state === "cancelled")) {
+      const item = document.createElement("p");
+      item.className = `platform-history-run is-${event.state}`;
+      item.textContent = RUN_STATE_LABELS[event.state] || `Run ${words(event.state)}`;
+      root.append(item);
+      return;
+    }
+    // Everything between two messages (tool steps, run start, and the
+    // content-free events the server withholds) folds into one line.
+    addHistoryStep(historyStepGroup(root), event);
   });
-  byId("platform-history-more").hidden = history.has_more !== true;
+  const more = history.has_more === true;
+  byId("platform-history-more").hidden = !more;
+  // The answer usually sits on a later page, so keep reading (bounded)
+  // instead of leaving it behind a button.
+  if (more && platformHistoryAutoPages < HISTORY_AUTO_PAGES) {
+    platformHistoryAutoPages += 1;
+    window.setTimeout(() => pagePlatformHistory(), 0);
+  }
   root.scrollTop = root.scrollHeight;
+}
+
+const HISTORY_AUTO_PAGES = 20;
+const RUN_STATE_LABELS = {
+  completed: "Monique finished",
+  failed: "The run failed",
+  cancelled: "The run was cancelled",
+};
+const TOOL_STEP_LABELS = {
+  todo: "planned",
+  write: "wrote files",
+  edit: "edited files",
+  bash: "ran commands",
+  read: "read files",
+  grep: "searched",
+  glob: "searched",
+  web: "browsed",
+};
+
+function historyMessage(event) {
+  const user = event.role === "user";
+  const item = document.createElement("article");
+  item.className = "platform-history-event is-message";
+  item.dataset.role = user ? "user" : "assistant";
+  item.dataset.cursor = event.cursor || "";
+  const head = document.createElement("header");
+  const who = document.createElement("strong");
+  who.textContent = user ? "You" : event.role === "assistant" ? "Monique" : words(event.role || "message");
+  head.append(who);
+  if (validPlatformDecimal(event.at_ms)) {
+    const at = document.createElement("time");
+    at.textContent = new Date(Number(event.at_ms)).toLocaleString(localeTag(), { dateStyle: "medium", timeStyle: "short" });
+    head.append(at);
+  }
+  const content = document.createElement("section");
+  content.className = "platform-history-text";
+  content.setAttribute("data-i18n-skip", "");
+  appendMessageText(content, event.text || "");
+  if (event.truncated === true) {
+    const note = document.createElement("small");
+    note.textContent = "Shortened by the server.";
+    content.append(note);
+  }
+  item.append(head, content);
+  return item;
+}
+
+// Code fences become blocks and `inline code` stays code; everything else is
+// plain text. Built node by node, never parsed as HTML.
+function appendMessageText(root, text) {
+  text.split(/```/).forEach((part, index) => {
+    if (index % 2 === 1) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      // The fence's language tag may arrive on the same line once whitespace
+      // is collapsed upstream, so drop a known tag either way.
+      code.textContent = part
+        .replace(/^[\w-]*\n/, "")
+        .replace(/^\s*(text|txt|bash|sh|shell|console|json|js|ts|python|py|diff|html|css|rust|toml|yaml)\s+/, "")
+        .replace(/\s+$/, "");
+      pre.append(code);
+      root.append(pre);
+      return;
+    }
+    part.split(/\n{2,}/).forEach((paragraph) => {
+      if (!paragraph.trim()) return;
+      const p = document.createElement("p");
+      paragraph.split(/(`[^`\n]+`)/).forEach((piece) => {
+        if (piece.startsWith("`") && piece.endsWith("`") && piece.length > 2) {
+          const code = document.createElement("code");
+          code.textContent = piece.slice(1, -1);
+          p.append(code);
+        } else if (piece) {
+          p.append(document.createTextNode(piece));
+        }
+      });
+      root.append(p);
+    });
+  });
+}
+
+function historyStepGroup(root) {
+  const last = root.lastElementChild;
+  if (last?.classList.contains("platform-history-steps")) return last;
+  const group = document.createElement("details");
+  group.className = "platform-history-steps";
+  group.dataset.count = "0";
+  const summary = document.createElement("summary");
+  const list = document.createElement("ol");
+  group.append(summary, list);
+  root.append(group);
+  return group;
+}
+
+function addHistoryStep(group, event) {
+  group.dataset.count = String(Number(group.dataset.count) + 1);
+  if (event.kind === "tool_state" && event.label) {
+    const done = new Set((group.dataset.tools || "").split(",").filter(Boolean));
+    done.add(event.label);
+    group.dataset.tools = [...done].join(",");
+    if (event.state === "completed" || event.state === "failed") {
+      const step = document.createElement("li");
+      step.textContent = `${TOOL_STEP_LABELS[event.label] || words(event.label)}${event.state === "failed" ? " (failed)" : ""}`;
+      step.setAttribute("data-i18n-skip", "");
+      group.querySelector("ol").append(step);
+    }
+  }
+  const tools = (group.dataset.tools || "").split(",").filter(Boolean)
+    .map((label) => TOOL_STEP_LABELS[label] || words(label));
+  const count = Number(group.dataset.count);
+  group.querySelector("summary").textContent = tools.length
+    ? `Worked: ${tools.join(", ")} · ${count} ${count === 1 ? "step" : "steps"}`
+    : `Working · ${count} ${count === 1 ? "step" : "steps"}`;
 }
 
 function renderPlatformReceipt(view) {
@@ -3533,8 +3683,7 @@ async function openPlatformSession(sessionId) {
     byId("platform-session-posture").textContent = record.freshness === "stale" ? "Out of date · read only" : "Up to date · read only";
     const approvals = view.command?.state === "ready" && Array.isArray(view.command.pending_approvals) ? view.command.pending_approvals.length : 0;
     // A run target is not proof that anything is executing, so it is named as linked only.
-    const run = view.command?.state === "ready" && view.command.run ? "Has a linked run" : "No linked run";
-    byId("platform-session-status").textContent = `${view.attachment_cursor ? "Live" : "Saved history"} · ${run} · ${approvals === 0 ? "nothing to approve" : `${approvals} to approve`}`;
+    byId("platform-session-status").textContent = `${view.attachment_cursor ? "Live" : "Saved history"}${approvals === 0 ? "" : ` · ${approvals} to approve`}`;
     consoleSyncTaskDrawerTitle();
     renderPlatformHistory(view.history, true);
     settlePlatformFence(view.command);

@@ -669,7 +669,7 @@ kbd { display: inline-block; min-width: 18px; padding: 1px 5px; border: 1px soli
 .legacy-hooks { display: none !important; }
 
 /* ---------------------------------------------------------------- top bar */
-.topbar { position: sticky; z-index: 30; top: 0; height: var(--topbar-h); border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: saturate(1.4) blur(10px); }
+.topbar { position: sticky; z-index: 30; top: 0; height: var(--topbar-h); border-bottom: 1px solid var(--line); background: var(--bg); }
 .topbar-inner { display: flex; height: 100%; max-width: 1680px; gap: 14px; align-items: center; margin: 0 auto; padding: 0 var(--page-pad); }
 .brand { display: flex; flex: 0 0 auto; gap: 9px; align-items: center; color: var(--text); text-decoration: none; }
 .brand-mark { display: grid; width: 24px; height: 24px; place-items: center; border-radius: 7px; color: var(--accent-ink); background: var(--accent); font: 700 13px/1 var(--font-sans); }
@@ -1475,3 +1475,26 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 @keyframes thinking { 0%, 70%, 100% { opacity: .25; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-3px); } }
 
 .cockpit-exact-generation { display: block; margin-top: 2px; color: var(--quiet); font: var(--font-2xs) var(--font-code); overflow-wrap: anywhere; }
+
+.platform-history-event.is-message > div time { margin-left: auto; font-weight: 500; letter-spacing: 0; text-transform: none; }
+.platform-history-text { display: grid; gap: 8px; padding: 10px 12px; border-radius: 10px; background: var(--panel-2); color: var(--text); font-size: var(--font-sm); line-height: 1.6; overflow-wrap: anywhere; }
+.platform-history-event[data-role="user"] .platform-history-text { background: var(--accent-softer); }
+.platform-history-event.is-message[data-role] .platform-history-text p { margin: 0; padding: 0; border-radius: 0; background: none; color: inherit; font-size: inherit; white-space: pre-wrap; }
+.platform-history-text code { padding: 1px 5px; border-radius: 5px; background: color-mix(in srgb, var(--text) 8%, transparent); font: .92em var(--font-code); }
+.platform-history-text pre { margin: 0; padding: 9px 11px; overflow-x: auto; border-radius: 8px; background: color-mix(in srgb, var(--text) 6%, transparent); }
+.platform-history-text pre code { padding: 0; background: none; }
+.platform-history-text small { color: var(--quiet); font-size: var(--font-2xs); }
+.platform-history-steps { color: var(--muted); font-size: var(--font-xs); }
+.platform-history-steps summary { padding: 4px 2px; cursor: pointer; list-style-position: inside; }
+.platform-history-steps summary:hover { color: var(--text); }
+.platform-history-steps ol { display: grid; gap: 2px; margin: 4px 0 0; padding-left: 22px; color: var(--quiet); }
+.platform-history-run { margin: 0; padding-left: 2px; color: var(--muted); font-size: var(--font-xs); }
+.platform-history-run::before { margin-right: 7px; color: var(--accent-text); content: "●"; font-size: 8px; vertical-align: 2px; }
+.platform-history-run.is-failed, .platform-history-run.is-cancelled { color: var(--amber); }
+.platform-history-event.is-message > header { display: flex; gap: 8px; align-items: baseline; color: var(--quiet); font-size: var(--font-2xs); font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.facts dd[data-tone="warn"] { color: var(--amber); }
+.facts dd[data-tone="bad"] { color: var(--red); }
+.facts dd[data-tone="muted"] { color: var(--muted); }
+#processes-health[data-state="waiting"] { color: var(--muted); background: var(--panel-2); }
+/* The message box stays reachable however long the conversation gets. */
+#chat-form { position: sticky; z-index: 5; bottom: 12px; }
