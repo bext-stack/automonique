@@ -41,6 +41,22 @@
 //!   an issue can mark it delivered (see
 //!   [`crate::ticket_reactions::delivery_finished`]).
 //!
+//! One optional switch is admitted in both schema versions as well:
+//!
+//! - `retire_stale_approvals=on|off` controls what happens to a Monique job
+//!   still awaiting approval once GitHub shows its ticket finished. It only
+//!   has an effect when a `team_github_login` is configured: without one a
+//!   delivery reported by comment cannot be judged, tickets awaiting approval
+//!   are not verified and nothing is retired. With one, the default is `on`:
+//!   the job is rejected through the ordinary ticket decision. `off` keeps the
+//!   verification (and the ✅) and leaves the job waiting in Manage. The line
+//!   may be repeated as long as every occurrence agrees.
+//!
+//! Every key is known to this parser or the file is refused: an unrecognized
+//! key is `slack_config_malformed`, never ignored. The dashboard reads the
+//! same file through this same parser, so a key is written only once every
+//! running binary knows it.
+//!
 //! # Why an operator types a name and never an id
 //!
 //! [`ChannelId`] admits `C…`, `G…` and `D…` — every conversation the token can
@@ -417,6 +433,9 @@ pub enum SlackConfigError {
     AutoConfirmInvalid,
     /// A `team_github_login` entry is invalid, duplicated, or over capacity.
     TeamLoginInvalid,
+    /// `retire_stale_approvals` is neither `on` nor `off`, or two occurrences
+    /// disagree.
+    RetireStaleApprovalsInvalid,
     /// The ticket work ledger beside the ticket registries would not open.
     TicketLedgerUnavailable,
     /// File exchange was enabled without a tenant artifact policy.
@@ -469,6 +488,9 @@ impl fmt::Display for SlackConfigError {
             Self::TeamLoginInvalid => {
                 formatter.write_str("slack team GitHub login configuration is invalid")
             }
+            Self::RetireStaleApprovalsInvalid => {
+                formatter.write_str("slack stale-approval retirement switch is invalid")
+            }
             Self::TicketLedgerUnavailable => {
                 formatter.write_str("slack ticket work ledger is unavailable")
             }
@@ -509,6 +531,7 @@ impl SlackConfigError {
             Self::FeatureInvalid => "slack_config_feature",
             Self::AutoConfirmInvalid => "slack_config_auto_confirm",
             Self::TeamLoginInvalid => "slack_config_team_github_login",
+            Self::RetireStaleApprovalsInvalid => "slack_config_retire_stale_approvals",
             Self::TicketLedgerUnavailable => "slack_ticket_ledger_unavailable",
             Self::ArtifactPolicyRequired => "slack_artifact_policy_required",
             Self::TicketActionsUnavailable => "slack_ticket_actions_unavailable",
@@ -576,6 +599,8 @@ pub struct SlackConfig {
     interactive_decisions: bool,
     auto_confirm: Vec<UserId>,
     team_github_logins: Vec<String>,
+    /// The `retire_stale_approvals` switch as written; `on` when absent.
+    retire_stale_approvals: bool,
 }
 
 impl fmt::Debug for SlackConfig {
@@ -594,6 +619,7 @@ impl fmt::Debug for SlackConfig {
             .field("interactive_decisions", &self.interactive_decisions)
             .field("auto_confirm_count", &self.auto_confirm.len())
             .field("team_github_login_count", &self.team_github_logins.len())
+            .field("retire_stale_approvals", &self.retires_stale_approvals())
             .finish()
     }
 }
@@ -622,6 +648,19 @@ impl SlackConfig {
     #[must_use]
     pub const fn channels(&self) -> &ChannelMap {
         &self.channels
+    }
+
+    /// Whether tickets whose Monique jobs all await approval are verified
+    /// against GitHub: only when a team login makes "delivered" judgeable.
+    #[must_use]
+    pub(crate) fn verifies_unapproved_tickets(&self) -> bool {
+        !self.team_github_logins.is_empty()
+    }
+
+    /// Whether an approval left waiting on a finished ticket is retired.
+    #[must_use]
+    pub(crate) fn retires_stale_approvals(&self) -> bool {
+        self.verifies_unapproved_tickets() && self.retire_stale_approvals
     }
 
     /// Load the configuration, distinguishing "deliberately not configured"
@@ -672,6 +711,7 @@ impl SlackConfig {
         let mut features: Vec<SlackFeature> = Vec::new();
         let mut auto_confirm: Vec<UserId> = Vec::new();
         let mut team_github_logins: Vec<String> = Vec::new();
+        let mut retire_stale_approvals: Option<bool> = None;
         let mut terminated = false;
         for line in lines {
             if terminated {
@@ -716,6 +756,20 @@ impl SlackConfig {
                         return Err(SlackConfigError::TeamLoginInvalid);
                     }
                     team_github_logins.push(value.to_owned());
+                }
+                // A switch, admitted in v1 as well. Writing it twice is not a
+                // duplicate-key refusal as long as both lines say the same
+                // thing; two that disagree leave nothing to believe.
+                "retire_stale_approvals" => {
+                    let enabled = match value {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(SlackConfigError::RetireStaleApprovalsInvalid),
+                    };
+                    if retire_stale_approvals.is_some_and(|seen| seen != enabled) {
+                        return Err(SlackConfigError::RetireStaleApprovalsInvalid);
+                    }
+                    retire_stale_approvals = Some(enabled);
                 }
                 _ => return Err(SlackConfigError::Malformed),
             }
@@ -806,6 +860,7 @@ impl SlackConfig {
             interactive_decisions,
             auto_confirm,
             team_github_logins,
+            retire_stale_approvals: retire_stale_approvals.unwrap_or(true),
         }))
     }
 
@@ -3309,6 +3364,22 @@ fn slack_ticket_terminal_text(
     }
 }
 
+/// Whether a job ended because the ticket reactor retired its stale approval.
+///
+/// Manage stores a rejection's reason as the cancelled job's result, and that
+/// reason is fixed text only the reactor sends, so the job itself says how it
+/// ended: no second registry has to agree with Manage about it, and a restart
+/// or a retried decision cannot lose the answer.
+fn retired_stale_approval(
+    notification: &crate::telegram_bridge::SlackTicketNotification,
+    status: &TicketStatus,
+) -> bool {
+    notification.job_id == status.job_id
+        && notification.issue_url == status.issue_url
+        && status.job_status == TicketJobStatus::Cancelled
+        && status.result.trim() == crate::ticket_reactions::STALE_APPROVAL_REASON
+}
+
 /// Resolve a read-only issue follow-up against the current Slack thread.
 ///
 /// The first turn commonly carries the canonical URL while a human follow-up
@@ -3461,6 +3532,16 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             // notification remains unclaimed for the successor to inspect.
             if stop.load(Ordering::Acquire) {
                 break;
+            }
+            // A job retired because its ticket was finished elsewhere ends
+            // without a word: the ✅ on the post already says the ticket is
+            // done, and "cancelled" under it would read as a failure.
+            if retired_stale_approval(&notification, &status) {
+                let _ = self
+                    .gates
+                    .lock()
+                    .map(|mut gates| gates.settle_slack_notification(&notification));
+                continue;
             }
             let Some(text) = slack_ticket_terminal_text(&notification, &status) else {
                 continue;
@@ -5306,6 +5387,8 @@ impl SlackTicketHost {
         let Some(config) = SlackConfig::load(state_dir)? else {
             return Ok(Self::Disabled);
         };
+        let verify_unapproved = config.verifies_unapproved_tickets();
+        let retire_stale_approvals = config.retires_stale_approvals();
         let SlackConfig {
             token,
             app_token,
@@ -5316,6 +5399,7 @@ impl SlackTicketHost {
             interactive_decisions,
             auto_confirm,
             team_github_logins,
+            retire_stale_approvals: _,
         } = config;
         let Some(app_token) = app_token else {
             return Ok(Self::Disabled);
@@ -5451,12 +5535,29 @@ impl SlackTicketHost {
             }
             crate::github::GitHubHost::Disabled => None,
         };
+        // Retiring is the reactor's one write to Manage, so it gets its own
+        // handle too, and the gate registry it shares with both transports:
+        // that is where the job's decision coordinates are retained.
+        let retirer = if retire_stale_approvals {
+            crate::ticket_intake::FleetConfig::load(state_dir)
+                .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
+                .map(|config| {
+                    Box::new(crate::ticket_reactions::ManageApprovalRetirer {
+                        manage: Box::new(config.into_action_client()),
+                        gates: Arc::clone(&gates),
+                    }) as Box<dyn crate::ticket_reactions::StaleApprovalRetirer>
+                })
+        } else {
+            None
+        };
         let reactor = crate::ticket_reactions::TicketReactor {
             ledger: Arc::clone(&ledger),
             slack: Box::new(Arc::clone(&client)),
             jobs: reactor_jobs,
             github: reactor_github,
             team_logins: team_github_logins,
+            verify_unapproved,
+            retirer,
             channels: channels.0.iter().map(|(_, id)| id.clone()).collect(),
             requests: claim_requests,
             last_job_poll_ms: 0,
@@ -10164,6 +10265,231 @@ mod tests {
             pending[0].name,
             automonique_slack_connector::ReactionName::WhiteCheckMark
         );
+    }
+
+    fn cancelled_ticket_status(result: &str) -> automonique_support_connector::TicketStatus {
+        let mut status = done_ticket_status();
+        status.job_status = automonique_support_connector::TicketJobStatus::Cancelled;
+        status.result = result.to_owned();
+        status
+    }
+
+    #[test]
+    fn a_retired_stale_approval_settles_its_notification_without_a_thread_message() {
+        let (mut router, messages, ledger) = work_router(
+            FakeManage {
+                status: Some(cancelled_ticket_status(
+                    crate::ticket_reactions::STALE_APPROVAL_REASON,
+                )),
+                ..FakeManage::default()
+            },
+            Vec::new(),
+        );
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvPost"), "");
+        assert_eq!(messages.lock().expect("messages").len(), 1, "the card");
+
+        router.poll_ticket_notifications(&AtomicBool::new(false));
+        assert_eq!(
+            messages.lock().expect("messages").len(),
+            1,
+            "no cancelled message under a ticket that is done"
+        );
+        assert!(
+            router
+                .gates
+                .lock()
+                .expect("gates")
+                .pending_slack_notifications(8)
+                .is_empty(),
+            "the row is settled, not left to be polled forever"
+        );
+        // The status read is still shared: the job is no longer a claim.
+        assert!(
+            ledger
+                .lock()
+                .expect("ledger")
+                .ticket_jobs(&ticket_key())
+                .is_empty()
+        );
+        router.poll_ticket_notifications(&AtomicBool::new(false));
+        assert_eq!(messages.lock().expect("messages").len(), 1);
+
+        // A job cancelled for any other reason is still announced.
+        let (mut router, messages, _) = work_router(
+            FakeManage {
+                status: Some(cancelled_ticket_status("Not authorized for this release")),
+                ..FakeManage::default()
+            },
+            Vec::new(),
+        );
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvPost"), "");
+        router.poll_ticket_notifications(&AtomicBool::new(false));
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].contains("ticket work was cancelled"));
+    }
+
+    #[test]
+    fn a_ticket_posted_again_after_its_approval_was_retired_opens_a_fresh_gate() {
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let (mut router, messages, ledger) = work_router(manage, Vec::new());
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvPost"), "");
+
+        // The reactor found the ticket finished and retired the waiting job:
+        // the ticket is finished, the job is gone, its gate is resolved.
+        {
+            let mut ledger = ledger.lock().expect("ledger");
+            let now_ms = crate::unix_millis().expect("clock");
+            ledger
+                .mark_finished(&ticket_key(), true, now_ms)
+                .expect("finished");
+            ledger
+                .observe_job_status(
+                    "job-fixture-123456",
+                    automonique_support_connector::TicketJobStatus::Cancelled,
+                    now_ms,
+                )
+                .expect("retired");
+            assert!(ledger.ticket_jobs(&ticket_key()).is_empty());
+        }
+        router
+            .gates
+            .lock()
+            .expect("gates")
+            .resolve("job-fixture-123456")
+            .expect("resolved");
+
+        // The client posts the ticket again. Nothing the daemon remembers
+        // stands in the way: Manage is asked under the new message's key, and
+        // the gate it answers with is registered and offered for approval.
+        let mut again = ticket_event("U0CLIENT01", TICKET_URL, "EvRepost");
+        again.ts = MessageTs::new("1723549999.000300").expect("ts");
+        again.parent = MessageTs::new("1723549999.000300").expect("ts");
+        router.handle_with_context(again, "");
+
+        assert_eq!(
+            opened.lock().expect("opened").as_slice(),
+            [
+                (
+                    String::from(TICKET_URL),
+                    String::from("slack:T0RESERVED:event:EvPost")
+                ),
+                (
+                    String::from(TICKET_URL),
+                    String::from("slack:T0RESERVED:event:EvRepost")
+                ),
+            ]
+        );
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[1].contains("Confirmation required"));
+        assert!(
+            router
+                .gates
+                .lock()
+                .expect("gates")
+                .gate_for_job("job-fixture-123456")
+                .is_some()
+        );
+        let ledger = ledger.lock().expect("ledger");
+        assert_eq!(ledger.posts(&ticket_key()).len(), 2);
+        assert_eq!(
+            ledger.ticket_jobs(&ticket_key()),
+            vec![String::from("job-fixture-123456")]
+        );
+        // The finish is checked again against GitHub rather than trusted.
+        assert!(ledger.is_queued(&ticket_key()));
+    }
+
+    #[test]
+    fn stale_approval_retirement_follows_the_team_login_and_its_switch() {
+        let with = |extra: &[&str]| {
+            let mut lines = complete();
+            lines.extend(extra.iter().map(|line| (*line).to_owned()));
+            SlackConfig::parse(&config(&borrowed(&lines)))
+        };
+        let present = |extra: &[&str]| with(extra).expect("valid").expect("present");
+
+        // Without a team login nothing changes, whatever the switch says.
+        assert!(!parsed().verifies_unapproved_tickets());
+        assert!(!parsed().retires_stale_approvals());
+        let switched_on = present(&["retire_stale_approvals=on"]);
+        assert!(!switched_on.verifies_unapproved_tickets());
+        assert!(!switched_on.retires_stale_approvals());
+
+        // With one, it is on unless opted out; opting out keeps verification.
+        let default = present(&["team_github_login=team-member"]);
+        assert!(default.verifies_unapproved_tickets());
+        assert!(default.retires_stale_approvals());
+        let opted_out = present(&[
+            "team_github_login=team-member",
+            "retire_stale_approvals=off",
+        ]);
+        assert!(opted_out.verifies_unapproved_tickets());
+        assert!(!opted_out.retires_stale_approvals());
+        assert!(format!("{opted_out:?}").contains("retire_stale_approvals: false"));
+
+        // Repeating the line is safe as long as every occurrence agrees.
+        let repeated = present(&[
+            "team_github_login=team-member",
+            "retire_stale_approvals=off",
+            "retire_stale_approvals=off",
+        ]);
+        assert!(!repeated.retires_stale_approvals());
+        assert!(
+            present(&[
+                "retire_stale_approvals=on",
+                "team_github_login=team-member",
+                "retire_stale_approvals=on",
+            ])
+            .retires_stale_approvals()
+        );
+
+        // The v2 schema admits it as well.
+        let mut lines = complete();
+        lines.push(String::from("team_github_login=team-member"));
+        lines.push(String::from("retire_stale_approvals=off"));
+        let v2 = SlackConfig::parse(&config_v2(&borrowed(&lines)))
+            .expect("v2 with the switch")
+            .expect("present");
+        assert!(!v2.retires_stale_approvals());
+
+        for bad in [
+            "retire_stale_approvals=off\nretire_stale_approvals=on",
+            "retire_stale_approvals=maybe",
+            "retire_stale_approvals=OFF",
+            "retire_stale_approvals=",
+        ] {
+            assert_eq!(
+                with(&[bad]).expect_err(bad).category(),
+                "slack_config_retire_stale_approvals",
+                "{bad}"
+            );
+        }
+    }
+
+    /// The parser is shared by the daemon and the dashboard, and it is strict:
+    /// a key one of them does not know refuses the file for both instead of
+    /// being skipped by one. A new key is therefore written only after every
+    /// running binary has been upgraded.
+    #[test]
+    fn a_key_this_parser_does_not_know_is_refused_rather_than_ignored() {
+        for unknown in [
+            "retire_stale_claims=off",
+            "retire-stale-approvals=off",
+            "future_switch=on",
+        ] {
+            let mut lines = complete();
+            lines.push(unknown.to_owned());
+            for text in [config(&borrowed(&lines)), config_v2(&borrowed(&lines))] {
+                assert_eq!(
+                    SlackConfig::parse(&text).expect_err(unknown).category(),
+                    "slack_config_malformed",
+                    "{unknown}"
+                );
+            }
+        }
     }
 
     #[test]

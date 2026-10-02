@@ -41,6 +41,15 @@ end=automonique.slack/v2
   Unlisted users keep the approval card.
 - `team_github_login=<login>` (optional, repeatable, v1 and v2) names a GitHub
   login of the delivery team. Logins are configuration, never code.
+- `retire_stale_approvals=on|off` (optional, v1 and v2; may be repeated when
+  every occurrence agrees) controls the retirement described under "Stale
+  approvals" below. It has an effect only when a `team_github_login` is
+  configured, and then defaults to `on`.
+
+Every key must be known to the parser: an unrecognized key refuses the whole
+file (`slack_config_malformed`) for the daemon and for the dashboard, which
+read it through the same parser. Add a new key only after every running binary
+has been upgraded to a release that knows it.
 
 `files` is reserved but must remain disabled until the tenant has an explicit
 artifact size, retention, access and deletion policy and the external-upload
@@ -147,6 +156,35 @@ every competing Monique job (`pending_approval`, `pending`, `claimed`,
 it answers in thread instead of opening a Monique job. A release checks GitHub
 at once and reacts ✅ when the ticket is finished; otherwise the ticket is
 queued for verification.
+
+### Stale approvals
+
+A Monique job in `pending_approval` is a question nobody answered, not work in
+progress: it never earns 👀 and it does not keep its ticket away from GitHub.
+When a `team_github_login` is configured, a ticket whose jobs are all still
+awaiting approval is verified on the same bounded cadence (three tickets per
+pass, the longest-due first, so a backlog rotates), at most every thirty
+minutes per ticket, until 21 days after its newest Slack post.
+
+When such a ticket is found finished it receives its ✅, and, unless
+`retire_stale_approvals=off`, the approval it no longer needs is retired: the
+daemon reads the job's status again and, only if it is still
+`pending_approval`, sends Manage the ordinary reject decision for that exact
+job with the gate coordinates retained at intake, the actor
+`automonique:stale-approval`, a decision key derived from the job id (so a
+retry is the same decision) and the fixed reason "Superseded: the ticket was
+finished outside Monique before this run was approved." A job that is
+`pending`, `claimed`, `running` or terminal is never rejected. A failed
+attempt is retried every ten minutes, five times at most, then abandoned and
+reported once in the journal (`stale_approval_settled`); the job then stays
+waiting in Manage.
+
+Manage records the rejection as a `cancelled` job whose result is that reason.
+The originating Slack thread is not told: its notification is settled without
+a message, because the ✅ already says the ticket is done. If the client
+reopens the ticket (a newer comment from outside the team) and posts it again,
+intake runs as usual and opens a fresh approval; the finish is withdrawn at
+the next verification.
 
 ## Decision contract and ordering
 

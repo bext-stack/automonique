@@ -14,6 +14,8 @@ pub(crate) const DRAIN_MESSAGE_ID: &str = "c64c8c969f2d43bb8baef5569fb69f96";
 pub(crate) const DRAIN_EVENT: &str = "shutdown_worker_drain";
 pub(crate) const WORKER_FAULT_MESSAGE_ID: &str = "5d3f0b7a9c1e4e0b8a6f2d9c4b1e7a35";
 pub(crate) const WORKER_FAULT_EVENT: &str = "worker_fault";
+pub(crate) const STALE_APPROVAL_MESSAGE_ID: &str = "9a4e61c2b7d84f0e8c35d1a6f2b97e04";
+pub(crate) const STALE_APPROVAL_EVENT: &str = "stale_approval_settled";
 pub(crate) const RENEWAL_DEFERRED_MESSAGE_ID: &str = "0b1c7d5e2a9f4b6c8d3e1f7a5c9b2d40";
 pub(crate) const RENEWAL_DEFERRED_EVENT: &str = "lease_renewal_deferred";
 pub(crate) const TEMPFS_RECONCILED_MESSAGE_ID: &str = "db1313b593ad4bbe907a22f790c6b8f6";
@@ -60,6 +62,40 @@ fn emit_worker_fault_to(socket_path: &Path, worker_group: &str, category: &str) 
          AUTOMONIQUE_SCHEMA={READY_SCHEMA}\n\
          AUTOMONIQUE_EVENT={WORKER_FAULT_EVENT}\n\
          AUTOMONIQUE_WORKER_GROUP={worker_group}\n\
+         AUTOMONIQUE_FAULT_CATEGORY={category}\n"
+    );
+    emit_to(socket_path, &event)
+}
+
+/// The ticket reactor settled an approval its ticket no longer needed.
+///
+/// `outcome` is `retired` (Manage recorded the rejection) or `abandoned` (the
+/// bounded attempts ran out and the job is left waiting); `category` says why.
+/// Emitted once per job per outcome. Both fields are stable machine
+/// vocabularies: no job, ticket or channel coordinate reaches the journal.
+pub(crate) fn emit_stale_approval(outcome: &str, category: &str) -> io::Result<()> {
+    if std::env::var_os("JOURNAL_STREAM").is_none() {
+        return Ok(());
+    }
+    emit_stale_approval_to(Path::new(JOURNAL_SOCKET), outcome, category)
+}
+
+fn emit_stale_approval_to(socket_path: &Path, outcome: &str, category: &str) -> io::Result<()> {
+    if !stable_vocabulary(outcome) || !stable_vocabulary(category) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid stale approval observation",
+        ));
+    }
+    let priority = if outcome == "abandoned" { 4 } else { 6 };
+    let event = format!(
+        "MESSAGE=Automonique settled a stale ticket approval\n\
+         MESSAGE_ID={STALE_APPROVAL_MESSAGE_ID}\n\
+         PRIORITY={priority}\n\
+         SYSLOG_IDENTIFIER=automonique\n\
+         AUTOMONIQUE_SCHEMA={READY_SCHEMA}\n\
+         AUTOMONIQUE_EVENT={STALE_APPROVAL_EVENT}\n\
+         AUTOMONIQUE_STALE_APPROVAL_OUTCOME={outcome}\n\
          AUTOMONIQUE_FAULT_CATEGORY={category}\n"
     );
     emit_to(socket_path, &event)
@@ -600,6 +636,42 @@ mod tests {
         }
         assert!(!event.contains("CONTENT="));
         assert!(!event.contains("TOKEN="));
+    }
+
+    #[test]
+    fn stale_approval_event_is_bounded_content_free_and_refuses_free_text() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("journal.sock");
+        let receiver = UnixDatagram::bind(&path).expect("journal receiver");
+
+        emit_stale_approval_to(&path, "abandoned", "decision_refused").expect("structured event");
+        let mut bytes = [0_u8; MAX_EVENT_BYTES + 1];
+        let count = receiver.recv(&mut bytes).expect("event datagram");
+        let event = std::str::from_utf8(&bytes[..count]).expect("UTF-8 event");
+
+        assert!(count <= MAX_EVENT_BYTES);
+        for field in [
+            "MESSAGE=Automonique settled a stale ticket approval",
+            "MESSAGE_ID=9a4e61c2b7d84f0e8c35d1a6f2b97e04",
+            "PRIORITY=4",
+            "AUTOMONIQUE_EVENT=stale_approval_settled",
+            "AUTOMONIQUE_STALE_APPROVAL_OUTCOME=abandoned",
+            "AUTOMONIQUE_FAULT_CATEGORY=decision_refused",
+        ] {
+            assert!(event.lines().any(|line| line == field), "missing {field}");
+        }
+        for (outcome, category) in [
+            ("retired\nTOKEN=secret", "rejected"),
+            ("retired", "job-123"),
+            ("", "rejected"),
+        ] {
+            assert_eq!(
+                emit_stale_approval_to(&path, outcome, category)
+                    .expect_err("invalid field must be refused")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]
