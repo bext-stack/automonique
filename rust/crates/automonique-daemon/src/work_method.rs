@@ -79,6 +79,7 @@ COMPTE RENDU GITHUB (obligatoire, en français, court, sans jargon interne) — 
 - **Demande 2 — …** (même format pour chaque demande)
 - **Déploiement** : <procédure suivie> · <URL vérifiée> · <preuve que le changement est servi>
 - **Non fait / à clarifier** : <liste honnête, ou « rien »>
+Termine le commentaire par une ligne « — Monique » : il est publié sous le compte de l'équipe et le client doit savoir qui a répondu.
 Le client lit ce commentaire et n'a accès ni au serveur ni au code : n'y cite aucun chemin de fichier (ni /tmp, ni fichier source), aucun nom de commit et aucun marqueur MONIQUE_SHOT_OK. Les captures servent à TA vérification ; la preuve donnée au client est ce qu'il peut voir lui-même à l'URL.
 N'écris jamais « terminé », « livré » ou « vérifié » pour une demande sans preuve lue. Laisse l'issue ouverte sauf consigne contraire. Ta réponse finale doit contenir le permalien exact de ce commentaire (…#issuecomment-…).
 ",

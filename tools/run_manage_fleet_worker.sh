@@ -1126,8 +1126,8 @@ heartbeat online 0 || {
 
 # A worker that starts has no run in progress, so any job Manage still shows as
 # claimed or running for this instance lost its process (worker restart, host
-# out of memory). Report it failed now: left alone it blocks a relaunch of the
-# same ticket and only reads as failed after Manage's 20 minute staleness window.
+# out of memory). Hand it back to Manage now: left alone it blocks the ticket
+# and only reads as failed after Manage's 20 minute staleness window.
 recover_orphaned_jobs() {
     refresh_process_snapshot || return 0
     snapshot=$runtime_dir/processes.json
@@ -1135,8 +1135,17 @@ recover_orphaned_jobs() {
     orphans=$(jq -r '.jobs[]? | select(.assigned_to_worker == true and (.status == "running" or .status == "claimed")) | .id' "$snapshot" 2>/dev/null) || return 0
     while IFS= read -r orphan; do
         [[ "$orphan" =~ ^[0-9a-f-]{36}$ ]] || continue
-        report_job "$orphan" failed 'Interrupted: the Monique worker restarted while this run was in progress. Relaunch the ticket to run it again.' \
-            && printf 'recovered orphaned job %s\n' "$orphan" >&2
+        # `interrupted` asks Manage to queue the job again under the same id
+        # (bounded there); a Manage that does not know the flag records the
+        # failure, as does one whose requeue bound is spent.
+        body=$(jq -cn --arg job "$orphan" \
+            '{action:"job",jobId:$job,status:"failed",interrupted:true,result:"Interrupted: the Monique worker restarted while this run was in progress."}')
+        response=$(platform_runtime "$body") || continue
+        if jq -e '.ok == true and .requeued == true' >/dev/null <<<"$response"; then
+            printf 'requeued interrupted job %s\n' "$orphan" >&2
+        elif jq -e '.ok == true' >/dev/null <<<"$response"; then
+            printf 'failed interrupted job %s\n' "$orphan" >&2
+        fi
     done <<<"$orphans"
     refresh_process_snapshot || true
 }
