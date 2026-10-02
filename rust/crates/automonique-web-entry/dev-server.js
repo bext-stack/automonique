@@ -59,6 +59,20 @@ const RELOAD_CLIENT = `"use strict";
 })();
 `;
 
+// A front proxy may own `/api/*` paths for itself (bext reserves
+// `/api/platform/*`), so the page's API calls are routed through a private
+// prefix that this server maps back to the web entry's own paths.
+const API_PREFIX = "/__dev/api";
+const API_CLIENT = `"use strict";
+(() => {
+  const fetchUpstream = window.fetch.bind(window);
+  window.fetch = (input, init) => fetchUpstream(
+    typeof input === "string" && input.startsWith("/api/") ? "${API_PREFIX}" + input : input,
+    init,
+  );
+})();
+`;
+
 const WATCHED = new Set(["dashboard.html", ...[...LOCAL_ASSETS.values()].map(([name]) => name)]);
 const clients = new Set();
 const encoder = new TextEncoder();
@@ -91,13 +105,13 @@ function events(request) {
   });
 }
 
-async function forward(request) {
+async function forward(request, pathname = new URL(request.url).pathname) {
   const url = new URL(request.url);
   const headers = new Headers(request.headers);
   headers.set("Host", canonicalHost);
   headers.set("X-Forwarded-Proto", "https");
   headers.delete("Accept-Encoding");
-  const response = await fetch(new URL(url.pathname + url.search, upstream), {
+  const response = await fetch(new URL(pathname + url.search, upstream), {
     method: request.method,
     headers,
     body: ["GET", "HEAD"].includes(request.method) ? undefined : await request.arrayBuffer(),
@@ -112,9 +126,16 @@ async function forward(request) {
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
-  async fetch(request) {
+  async fetch(request, server) {
     const { pathname } = new URL(request.url);
-    if (pathname === "/__dev/events") return events(request);
+    if (pathname === "/__dev/events") {
+      // The reload stream is idle by design; keep it open past Bun's idle timeout.
+      server.timeout(request, 0);
+      return events(request);
+    }
+    if (pathname === "/__dev/api.js") {
+      return new Response(API_CLIENT, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+    }
     if (pathname === "/__dev/reload.js") {
       return new Response(RELOAD_CLIENT, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
     }
@@ -137,11 +158,15 @@ const server = Bun.serve({
       });
     }
     try {
-      const { response, headers } = await forward(request);
+      const upstreamPath = pathname.startsWith(`${API_PREFIX}/`) ? pathname.slice(API_PREFIX.length) : pathname;
+      const { response, headers } = await forward(request, upstreamPath);
       // The document still goes through the web entry, which authenticates it
       // and mints the API session cookie; only its body is replaced.
       if (pathname === "/" && response.ok) {
+        // api.js must run before the dashboard's deferred scripts issue their
+        // first request, so it goes ahead of every other script.
         const html = (await readFile(assetsDir + "dashboard.html", "utf8"))
+          .replace("<script ", '<script src="/__dev/api.js"></script>\n    <script ')
           .replace("</head>", '    <script src="/__dev/reload.js" defer></script>\n  </head>');
         return new Response(html, { status: response.status, headers });
       }
