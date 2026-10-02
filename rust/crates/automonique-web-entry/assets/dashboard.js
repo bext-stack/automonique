@@ -1241,6 +1241,8 @@ const frenchUi = Object.freeze({
   "Pick a task in the list to read its conversation.": "Choisissez une tâche dans la liste pour lire sa conversation.",
   "Close conversation": "Fermer la conversation",
   "Read only": "Lecture seule",
+  "View run": "Voir l’exécution",
+  "Open the run to see what went wrong.": "Ouvrez l’exécution pour voir ce qui n’a pas marché.",
   "Opening…": "Ouverture…",
   "Opening conversation…": "Ouverture de la conversation…",
   "Conversation history": "Historique de la conversation",
@@ -2069,8 +2071,8 @@ function toast(message, kind = "info") {
 
 function attention(status) {
   const items = [];
-  const add = (key, title, detail, href = null) => {
-    if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href });
+  const add = (key, title, detail, href = null, processId = null) => {
+    if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href, processId });
   };
   if (status.health !== "operational") add("runtime", "Monique is not fully healthy", `Current state: ${status.health || "unavailable"}.`);
   if (status.stale) add("stale", "Status is out of date", "This page has not received a recent status update.");
@@ -2084,8 +2086,9 @@ function attention(status) {
     add(
       `manage:${job.id}`,
       `Agent run ${shortProcessReference(job.id)} failed`,
-      "Open it in Manage to see what went wrong.",
+      "Open the run to see what went wrong.",
       safeTicketLink(job.manage_url) || safeTicketLink(job.issue_url),
+      job.id,
     );
   });
   return items;
@@ -2113,6 +2116,18 @@ function renderAttention(status) {
     const detail = document.createElement("span");
     detail.textContent = item.detail;
     row.append(title, detail);
+    if (item.processId) {
+      // Always reachable in the dashboard, even when Manage gave no link.
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "button ghost small";
+      open.textContent = "View run";
+      open.addEventListener("click", () => {
+        window.location.hash = "#operations";
+        window.setTimeout(() => consoleOpenProcess(item.processId), 0);
+      });
+      row.append(open);
+    }
     if (item.href) {
       const link = document.createElement("a");
       link.href = item.href;
