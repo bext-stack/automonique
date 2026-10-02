@@ -1122,6 +1122,24 @@ heartbeat online 0 || {
     exit 1
 }
 
+# A worker that starts has no run in progress, so any job Manage still shows as
+# claimed or running for this instance lost its process (worker restart, host
+# out of memory). Report it failed now: left alone it blocks a relaunch of the
+# same ticket and only reads as failed after Manage's 20 minute staleness window.
+recover_orphaned_jobs() {
+    refresh_process_snapshot || return 0
+    snapshot=$runtime_dir/processes.json
+    [[ -f "$snapshot" && ! -L "$snapshot" ]] || return 0
+    orphans=$(jq -r '.jobs[]? | select(.assigned_to_worker == true and (.status == "running" or .status == "claimed")) | .id' "$snapshot" 2>/dev/null) || return 0
+    while IFS= read -r orphan; do
+        [[ "$orphan" =~ ^[0-9a-f-]{36}$ ]] || continue
+        report_job "$orphan" failed 'Interrupted: the Monique worker restarted while this run was in progress. Relaunch the ticket to run it again.' \
+            && printf 'recovered orphaned job %s\n' "$orphan" >&2
+    done <<<"$orphans"
+    refresh_process_snapshot || true
+}
+recover_orphaned_jobs
+
 while (( stopping == 0 )); do
     previous_selection=$selection_key
     if load_selected_account; then
