@@ -87,10 +87,14 @@
 //! # Nothing here crashes the daemon
 //!
 //! A malformed update, a refused reply, a send failure, an unreadable status,
-//! and a lost lease are all counted and stepped over. The one condition that
-//! stops the loop is [`RuntimeError::CommitReconciliationRequired`], because a
-//! poller holding an unresolved ambiguous commit is fail-closed by construction
-//! and every further poll would return the same error forever.
+//! and a lost lease are all counted and stepped over. So is an ambiguous
+//! commit ([`RuntimeError::CommitReconciliationRequired`]): the poller retains
+//! the exact batch, and the loop replays it through the sink — with no Telegram
+//! request — until the store answers, then answers the batch and polls on. The
+//! one condition that stops the loop is a replay the store refuses as
+//! inconsistent, because no amount of waiting resolves that and polling past
+//! it would skip or double-answer the batch. The host journals why a poller
+//! stopped, so a silent bot always has a reason on record.
 //!
 //! # What is counted is not yet reported
 //!
@@ -152,11 +156,11 @@ use automonique_transport_runtime::{
     MAX_ALLOWED_USERS, MAX_COMMAND_TEXT_BYTES, MAX_PAUSE_MS, MAX_SEND_MESSAGE_TEXT_UNITS,
     MemoryDirective, MessageModifiers, ModelAlias, ModifierKind, MuteDirective, OpaqueBotToken,
     OperatorAuthority, PollOutcome, PollerLease, RuntimeError, SendMessageRequest,
-    SetMessageReactionRequest, SetMyCommandsRequest, TelegramBotCommand, TelegramCallBudget,
-    TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan, TelegramHttpResponse,
-    TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan, TelegramPoller,
-    TelegramTextStyle, authorize_and_parse_tiered, command_manifest, command_refusal_text,
-    help_text, parse_command, parse_modifiers,
+    SetMessageReactionRequest, SetMyCommandsRequest, SinkFailure, TelegramBotCommand,
+    TelegramCallBudget, TelegramDurableSink, TelegramHttpClient, TelegramHttpPlan,
+    TelegramHttpResponse, TelegramOutbound, TelegramOutboundClient, TelegramOutboundPlan,
+    TelegramPoller, TelegramTextStyle, authorize_and_parse_tiered, command_manifest,
+    command_refusal_text, help_text, parse_command, parse_modifiers,
 };
 use automonique_transports::{
     TelegramAccessPolicy, TelegramBotId, TelegramDisposition, TelegramIngress, TelegramInputKind,
@@ -5143,6 +5147,11 @@ pub struct BridgeTotals {
     /// answered "I am muted" would be answering, which is the thing the
     /// operator asked to stop.
     pub muted: usize,
+    /// Iterations that found an ambiguous commit still unresolved and backed
+    /// off before replaying it again.
+    pub reconciliation_retries: usize,
+    /// Ambiguous commits that a replay resolved, after which polling resumed.
+    pub reconciled_commits: usize,
 }
 
 /// Records the exact bytes of each response on their way to the poller.
@@ -6228,9 +6237,6 @@ where
         now_ms: i64,
         cancellation: &CancellationToken,
     ) -> Result<DispatchReport, RuntimeError> {
-        if let Ok(mut slot) = self.captured.lock() {
-            *slot = None;
-        }
         // THE WHOLE-BOT PAUSE, AHEAD OF EVERYTHING. A `429` is about the bot, so
         // during it this cycle issues no Telegram call at all — not the drain,
         // and not the long poll. Nothing is lost by waiting: the poll offset was
@@ -6240,6 +6246,19 @@ where
         if self.paused_until(now_ms).is_some() {
             self.totals.paused_iterations += 1;
             return Ok(DispatchReport::default());
+        }
+        // AN AMBIGUOUS COMMIT IS RESOLVED BEFORE ANYTHING ELSE, AND RETRIED.
+        // The poller refuses every further poll until the exact retained batch
+        // is replayed through the sink, so that replay is this cycle's only
+        // work. It issues no Telegram request, and it runs before the roster
+        // refresh because the batch must be answered under the policy it was
+        // fetched with. A store that was merely busy when the first commit ran
+        // is the ordinary cause, and it answers the replay a moment later.
+        if self.poller.has_pending_commit() {
+            return self.reconcile_and_dispatch(lease, now_ms, cancellation);
+        }
+        if let Ok(mut slot) = self.captured.lock() {
+            *slot = None;
         }
         // Before the request, never after: the policy an update is admitted
         // under has to be the one it was fetched under, and this is the only
@@ -6288,6 +6307,35 @@ where
         report.add(ticket_completed);
         report.add(email_completed);
         report.add(recovered);
+        Ok(report)
+    }
+
+    /// Replay the retained ambiguous batch and answer it once it is durable.
+    ///
+    /// The batch was fetched by this bridge and never answered — its first
+    /// commit returned an error before any dispatch — so a replay the sink
+    /// reports as a duplicate (the first commit did land) is still answered
+    /// here, exactly once. The captured response bytes were kept for this: the
+    /// capture slot is cleared only by a poll that issues a new request.
+    ///
+    /// # Errors
+    ///
+    /// The runtime's refusal for the replay. A refusal that leaves the batch
+    /// pending is retried by [`Self::run`] on a later iteration.
+    fn reconcile_and_dispatch(
+        &mut self,
+        lease: &PollerLease,
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<DispatchReport, RuntimeError> {
+        let outcome = self.poller.reconcile_commit(lease, now_ms)?;
+        self.totals.reconciled_commits += 1;
+        let outcome = PollOutcome {
+            duplicate: false,
+            ..outcome
+        };
+        let report = self.dispatch_committed(&outcome, cancellation);
+        self.totals.dispatch.add(report);
         Ok(report)
     }
 
@@ -6387,13 +6435,26 @@ where
             match self.poll_and_dispatch(&current, now_ms, cancellation) {
                 Ok(_) => {}
                 Err(RuntimeError::CommitReconciliationRequired { .. }) => {
-                    // The poller is fail-closed from here on: every further
-                    // poll returns this same error until the exact retained
-                    // batch is resolved, and resolving it across a restart
-                    // needs host-side durable storage of the pending batch that
-                    // this slice does not add. Stopping is the honest end.
+                    // The poller retains the exact batch and refuses to poll
+                    // until it is replayed, which the next iteration does. The
+                    // usual cause is a store that did not answer in time — a
+                    // busy write lock fails the commit before anything is
+                    // written — and that is a reason to wait, not to stop:
+                    // a stopped poller leaves the bot silent until a restart.
                     self.totals.poll_failures += 1;
-                    self.terminal = Some("commit_reconciliation_required");
+                    self.totals.reconciliation_retries += 1;
+                    back_off(stop);
+                }
+                Err(
+                    RuntimeError::Sink(SinkFailure::Conflict)
+                    | RuntimeError::SinkReceiptMismatch
+                    | RuntimeError::InvalidConfiguration(_),
+                ) if self.poller.has_pending_commit() => {
+                    // The replay itself was refused as inconsistent with what
+                    // the store holds. That will not change by waiting, and
+                    // polling past the batch would skip or double-answer it.
+                    self.totals.poll_failures += 1;
+                    self.terminal = Some("commit_reconciliation_refused");
                     break;
                 }
                 Err(RuntimeError::Http(HttpFailure::RateLimited { .. })) => {

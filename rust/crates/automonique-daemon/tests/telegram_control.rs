@@ -271,9 +271,18 @@ struct SinkState {
     /// reply alone cannot tell whether the two agreed — and they must, or the
     /// bot answers a sender its own durable record says it denied.
     committed: Vec<Vec<DurableDisposition>>,
+    /// Refusals the next commits return, in order, before any is recorded.
+    commit_failures: VecDeque<SinkFailure>,
 }
 
 impl FakeSink {
+    /// A sink whose next commits fail with these refusals, then succeed.
+    fn failing_commits(failures: impl IntoIterator<Item = SinkFailure>) -> Self {
+        let sink = Self::default();
+        sink.state.lock().expect("sink state").commit_failures = failures.into_iter().collect();
+        sink
+    }
+
     fn duplicating() -> Self {
         let sink = Self::default();
         sink.state.lock().expect("sink state").duplicate = true;
@@ -324,6 +333,9 @@ impl TelegramDurableSink for FakeSink {
             "a commit must be fenced by the exact lease expiry"
         );
         let mut state = self.state.lock().expect("sink state");
+        if let Some(failure) = state.commit_failures.pop_front() {
+            return Err(failure);
+        }
         state.commits += 1;
         state.offset = batch.next_offset;
         state.committed.push(
@@ -5377,6 +5389,108 @@ fn the_run_loop_stops_when_the_stop_flag_is_set() {
     assert_eq!(bridge.totals().polls, 0);
     assert!(bridge.terminal().is_none());
     assert!(outbound.sent().is_empty());
+}
+
+/// A commit the store could not confirm — a busy write lock is the usual
+/// cause — is replayed on the next cycle and then answered, instead of ending
+/// the poller and leaving the bot silent until a restart.
+#[test]
+fn an_ambiguous_commit_is_replayed_and_answered_without_a_second_fetch() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let client = FakeClient::new([updates(&[(1, OPERATOR, "/help")])]);
+    let sink =
+        FakeSink::failing_commits([SinkFailure::AmbiguousCommit, SinkFailure::AmbiguousCommit]);
+    let mut bridge = bridge(&fixture, client.clone(), outbound.clone(), sink.clone());
+
+    assert!(matches!(
+        poll(&mut bridge),
+        Err(RuntimeError::CommitReconciliationRequired { next_offset: 2, .. })
+    ));
+    // A replay the store still cannot confirm stays pending, and still issues
+    // no Telegram request.
+    assert!(matches!(
+        poll(&mut bridge),
+        Err(RuntimeError::CommitReconciliationRequired { next_offset: 2, .. })
+    ));
+    assert!(outbound.messages().is_empty());
+
+    let report = poll(&mut bridge).expect("the replay commits");
+    assert_eq!(report.updates, 1);
+    assert_eq!(report.answered, 1);
+    assert_eq!(outbound.messages().len(), 1);
+    assert_eq!(sink.offset(), 2);
+    assert_eq!(sink.commits(), 1);
+    assert_eq!(
+        client.requested_offsets(),
+        vec![0],
+        "a replay fetches nothing"
+    );
+    assert_eq!(bridge.totals().reconciled_commits, 1);
+    assert!(bridge.terminal().is_none());
+
+    // Polling resumes from the committed offset.
+    client.push(updates(&[]));
+    poll(&mut bridge).expect("polling resumes");
+    assert_eq!(client.requested_offsets(), vec![0, 2]);
+    assert_eq!(outbound.messages().len(), 1, "the batch is answered once");
+}
+
+/// A replay that lands on a commit the first attempt already made is still
+/// answered: the bridge never dispatched that batch.
+#[test]
+fn a_replayed_commit_that_had_landed_is_answered_once() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let sink = FakeSink::failing_commits([SinkFailure::AmbiguousCommit]);
+    sink.state.lock().expect("sink state").duplicate = true;
+    let mut bridge = bridge(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/help")])]),
+        outbound.clone(),
+        sink,
+    );
+
+    assert!(poll(&mut bridge).is_err());
+    let report = poll(&mut bridge).expect("the replay commits");
+    assert!(!report.duplicate);
+    assert_eq!(report.answered, 1);
+    assert_eq!(outbound.messages().len(), 1);
+}
+
+/// The run loop rides out an ambiguous commit; it ends only when the replay is
+/// refused as inconsistent, and then it says why.
+#[test]
+fn the_run_loop_stops_only_when_a_replay_is_refused() {
+    let fixture = Fixture::new(&[]);
+    let outbound = FakeOutbound::default();
+    let mut bridge = bridge(
+        &fixture,
+        FakeClient::new([updates(&[(1, OPERATOR, "/help")])]),
+        outbound.clone(),
+        FakeSink::failing_commits([
+            SinkFailure::AmbiguousCommit,
+            SinkFailure::AmbiguousCommit,
+            SinkFailure::Unavailable,
+            SinkFailure::Conflict,
+        ]),
+    );
+    assert!(matches!(
+        poll(&mut bridge),
+        Err(RuntimeError::CommitReconciliationRequired { .. })
+    ));
+    // The loop replays the retained batch: a store that does not answer is
+    // waited out, and only the refused replay ends it.
+    bridge.run(
+        &Arc::new(Mutex::new(lease())),
+        &AtomicBool::new(false),
+        &CancellationToken::new(),
+    );
+    assert_eq!(bridge.terminal(), Some("commit_reconciliation_refused"));
+    let totals = bridge.totals();
+    assert_eq!(totals.reconciliation_retries, 1);
+    assert_eq!(totals.poll_failures, 3);
+    assert!(outbound.messages().is_empty());
 }
 
 /// The read surface refuses rather than reporting a generation it does not

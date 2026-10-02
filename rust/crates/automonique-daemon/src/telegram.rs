@@ -598,10 +598,12 @@ pub(crate) struct PollerControl {
 impl PollerControl {
     /// Whether a started poller has ended.
     ///
-    /// A bridge returns only fail-closed — an unresolvable ambiguous commit, or
-    /// a serve thread that stopped republishing the lease — and when it does it
-    /// takes the client and both credentials with it, because the thread's
-    /// closure owned them. So this answers a question about what this host still
+    /// A bridge returns only fail-closed — a replay of an ambiguous commit the
+    /// store refuses as inconsistent, or a serve thread that stopped
+    /// republishing the lease — and when it does it takes the client and both
+    /// credentials with it, because the thread's closure owned them. The thread
+    /// journals why it ended (see [`poller_stop_reason`]), so this state is
+    /// never reached in silence. So this answers a question about what this host still
     /// holds, which is what its reported state has to be built from.
     ///
     /// False before [`TelegramHost::start`], when the bridge is composed and
@@ -610,6 +612,29 @@ impl PollerControl {
     /// a connection.
     fn stopped(&self) -> bool {
         self.prepared.is_none() && self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+}
+
+/// The worker group a stopped poller is journaled under.
+const POLLER_WORKER_GROUP: &str = "telegram_poller";
+
+/// Why a poller thread ended, when the host did not ask it to.
+///
+/// `ran` is the thread body's outcome: the bridge's own terminal reason, or a
+/// panic. An end the host requested (the stop flag, at shutdown or handoff)
+/// returns `None`, because it is not a fault and is journaled by the shutdown
+/// drain. Every other end returns a stable, content-free category, so an
+/// operator reading the journal learns why the bot went silent without the
+/// line ever carrying a credential, a chat, or a message.
+fn poller_stop_reason(
+    ran: std::thread::Result<Option<&'static str>>,
+    stop_requested: bool,
+) -> Option<&'static str> {
+    match ran {
+        Err(_) => Some("panicked"),
+        Ok(Some(reason)) => Some(reason),
+        Ok(None) if stop_requested => None,
+        Ok(None) => Some("ended_unrequested"),
     }
 }
 
@@ -912,10 +937,17 @@ impl TelegramHost {
         let worker = std::thread::Builder::new()
             .name(String::from("automonique-telegram"))
             .spawn(move || {
-                // The menu is published before the first poll so an operator
-                // who opens the chat sees the vocabulary the bot will answer.
-                bridge.publish_menu(&cancellation);
-                bridge.run(&lease, &stop, &cancellation);
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The menu is published before the first poll so an
+                    // operator who opens the chat sees the vocabulary the bot
+                    // will answer.
+                    bridge.publish_menu(&cancellation);
+                    bridge.run(&lease, &stop, &cancellation);
+                    bridge.terminal()
+                }));
+                if let Some(reason) = poller_stop_reason(ran, stop.load(Ordering::Acquire)) {
+                    let _ = crate::structured_log::emit_worker_fault(POLLER_WORKER_GROUP, reason);
+                }
             })
             .map_err(|_| TelegramHostError::PollerUnavailable)?;
         control.worker = Some(worker);
@@ -1346,6 +1378,29 @@ mod tests {
     }
 
     /// A configuration with the given `allow=` lines spliced in.
+    /// A poller that ends on its own always names why; one the host stopped
+    /// does not, because that is not a fault.
+    #[test]
+    fn a_poller_that_ends_unasked_always_has_a_journaled_reason() {
+        assert_eq!(poller_stop_reason(Ok(None), true), None);
+        assert_eq!(
+            poller_stop_reason(Ok(Some("commit_reconciliation_refused")), false),
+            Some("commit_reconciliation_refused")
+        );
+        assert_eq!(
+            poller_stop_reason(Ok(Some("lease_unpublishable")), true),
+            Some("lease_unpublishable")
+        );
+        assert_eq!(
+            poller_stop_reason(Ok(None), false),
+            Some("ended_unrequested")
+        );
+        assert_eq!(
+            poller_stop_reason(Err(Box::new("fixture panic")), false),
+            Some("panicked")
+        );
+    }
+
     fn config(allow: &[&str]) -> String {
         tiered_config(&[], allow)
     }

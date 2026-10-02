@@ -759,6 +759,13 @@ where
         Ok(())
     }
 
+    /// Whether an ambiguous commit is retained and must be reconciled with
+    /// [`Self::reconcile_commit`] before any further poll.
+    #[must_use]
+    pub const fn has_pending_commit(&self) -> bool {
+        self.pending_commit.is_some()
+    }
+
     /// Move ambiguity state to the durable host during shutdown/checkpointing.
     #[must_use]
     pub fn take_pending_commit(&mut self) -> Option<PendingCommit> {
