@@ -5404,52 +5404,100 @@ fn compose_chat_prompt(
         evidence_remaining = evidence_remaining.saturating_sub(retained);
         prompt.push_str("\n[/memory]\n");
     }
-    if let Some((channel, content)) = context.live_slack {
+    // Every live section shares what is left of the run's prompt limit once
+    // the fixed context, history, memory and the user's message are in, so a
+    // turn that reads several sources is never refused as too long. Direct
+    // reads (issues, GitHub, Manage) keep their share first; Slack and the
+    // inventories shrink first.
+    let requested = |content: Option<&str>, cap: usize| {
+        content.map_or(0, |value| value.chars().count().min(cap))
+    };
+    let budgets = live_section_budgets(
+        CHAT_PROMPT_LIMIT.saturating_sub(prompt.len() + message.len() + CHAT_PROMPT_RESERVE),
+        &[
+            requested(context.live_github_issues, REFERENCED_ISSUES_BUDGET),
+            requested(context.live_github.map(|(_, content)| content), 8_000),
+            requested(context.live_manage.map(|(_, content)| content), 8_000),
+            requested(context.live_processes, 3_000),
+            requested(
+                context.live_slack.map(|(_, content)| content),
+                SLACK_SNAPSHOT_BUDGET,
+            ),
+            requested(
+                context.live_sites.map(|sites| sites.enabled_sites.as_str()),
+                1_500,
+            ),
+            requested(
+                context
+                    .live_sites
+                    .and_then(|sites| sites.manage_profiles.as_deref()),
+                2_500,
+            ),
+            requested(context.live_knowledge, 1_800),
+        ],
+    );
+    let [
+        issues_budget,
+        github_budget,
+        manage_budget,
+        processes_budget,
+        slack_budget,
+        sites_budget,
+        profiles_budget,
+        knowledge_budget,
+    ] = budgets;
+    if let Some((channel, content)) = context.live_slack.filter(|_| slack_budget > 0) {
         prompt.push_str("[live_tool capability=slack_recent_messages channel=");
         prompt.push_str(channel);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, SLACK_SNAPSHOT_BUDGET);
+        push_bounded(&mut prompt, content, slack_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
-    if let Some((tool, content)) = context.live_github {
+    if let Some((tool, content)) = context.live_github.filter(|_| github_budget > 0) {
         prompt.push_str("[live_tool capability=");
         prompt.push_str(tool);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, 8_000);
+        push_bounded(&mut prompt, content, github_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
-    if let Some(content) = context.live_github_issues {
+    if let Some(content) = context.live_github_issues.filter(|_| issues_budget > 0) {
         prompt.push_str("[live_tool capability=");
         prompt.push_str(REFERENCED_ISSUES_CAPABILITY);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, REFERENCED_ISSUES_BUDGET);
+        push_bounded(&mut prompt, content, issues_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
-    if let Some((tool, content)) = context.live_manage {
+    if let Some((tool, content)) = context.live_manage.filter(|_| manage_budget > 0) {
         prompt.push_str("[live_tool capability=manage_ai_operations tool=");
         prompt.push_str(tool);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, 8_000);
+        push_bounded(&mut prompt, content, manage_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
     if let Some(sites) = context.live_sites {
-        prompt.push_str("[live_tool capability=enabled_site_inventory freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, &sites.enabled_sites, 1_500);
-        prompt.push_str("\n[/live_tool]\n");
-        if let Some(profiles) = &sites.manage_profiles {
+        if sites_budget > 0 {
+            prompt.push_str("[live_tool capability=enabled_site_inventory freshness=request_time trust=untrusted_data]\n");
+            push_bounded(&mut prompt, &sites.enabled_sites, sites_budget);
+            prompt.push_str("\n[/live_tool]\n");
+        }
+        if let Some(profiles) = sites
+            .manage_profiles
+            .as_deref()
+            .filter(|_| profiles_budget > 0)
+        {
             prompt.push_str("[live_tool capability=manage_site_profiles freshness=request_time trust=untrusted_data]\n");
-            push_bounded(&mut prompt, profiles, 2_500);
+            push_bounded(&mut prompt, profiles, profiles_budget);
             prompt.push_str("\n[/live_tool]\n");
         }
     }
-    if let Some(knowledge) = context.live_knowledge {
+    if let Some(knowledge) = context.live_knowledge.filter(|_| knowledge_budget > 0) {
         prompt.push_str("[live_tool capability=local_entity_knowledge freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, knowledge, 1_800);
+        push_bounded(&mut prompt, knowledge, knowledge_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
-    if let Some(processes) = context.live_processes {
+    if let Some(processes) = context.live_processes.filter(|_| processes_budget > 0) {
         prompt.push_str("[live_tool capability=pm2_process_inventory freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, processes, 3_000);
+        push_bounded(&mut prompt, processes, processes_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
     prompt.push_str("[/dashboard_context]\n[user_message]\n");
@@ -5460,6 +5508,31 @@ fn compose_chat_prompt(
 
 /// Characters of live Slack content one chat turn may carry.
 const SLACK_SNAPSHOT_BUDGET: usize = 6_000;
+
+/// The run lane refuses a prompt above this many bytes (`MAX_LAUNCH_PROMPT_BYTES`).
+const CHAT_PROMPT_LIMIT: usize = automonique_daemon::execute::MAX_PROMPT_BYTES;
+/// Headroom for section markers, the truncation ellipses, multi-byte
+/// characters (budgets count characters) and an approved-skills wrapper.
+const CHAT_PROMPT_RESERVE: usize = 2_048;
+/// Marker bytes one live section adds around its content.
+const LIVE_SECTION_OVERHEAD: usize = 160;
+
+/// Share `available` bytes across live sections in priority order: each takes
+/// what it asked for while room remains, and a section left with too little to
+/// be useful is dropped instead of reduced to a stub.
+fn live_section_budgets<const N: usize>(available: usize, requested: &[usize; N]) -> [usize; N] {
+    let mut remaining = available;
+    let mut budgets = [0; N];
+    for (budget, &wanted) in budgets.iter_mut().zip(requested) {
+        if wanted == 0 || remaining <= LIVE_SECTION_OVERHEAD + 200 {
+            continue;
+        }
+        let granted = wanted.min(remaining - LIVE_SECTION_OVERHEAD);
+        *budget = granted;
+        remaining -= granted + LIVE_SECTION_OVERHEAD;
+    }
+    budgets
+}
 
 fn slack_read_plan(
     message: &str,
@@ -11953,6 +12026,78 @@ mod tests {
         );
         assert!(prompt.len() <= 16 * 1024, "{} bytes", prompt.len());
         assert!(prompt.ends_with("what do you know about the named site?\n[/user_message]"));
+    }
+
+    #[test]
+    fn slack_plus_referenced_issues_never_exceed_the_run_prompt_limit() {
+        // The owner's "check if what people sent you in slack today is all
+        // done" read every channel AND ten issues and was refused as too long.
+        let history = (0..12)
+            .map(|id| automonique_store::agent_memory::ConversationMessage {
+                id,
+                role: String::from("assistant"),
+                content: "réponse précédente avec accents ".repeat(200),
+                created_at_ms: id,
+            })
+            .collect::<Vec<_>>();
+        let slack = "## #operator-chat\nBruno → activ#1119 voir la refonte ".repeat(400);
+        let issues =
+            "webdesign29/activ#1119 state=open latest_comment_author=benfavre ".repeat(400);
+        let manage = "manage row ".repeat(2_000);
+        let sites = LiveSiteContext {
+            enabled_sites: "enabled sites ".repeat(1_000),
+            manage_profiles: Some("managed profiles ".repeat(1_000)),
+        };
+        let message = "check if what people sent you in slack today is all done";
+        let prompt = compose_chat_prompt(
+            message,
+            &history,
+            &[],
+            &ChatPromptContext {
+                live_slack: Some(("deploiements,operator-chat", &slack)),
+                live_github: None,
+                live_github_issues: Some(&issues),
+                live_manage: Some(("company_manager_list_sites", &manage)),
+                status: &fixture_status(),
+                request_time_utc: "2026-10-02T14:17:00Z",
+                live_sites: Some(&sites),
+                live_knowledge: None,
+                live_processes: None,
+                manage_page: None,
+                manage: &ManageIntegration {
+                    console_url: None,
+                    platform_url: None,
+                    profile_app: None,
+                    profile_source_configured: true,
+                    agent_tools_configured: false,
+                    mcp_servers: Vec::new(),
+                    mcp_server: None,
+                },
+            },
+        );
+        assert!(
+            prompt.len() + CHAT_PROMPT_RESERVE / 2 <= CHAT_PROMPT_LIMIT,
+            "{} bytes",
+            prompt.len()
+        );
+        let issues_at = prompt
+            .find("capability=github_issues")
+            .expect("issues kept first");
+        assert!(prompt[issues_at..].contains("latest_comment_author=benfavre"));
+        assert!(prompt.ends_with(&format!("{message}\n[/user_message]")));
+    }
+
+    #[test]
+    fn live_section_budgets_grant_in_priority_order_and_drop_stubs() {
+        assert_eq!(
+            live_section_budgets(10_000, &[3_000, 0, 4_000]),
+            [3_000, 0, 4_000]
+        );
+        assert_eq!(live_section_budgets(5_000, &[4_000, 4_000]), [4_000, 680]);
+        assert_eq!(live_section_budgets(4_400, &[4_000, 4_000]), [4_000, 0]);
+        let shared = live_section_budgets(6_000, &[4_000, 4_000]);
+        assert_eq!(shared[0], 4_000);
+        assert!(shared[1] > 0 && shared[1] < 4_000);
     }
 
     #[test]
