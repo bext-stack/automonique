@@ -888,9 +888,16 @@ log_provider_line() {
     elif [[ "$selected_provider" == jcode ]]; then
         text=$(jq -r '
             if .type == "done" then (.text // empty)
+            elif .type == "tool_input" then
+                # Each tool call states its purpose; that is what an operator
+                # reading the run wants, not the bare tool name.
+                ((.delta // "" | try fromjson catch {}) as $input
+                 | ($input.intent // $input.description // empty)
+                 | tostring | gsub("[[:cntrl:]]+"; " ") | .[0:240])
             elif .type == "tool_start" then ("started tool " + (.name // "unknown"))
-            elif .type == "tool_done" then
-                ((if .error == null then "completed tool " else "failed tool " end) + (.name // "unknown"))
+            elif .type == "tool_done" and .error != null then
+                ("failed tool " + (.name // "unknown") + ": "
+                 + ((.error | tostring | gsub("[[:cntrl:]]+"; " ")) | .[0:200]))
             elif .type == "error" then (.message // "provider error")
             else empty end
         ' <<<"$line" 2>/dev/null) || text=
@@ -1034,7 +1041,8 @@ run_job() {
             | JCODE_HOME="$selected_home" \
                 JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
                 JCODE_SERVER_EXECUTABLE="$selected_binary" \
-                "$selected_binary" --quiet --no-update --no-selfdev run --ndjson - \
+                "$selected_binary" --quiet --no-update --no-selfdev run --ndjson \
+                    --disabled-tools browser - \
                 >"$output" 2>"$error_output" &
     else
         cd -- "$cwd" || {
