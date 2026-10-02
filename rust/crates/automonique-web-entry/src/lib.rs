@@ -6290,7 +6290,7 @@ fn routed_slack_plan(
         };
     }
     let keyword_read = keyword_plan != SlackReadPlan::NotRequested;
-    let router_read = router.is_some_and(|answers| jev::JevAnswers::says_read(answers.read_slack));
+    let router_read = router.is_some_and(jev::JevAnswers::says_slack_read);
     let plan = if keyword_read || !router_read {
         keyword_plan
     } else {
@@ -14269,11 +14269,24 @@ mod tests {
         );
         assert_eq!(routed.plan, SlackReadPlan::AllChannels);
         assert_eq!(routed.read.label(), "keyword");
-        // Below threshold the router adds nothing.
-        let unsure = router_answers(0.49, 0.0, None);
+        // Below the Slack read threshold the router adds nothing...
+        let unsure = router_answers(0.30, 0.0, None);
         assert_eq!(
             routed_slack_plan(SlackReadPlan::NotRequested, Some(&unsure), message, &labels).plan,
             SlackReadPlan::NotRequested
+        );
+        // ...while a live 0.43 ("summarize the latest messages from Bruno")
+        // now reads, since a read is cheap and a miss answers wrongly.
+        let leaning = router_answers(0.43, 0.0, None);
+        assert_eq!(
+            routed_slack_plan(
+                SlackReadPlan::NotRequested,
+                Some(&leaning),
+                message,
+                &labels
+            )
+            .plan,
+            SlackReadPlan::AllChannels
         );
     }
 

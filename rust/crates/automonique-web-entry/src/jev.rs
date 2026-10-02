@@ -41,6 +41,10 @@ const MESSAGE_CHARS: usize = 4_000;
 
 /// Read when Jev's probability is at least this.
 pub(crate) const READ_THRESHOLD: f64 = 0.5;
+/// A Slack read is read-only and cheap, while a missed one produces a wrong
+/// answer ("summarize the latest messages from Bruno" scored 0.43 live, since
+/// the router cannot know who posts in Slack), so it triggers lower.
+pub(crate) const SLACK_READ_THRESHOLD: f64 = 0.35;
 /// Refuse a Slack write when Jev's probability is at least this.
 pub(crate) const SLACK_WRITE_THRESHOLD: f64 = 0.8;
 /// Override the keyword reply language when Jev is at least this confident.
@@ -295,6 +299,11 @@ pub(crate) struct JevAnswers {
 impl JevAnswers {
     pub(crate) fn says_read(value: Option<f64>) -> bool {
         value.is_some_and(|probability| probability >= READ_THRESHOLD)
+    }
+
+    pub(crate) fn says_slack_read(&self) -> bool {
+        self.read_slack
+            .is_some_and(|probability| probability >= SLACK_READ_THRESHOLD)
     }
 
     pub(crate) fn says_slack_write(&self) -> bool {
