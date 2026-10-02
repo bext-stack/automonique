@@ -722,8 +722,10 @@ pub struct CompositionInputs<'a> {
     pub run_id: &'a str,
     /// The provider this deployment runs.
     pub provider: &'a ProviderConfig,
-    /// What this host offers a document's enforcement negotiation, exactly as
-    /// [`crate::execute::offered_host_features`] measured it.
+    /// What the executing host offers a document's enforcement negotiation,
+    /// exactly as [`crate::execute::offered_host_features`] measured it in the
+    /// daemon process. A composer outside that process reads it from the
+    /// daemon (`automonique.admin/host_features`) rather than measuring itself.
     pub offered_features: &'a [HostFeature],
     /// Whether this deployment resolves any brokered destination at all.
     ///

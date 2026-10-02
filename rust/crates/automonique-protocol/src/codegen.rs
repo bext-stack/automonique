@@ -2964,6 +2964,7 @@ fn admin_command_module() -> GeneratedModule {
             request_kinds_not_generated: vec![
                 "fail_reconciliation".to_owned(),
                 "generations".to_owned(),
+                "host_features".to_owned(),
                 "inspect_outbox".to_owned(),
                 "inspect_reconciliation".to_owned(),
                 "reconcile_outbox".to_owned(),
@@ -3048,6 +3049,7 @@ fn admin_command_module() -> GeneratedModule {
             ],
             response_kinds_not_decoded: vec![
                 "generations_result".to_owned(),
+                "host_features_result".to_owned(),
                 "outbox_inspected".to_owned(),
                 "outbox_reconciled".to_owned(),
                 "reconciliation_failed".to_owned(),

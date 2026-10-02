@@ -5234,6 +5234,26 @@ impl Daemon {
                     request_id: request.request_id().clone(),
                 }
             }
+            automonique_protocol::admin::AdminCommand::HostFeatures => {
+                // Read-only: the list the execution lane measured in this
+                // process when it opened and admits every start against. No
+                // probe runs here, so the answer cannot drift from what an
+                // `execute_run` would be admitted on. A daemon with no lane
+                // runs nothing and says so in the execute lane's own word,
+                // rather than reporting an empty offer as if it had measured
+                // one.
+                let Some(execution) = self.execution.as_ref() else {
+                    return self.write_refusal(
+                        stream,
+                        request.request_id(),
+                        "execution_unavailable",
+                    );
+                };
+                AdminResponse::HostFeatures {
+                    request_id: request.request_id().clone(),
+                    features: execution.offered_host_features().to_vec(),
+                }
+            }
         };
         self.write_admin_response(stream, &response)?;
         if matches!(

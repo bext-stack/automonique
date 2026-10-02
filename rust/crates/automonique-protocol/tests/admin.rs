@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
+use automonique_protocol::admin::MAX_HOST_FEATURES;
 use automonique_protocol::admin::{
     ADMIN_PROTOCOL, AdminCommand, AdminError, AdminInstanceId, AdminOutboxEvidence,
     AdminOutboxEvidenceParts, AdminReconciliationEvidence, AdminRefusalCategory, AdminRequest,
@@ -14,6 +15,7 @@ use automonique_protocol::admin::{
 };
 use automonique_protocol::codec::{CodecError, FrameDecode, RequestId, decode_frame, encode_frame};
 use automonique_protocol::digest::Sha256;
+use automonique_protocol::sandbox::{HostFeature, ImplementationDigest};
 use automonique_protocol::tools::RunId;
 
 fn request_id() -> RequestId {
@@ -248,6 +250,178 @@ fn requests_round_trip_through_canonical_framing() {
             request
         );
     }
+}
+
+fn host_feature(name: &str, fill: char) -> HostFeature {
+    HostFeature::new(
+        name,
+        ImplementationDigest::parse(&format!("sha256:{}", fill.to_string().repeat(64)))
+            .expect("a digest"),
+    )
+    .expect("a feature")
+}
+
+fn host_features_payload(body: &str) -> Vec<u8> {
+    format!(
+        r#"{{"body":{body},"kind":"host_features_result","protocol":"automonique.admin","request_id":"req-admin-1","version":1}}"#
+    )
+    .into_bytes()
+}
+
+#[test]
+fn host_features_request_is_read_only_shaped_and_round_trips() {
+    let request = AdminRequest::new(request_id(), AdminCommand::HostFeatures);
+    let payload = request.to_message().expect("encode").to_canonical_bytes();
+    assert_eq!(
+        std::str::from_utf8(&payload).expect("utf-8"),
+        r#"{"body":{},"kind":"host_features","protocol":"automonique.admin","request_id":"req-admin-1","version":1}"#
+    );
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(&payload).expect("decode"),
+        request
+    );
+    let widened = br#"{"body":{"probe":true},"kind":"host_features","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(widened).expect_err("a body it does not define"),
+        AdminError::InvalidBody
+    );
+}
+
+#[test]
+fn host_features_response_round_trips_exactly_and_in_order() {
+    for features in [
+        Vec::new(),
+        vec![host_feature("descendant_containment", '3')],
+        vec![
+            host_feature("uid_separation", 'a'),
+            host_feature("descendant_containment", 'b'),
+            host_feature("tcp_denial", 'c'),
+        ],
+    ] {
+        let response = AdminResponse::HostFeatures {
+            request_id: request_id(),
+            features,
+        };
+        let payload = response.to_message().expect("encode").to_canonical_bytes();
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(&payload).expect("decode"),
+            response,
+            "an offer must decode to exactly the list, in exactly the order, it was sent"
+        );
+    }
+    let one = AdminResponse::HostFeatures {
+        request_id: request_id(),
+        features: vec![host_feature("descendant_containment", '3')],
+    };
+    assert_eq!(
+        String::from_utf8(one.to_message().expect("encode").to_canonical_bytes()).expect("utf-8"),
+        String::from_utf8(host_features_payload(&format!(
+            r#"{{"features":[{{"implementation":"sha256:{}","name":"descendant_containment"}}]}}"#,
+            "3".repeat(64)
+        )))
+        .expect("utf-8")
+    );
+}
+
+#[test]
+fn host_features_response_refuses_malformed_and_oversized_offers() {
+    let digest = format!("sha256:{}", "3".repeat(64));
+    let entry = |name: &str| format!(r#"{{"implementation":"{digest}","name":"{name}"}}"#);
+    for body in [
+        // Missing, extra or mistyped members.
+        String::from("{}"),
+        String::from(r#"{"features":{}}"#),
+        format!(r#"{{"extra":1,"features":[{}]}}"#, entry("tcp_denial")),
+        String::from(r#"{"features":[{"name":"tcp_denial"}]}"#),
+        format!(
+            r#"{{"features":[{{"implementation":"{digest}","name":"tcp_denial","note":"x"}}]}}"#
+        ),
+        format!(r#"{{"features":[{{"implementation":"{digest}","name":7}}]}}"#),
+        // A digest that is not one canonical spelling.
+        format!(
+            r#"{{"features":[{{"implementation":"sha256:{}","name":"tcp_denial"}}]}}"#,
+            "A".repeat(64)
+        ),
+        format!(
+            r#"{{"features":[{{"implementation":"sha256:{}","name":"tcp_denial"}}]}}"#,
+            "3".repeat(63)
+        ),
+        String::from(r#"{"features":[{"implementation":"md5:00","name":"tcp_denial"}]}"#),
+        // A name the sandbox vocabulary would not admit.
+        format!(r#"{{"features":[{{"implementation":"{digest}","name":""}}]}}"#),
+        // The same property offered twice.
+        format!(
+            r#"{{"features":[{},{}]}}"#,
+            entry("tcp_denial"),
+            entry("tcp_denial")
+        ),
+    ] {
+        assert_eq!(
+            AdminResponse::from_canonical_bytes(&host_features_payload(&body)),
+            Err(AdminError::InvalidBody),
+            "{body} must be refused, never decoded as a shorter or different offer"
+        );
+    }
+
+    let oversized: Vec<String> = (0..=MAX_HOST_FEATURES)
+        .map(|index| entry(&format!("feature_{index}")))
+        .collect();
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&host_features_payload(&format!(
+            r#"{{"features":[{}]}}"#,
+            oversized.join(",")
+        ))),
+        Err(AdminError::InvalidBody),
+        "an offer above the bound is refused, never truncated"
+    );
+
+    let too_many = AdminResponse::HostFeatures {
+        request_id: request_id(),
+        features: (0..=MAX_HOST_FEATURES)
+            .map(|index| host_feature(&format!("feature_{index}"), '3'))
+            .collect(),
+    };
+    assert_eq!(too_many.to_message(), Err(AdminError::InvalidBody));
+    let repeated = AdminResponse::HostFeatures {
+        request_id: request_id(),
+        features: vec![
+            host_feature("tcp_denial", '3'),
+            host_feature("tcp_denial", '4'),
+        ],
+    };
+    assert_eq!(repeated.to_message(), Err(AdminError::InvalidBody));
+}
+
+#[test]
+fn a_maximal_host_features_response_fits_one_admin_frame() {
+    let name = "\\".repeat(automonique_protocol::sandbox::MAX_SANDBOX_FIELD_BYTES);
+    let response = AdminResponse::HostFeatures {
+        request_id: RequestId::new("r".repeat(automonique_protocol::codec::MAX_REQUEST_ID_BYTES))
+            .expect("a maximal request id"),
+        features: (0..MAX_HOST_FEATURES)
+            .map(|index| {
+                let mut unique = name.clone();
+                unique.truncate(name.len() - 3);
+                unique.push_str(&format!("{index:03}"));
+                HostFeature::new(
+                    &unique,
+                    ImplementationDigest::parse(&format!("sha512:{}", "f".repeat(128)))
+                        .expect("a long digest"),
+                )
+                .expect("a maximal feature")
+            })
+            .collect(),
+    };
+    let payload = response.to_message().expect("encode").to_canonical_bytes();
+    assert!(
+        payload.len() <= MAX_ADMIN_CANONICAL_BYTES,
+        "{} bytes exceeds one admin frame",
+        payload.len()
+    );
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&payload).expect("decode"),
+        response
+    );
 }
 
 #[test]
@@ -2483,6 +2657,7 @@ mod capability {
             10,
             "automation scheduler worker health in the durable-state counts",
         ),
+        (11, "the read-only host enforcement features endpoint"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.
@@ -2537,6 +2712,7 @@ mod capability {
         "automonique.platform/detach",
         "automonique.platform/claim_control",
         "automonique.platform/release_control",
+        "automonique.admin/host_features",
     ];
 
     #[test]
@@ -2591,7 +2767,7 @@ mod capability {
     /// closed set rather than by reading the table.
     #[test]
     fn every_admin_command_is_declared() {
-        assert_eq!(AdminCommand::ALL.len(), 15);
+        assert_eq!(AdminCommand::ALL.len(), 16);
         for command in AdminCommand::ALL {
             let endpoint = format!("automonique.admin/{}", command.kind());
             assert!(

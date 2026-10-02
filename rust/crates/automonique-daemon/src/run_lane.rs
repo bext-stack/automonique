@@ -32,6 +32,24 @@
 //! own eight — and there is no second path into execution that a reviewer would
 //! have to audit separately.
 //!
+//! # Whose host a document is negotiated against
+//!
+//! A document names the enforcement features it requires, and composition
+//! refuses when the host offers none ([`ComposeRefusal::HostUnenforceable`]).
+//! The host that matters is the daemon's: it is the daemon's execution lane
+//! that admits and launches the document. So before each composition this lane
+//! asks the daemon, over the same socket, which features its execution lane
+//! offers (`automonique.admin/host_features`) and negotiates against that answer.
+//!
+//! It never probes its own process. This lane also runs inside clients — the
+//! hosted dashboard is one — whose service manager may confine them (a
+//! hardened user unit runs in a user namespace, where no delegated cgroup and
+//! no Landlock domain is visible), and a client that measured itself would
+//! refuse every run for a reason that is true of the client and false of the
+//! daemon. Fail closed is preserved: a daemon that cannot or will not answer
+//! is a refusal, recorded as a [`HostFeaturesRefusal`], and never an invented
+//! or locally probed feature list.
+//!
 //! The wait in step 4 deliberately does **not** use the socket. It reads the run
 //! index directly, on this lane's own connection, so a run that takes minutes
 //! does not spend those minutes issuing requests at a single-threaded serve
@@ -72,7 +90,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use automonique_protocol::admin::{AdminRequest, AdminResponse, SubmittedRunSpec};
+use automonique_protocol::admin::{AdminCommand, AdminRequest, AdminResponse, SubmittedRunSpec};
 use automonique_protocol::approval_api::{
     ApprovalDecision, ApprovalDisposition, ApprovalKey, ApprovalRefusal, ApprovalRequest,
     ApprovalResponse, DecideRequest, Decider,
@@ -81,6 +99,7 @@ use automonique_protocol::codec::{FrameDecode, RequestId, decode_frame, encode_f
 use automonique_protocol::execute_api::{
     CancelRequestRef, CancelRunOutcome, ExecuteRefusal, ExecuteRequest, ExecuteResponse,
 };
+use automonique_protocol::sandbox::HostFeature;
 use automonique_protocol::tools::RunId;
 use automonique_slack_connector::{ChannelId, MessageBlocks, MessageTs};
 use automonique_store::provider_deployments::{
@@ -155,6 +174,59 @@ impl core::fmt::Display for RunIndexUnavailable {
 }
 
 impl std::error::Error for RunIndexUnavailable {}
+
+/// Why this lane could not learn what the daemon's host enforces.
+///
+/// Every variant is a refusal of the run: composition does not proceed, nothing
+/// is submitted, and the run answers [`RunFailure::Unavailable`] — the word the
+/// chat surfaces receive, deliberately unchanged. This type exists for the
+/// operator surfaces beside them: [`SocketRunLane::host_features_refusal`]
+/// names which of these it was, so a deployment whose daemon cannot answer is
+/// diagnosable rather than a stream of identical `run_unavailable`s.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostFeaturesRefusal {
+    /// The socket would not connect, or the request could not be written or
+    /// answered in time.
+    Unreachable,
+    /// The daemon accepted the request and closed the connection without a
+    /// single response byte.
+    ///
+    /// That is what a daemon built before `automonique.admin/host_features`
+    /// existed does with a kind it does not know — it places no frame it
+    /// cannot decode — so in a split deployment this is almost always a web
+    /// entry newer than its daemon. It is indistinguishable on the wire from a
+    /// daemon that died mid-request, and is treated identically: refused.
+    Unsupported,
+    /// The daemon answered with a typed refusal — for example a daemon with no
+    /// execution lane, which can run nothing.
+    Refused,
+    /// The daemon answered something other than an exact, correlated feature
+    /// list.
+    Malformed,
+}
+
+impl HostFeaturesRefusal {
+    /// Stable, content-free category.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::Unreachable => "daemon_host_features_unreachable",
+            Self::Unsupported => "daemon_host_features_unsupported",
+            Self::Refused => "daemon_host_features_refused",
+            Self::Malformed => "daemon_host_features_malformed",
+        }
+    }
+}
+
+impl core::fmt::Display for HostFeaturesRefusal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.category())
+    }
+}
+
+/// Correlation identifier of a host-feature read. One request per connection,
+/// so a fixed value is enough to reject a reply to some other question.
+const HOST_FEATURES_REQUEST_ID: &str = "run-lane-host-features";
 
 /// Shortest interval between two snapshots on the `editMessageText` fallback.
 ///
@@ -395,6 +467,10 @@ pub struct DraftTransport {
 /// started with, not whatever a file said at the instant a message arrived — and
 /// it means an owner who edits either file gets the new answer by restarting the
 /// daemon, which is the same instant every other policy here takes effect.
+///
+/// The one input deliberately *not* resolved at open is the host's offered
+/// enforcement features: those belong to the daemon's execution lane and are
+/// read from it per composition. See the module's "Whose host" section.
 pub struct SocketRunLane {
     state_dir: PathBuf,
     admin_socket: PathBuf,
@@ -414,9 +490,10 @@ pub struct SocketRunLane {
     /// Whether this deployment resolves any brokered destination. A composed
     /// document declares `brokered_named`, so without one it cannot be admitted.
     egress_configured: bool,
-    /// What this host offers a document's enforcement negotiation, measured
-    /// once, exactly as the execution lane measures it.
-    offered: Vec<automonique_protocol::sandbox::HostFeature>,
+    /// Why the most recent run could not learn the daemon's offered features,
+    /// or `None` when it did (or never needed to). The features themselves are
+    /// never held here: see the module's "Whose host" section.
+    host_features_refusal: Option<HostFeaturesRefusal>,
     /// Distinguishes two runs composed inside one millisecond.
     sequence: u64,
     /// Live progress rendering, when a deployment composed one.
@@ -527,7 +604,7 @@ impl SocketRunLane {
             provider_deployments,
             provider_deployments_refused,
             egress_configured,
-            offered: crate::execute::offered_host_features(),
+            host_features_refusal: None,
             sequence: 0,
             drafts: None,
             pending_transport: None,
@@ -565,6 +642,53 @@ impl SocketRunLane {
             cursor: 0,
             active: false,
         });
+    }
+
+    /// Why the most recent run was refused before composition because the
+    /// daemon's offered host features could not be read, if it was.
+    ///
+    /// Cleared at the start of every run, so it describes the run that just
+    /// returned and never an earlier one.
+    #[must_use]
+    pub const fn host_features_refusal(&self) -> Option<HostFeaturesRefusal> {
+        self.host_features_refusal
+    }
+
+    /// Ask the daemon which host features its execution lane offers.
+    ///
+    /// Read fresh for every composition: the answer is a copy of a list the
+    /// daemon already holds, so it costs one local round trip, and a daemon
+    /// that was restarted onto a different host is never negotiated against
+    /// under its predecessor's answer. Any failure is recorded and refused; an
+    /// empty list is returned as the daemon gave it, and composition refuses
+    /// it as [`ComposeRefusal::HostUnenforceable`].
+    fn daemon_offered_features(&mut self) -> Result<Vec<HostFeature>, RunFailure> {
+        let outcome = self.read_daemon_offered_features();
+        self.host_features_refusal = outcome.as_ref().err().copied();
+        outcome.map_err(unavailable)
+    }
+
+    fn read_daemon_offered_features(&self) -> Result<Vec<HostFeature>, HostFeaturesRefusal> {
+        let request_id =
+            RequestId::new(HOST_FEATURES_REQUEST_ID).map_err(|_| HostFeaturesRefusal::Malformed)?;
+        let payload = AdminRequest::new(request_id.clone(), AdminCommand::HostFeatures)
+            .to_message()
+            .map_err(|_| HostFeaturesRefusal::Malformed)?
+            .to_canonical_bytes();
+        let response = self.exchange_classified(&payload)?;
+        match AdminResponse::from_canonical_bytes(&response)
+            .map_err(|_| HostFeaturesRefusal::Malformed)?
+        {
+            AdminResponse::HostFeatures {
+                request_id: answered,
+                features,
+            } if answered == request_id => Ok(features),
+            AdminResponse::Refused {
+                request_id: answered,
+                ..
+            } if answered == request_id => Err(HostFeaturesRefusal::Refused),
+            _ => Err(HostFeaturesRefusal::Malformed),
+        }
     }
 
     /// Whether this lane could compose anything at all.
@@ -873,29 +997,57 @@ impl SocketRunLane {
 
     /// Issue one bounded request on this daemon's admin socket.
     fn exchange(&self, payload: &[u8]) -> Result<Vec<u8>, RunFailure> {
-        let mut stream = UnixStream::connect(&self.admin_socket).map_err(unavailable)?;
+        self.exchange_classified(payload).map_err(unavailable)
+    }
+
+    /// [`Self::exchange`], keeping the one distinction a version-skewed peer
+    /// makes visible: a connection closed before any reply byte, which is how
+    /// an older daemon answers a request kind it does not define.
+    fn exchange_classified(&self, payload: &[u8]) -> Result<Vec<u8>, HostFeaturesRefusal> {
+        fn unreachable<E>(_error: E) -> HostFeaturesRefusal {
+            HostFeaturesRefusal::Unreachable
+        }
+        fn malformed<E>(_error: E) -> HostFeaturesRefusal {
+            HostFeaturesRefusal::Malformed
+        }
+        let mut stream = UnixStream::connect(&self.admin_socket).map_err(unreachable)?;
         stream
             .set_read_timeout(Some(EXCHANGE_TIMEOUT))
-            .map_err(unavailable)?;
+            .map_err(unreachable)?;
         stream
             .set_write_timeout(Some(EXCHANGE_TIMEOUT))
-            .map_err(unavailable)?;
+            .map_err(unreachable)?;
         let mut frame = Vec::new();
-        encode_frame(payload, &mut frame).map_err(unavailable)?;
-        stream.write_all(&frame).map_err(unavailable)?;
+        encode_frame(payload, &mut frame).map_err(malformed)?;
+        stream.write_all(&frame).map_err(unreachable)?;
 
         let mut prefix = [0_u8; 4];
-        stream.read_exact(&mut prefix).map_err(unavailable)?;
-        let length = usize::try_from(u32::from_be_bytes(prefix)).map_err(unavailable)?;
+        let mut filled = 0;
+        while filled < prefix.len() {
+            match stream.read(&mut prefix[filled..]) {
+                Ok(0) if filled == 0 => return Err(HostFeaturesRefusal::Unsupported),
+                Ok(0) => return Err(HostFeaturesRefusal::Malformed),
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // A peer that resets rather than closes, before answering
+                // anything, has said the same thing an orderly close says.
+                Err(error)
+                    if filled == 0 && error.kind() == std::io::ErrorKind::ConnectionReset =>
+                {
+                    return Err(HostFeaturesRefusal::Unsupported);
+                }
+                Err(_) => return Err(HostFeaturesRefusal::Unreachable),
+            }
+        }
+        let length = usize::try_from(u32::from_be_bytes(prefix)).map_err(malformed)?;
         if length > crate::MAX_ADMIN_PAYLOAD_BYTES {
-            return Err(RunFailure::Unavailable);
+            return Err(HostFeaturesRefusal::Malformed);
         }
         let mut response = vec![0_u8; length + 4];
         response[..4].copy_from_slice(&prefix);
-        stream.read_exact(&mut response[4..]).map_err(unavailable)?;
-        let FrameDecode::Frame { payload, .. } = decode_frame(&response).map_err(unavailable)?
-        else {
-            return Err(RunFailure::Unavailable);
+        stream.read_exact(&mut response[4..]).map_err(malformed)?;
+        let FrameDecode::Frame { payload, .. } = decode_frame(&response).map_err(malformed)? else {
+            return Err(HostFeaturesRefusal::Malformed);
         };
         Ok(payload.to_vec())
     }
@@ -1031,12 +1183,14 @@ impl SocketRunLane {
         task: &str,
         mode: ManagedSessionMode<'_>,
     ) -> Result<String, RunFailure> {
+        self.host_features_refusal = None;
         let provider = self.provider.clone().ok_or(RunFailure::NotConfigured)?;
+        let offered = self.daemon_offered_features()?;
         let inputs = CompositionInputs {
             state_dir: &self.state_dir,
             run_id,
             provider: &provider,
-            offered_features: &self.offered,
+            offered_features: &offered,
             egress_configured: self.egress_configured,
         };
         let composition = compose_managed(task, &inputs, mode).map_err(RunFailure::from_compose)?;
@@ -1086,6 +1240,7 @@ impl SocketRunLane {
         task: &str,
         profile: ProviderRunProfile,
     ) -> Result<String, RunFailure> {
+        self.host_features_refusal = None;
         if self.provider_deployments_refused {
             return Err(RunFailure::Unavailable);
         }
@@ -1186,11 +1341,12 @@ impl SocketRunLane {
         provider: &ProviderConfig,
     ) -> Result<String, RunFailure> {
         let run_id = self.next_run_id()?;
+        let offered = self.daemon_offered_features()?;
         let inputs = CompositionInputs {
             state_dir: &self.state_dir,
             run_id: &run_id,
             provider,
-            offered_features: &self.offered,
+            offered_features: &offered,
             egress_configured: self.egress_configured,
         };
         // Skill-only releases hot-reload by moving one verified `current`

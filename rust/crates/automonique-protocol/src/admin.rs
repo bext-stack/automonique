@@ -8,7 +8,9 @@
 //! leak. Version one exposes only a read-only status query and an orderly
 //! shutdown request, a local no-effect synthetic intake, explicit fenced
 //! reconciliation paths for ambiguous synthetic runs and expired outbox
-//! effects, and a durable-custody submission of one canonical RunSpec document.
+//! effects, a durable-custody submission of one canonical RunSpec document,
+//! and a read-only report of the host enforcement features the daemon's
+//! execution lane negotiates documents against.
 //!
 //! # The RunSpec document is opaque here
 //!
@@ -68,6 +70,7 @@ use crate::platform_v2_transport::{
 };
 use crate::provenance::{CausationId, CorrelationId, TraceId};
 use crate::runs_api::{RUNS_PROTOCOL, RunsApiError, RunsRequest};
+use crate::sandbox::{HostFeature, ImplementationDigest};
 use crate::tools::RunId;
 use crate::wire::{JsonValue, Message};
 
@@ -140,6 +143,32 @@ const METRICS_RESPONSE_OVERHEAD_BYTES: usize = 512;
 const _: () = assert!(
     2 * MAX_METRICS_EXPOSITION_BYTES + METRICS_RESPONSE_OVERHEAD_BYTES <= MAX_ADMIN_CANONICAL_BYTES,
     "a maximally escaped metrics response must fit one admin frame"
+);
+
+/// Maximum host enforcement features one `host_features_result` carries.
+///
+/// The daemon offers one feature per boundary property its launch path
+/// enforces — five today — so this is headroom, not a target. A response
+/// above it is refused at encode and at decode rather than truncated: a
+/// truncated list would be a host that enforces less than it does, and a
+/// negotiation against it would refuse documents for a reason that is false.
+pub const MAX_HOST_FEATURES: usize = 32;
+
+/// Worst-case canonical bytes of one host feature entry.
+///
+/// A maximal escaped name (every byte a quote or backslash, which escape to
+/// two), the longest digest spelling this build parses (`sha512:` plus 128
+/// hex digits), both key names and the punctuation.
+const HOST_FEATURE_ENTRY_BYTES: usize =
+    2 * crate::sandbox::MAX_SANDBOX_FIELD_BYTES + (7 + 128) + 64;
+
+/// Envelope, `features` key and array punctuation around the entries.
+const HOST_FEATURES_RESPONSE_OVERHEAD_BYTES: usize = 216 + 64;
+
+const _: () = assert!(
+    MAX_HOST_FEATURES * HOST_FEATURE_ENTRY_BYTES + HOST_FEATURES_RESPONSE_OVERHEAD_BYTES
+        <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal host_features_result must fit one admin frame"
 );
 
 /// Largest canonical request accepted by the local multi-protocol dispatch.
@@ -247,7 +276,10 @@ const _: () = assert!(
 /// - **10** — added `automation_scheduler_workers` to the status's
 ///   durable-state counts, so an operator can see whether the automation
 ///   scheduler worker is on its thread.
-pub const ADMIN_CAPABILITY: u32 = 10;
+/// - **11** — added the read-only `automonique.admin/host_features` endpoint,
+///   so a client that composes documents in another process negotiates against
+///   the features the daemon's execution lane offers rather than its own.
+pub const ADMIN_CAPABILITY: u32 = 11;
 
 /// How much of a promise an endpoint is.
 ///
@@ -395,6 +427,7 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
         "automonique.platform/release_control",
         Maturity::Experimental,
     ),
+    ("automonique.admin/host_features", Maturity::Experimental),
 ];
 
 /// A refusal while constructing or decoding an administration message.
@@ -676,6 +709,15 @@ pub enum AdminCommand {
     ResumeIntake,
     /// Stop intake and request an orderly shutdown.
     Shutdown,
+    /// Read the host enforcement features this daemon's execution lane
+    /// negotiates a document against.
+    ///
+    /// Read-only. It exists because a document is composed by a *client* of
+    /// this socket — the hosted dashboard, a chat bridge — and a client's own
+    /// process is not the host that runs the document. A client that probed
+    /// itself would negotiate against its own confinement, which under a
+    /// hardened service manager is no enforcement at all.
+    HostFeatures,
 }
 
 impl AdminCommand {
@@ -684,7 +726,7 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Status,
         Self::Metrics,
         Self::Generations,
@@ -700,6 +742,7 @@ impl AdminCommand {
         Self::PauseIntake,
         Self::ResumeIntake,
         Self::Shutdown,
+        Self::HostFeatures,
     ];
 
     /// Stable wire spelling of this command's message kind.
@@ -721,6 +764,7 @@ impl AdminCommand {
             Self::PauseIntake => "pause_intake",
             Self::ResumeIntake => "resume_intake",
             Self::Shutdown => "shutdown",
+            Self::HostFeatures => "host_features",
         }
     }
 }
@@ -1833,7 +1877,8 @@ impl AdminRequest {
                 | AdminCommand::Metrics
                 | AdminCommand::Generations
                 | AdminCommand::Rollback
-                | AdminCommand::Shutdown,
+                | AdminCommand::Shutdown
+                | AdminCommand::HostFeatures,
                 None,
                 None,
                 None,
@@ -1913,7 +1958,7 @@ impl AdminRequest {
                     required_body_string(message.body(), "target_release_digest")?,
                 )
             }
-            "status" | "metrics" | "generations" | "rollback" | "shutdown" => {
+            "status" | "metrics" | "generations" | "rollback" | "shutdown" | "host_features" => {
                 if !matches!(message.body(), JsonValue::Object(entries) if entries.is_empty()) {
                     return Err(AdminError::InvalidBody);
                 }
@@ -1922,6 +1967,7 @@ impl AdminRequest {
                     "metrics" => AdminCommand::Metrics,
                     "generations" => AdminCommand::Generations,
                     "rollback" => AdminCommand::Rollback,
+                    "host_features" => AdminCommand::HostFeatures,
                     _ => AdminCommand::Shutdown,
                 };
                 Ok(Self::new(message.envelope().request_id().clone(), command))
@@ -4331,6 +4377,22 @@ pub enum AdminResponse {
         /// Correlation identifier from the request.
         request_id: RequestId,
     },
+    /// The host enforcement features this daemon's execution lane offers.
+    ///
+    /// Exactly the list the lane admits documents against, measured once in
+    /// the daemon's own process when the lane opened. An empty list is a
+    /// truthful answer — a host that enforces nothing — and a negotiation
+    /// against it refuses, which is the point. At most [`MAX_HOST_FEATURES`]
+    /// entries, with no name repeated.
+    ///
+    /// Like [`crate::sandbox::HostFeature`] itself, this is a statement of
+    /// composition, not an attestation: nothing signs it.
+    HostFeatures {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// The offered features, in the order the daemon measured them.
+        features: Vec<HostFeature>,
+    },
 }
 
 impl AdminResponse {
@@ -4355,6 +4417,7 @@ impl AdminResponse {
             | Self::IntakePaused { request_id, .. }
             | Self::IntakeResumed { request_id, .. }
             | Self::Refused { request_id, .. }
+            | Self::HostFeatures { request_id, .. }
             | Self::ShutdownAccepted { request_id } => request_id,
         }
     }
@@ -4578,6 +4641,13 @@ impl AdminResponse {
                 envelope(request_id.clone(), "shutdown_accepted")?,
                 JsonValue::Object(Vec::new()),
             )),
+            Self::HostFeatures {
+                request_id,
+                features,
+            } => Ok(Message::new(
+                envelope(request_id.clone(), "host_features_result")?,
+                host_features_body(features)?,
+            )),
         }
     }
 
@@ -4769,9 +4839,85 @@ impl AdminResponse {
                 }
                 Ok(Self::ShutdownAccepted { request_id })
             }
+            "host_features_result" => Ok(Self::HostFeatures {
+                request_id,
+                features: host_features_from_body(message.body())?,
+            }),
             _ => Err(AdminError::UnknownKind),
         }
     }
+}
+
+/// Encode an offered feature list, refusing one this protocol would not decode.
+fn host_features_body(features: &[HostFeature]) -> Result<JsonValue, AdminError> {
+    if !valid_host_features(features) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(JsonValue::Object(vec![(
+        "features".to_owned(),
+        JsonValue::Array(
+            features
+                .iter()
+                .map(|feature| {
+                    JsonValue::Object(vec![
+                        (
+                            "implementation".to_owned(),
+                            JsonValue::String(feature.implementation().to_string()),
+                        ),
+                        (
+                            "name".to_owned(),
+                            JsonValue::String(feature.name().to_owned()),
+                        ),
+                    ])
+                })
+                .collect(),
+        ),
+    )]))
+}
+
+/// Decode an offered feature list exactly.
+///
+/// Every entry must carry exactly `implementation` and `name`; the digest must
+/// be in the one canonical spelling it re-encodes to; the name must satisfy
+/// [`HostFeature::new`]; and the list must be within [`MAX_HOST_FEATURES`] with
+/// no name repeated. Anything else is [`AdminError::InvalidBody`], never a
+/// shorter list: a partially decoded offer would be a host claiming less — or,
+/// worse, a different composition — than the daemon reported.
+fn host_features_from_body(body: &JsonValue) -> Result<Vec<HostFeature>, AdminError> {
+    exact_fields(body, &["features"])?;
+    let Some(JsonValue::Array(entries)) = body.get("features") else {
+        return Err(AdminError::InvalidBody);
+    };
+    if entries.len() > MAX_HOST_FEATURES {
+        return Err(AdminError::InvalidBody);
+    }
+    let features = entries
+        .iter()
+        .map(|entry| {
+            exact_fields(entry, &["implementation", "name"])?;
+            let spelling = required_body_string(entry, "implementation")?;
+            let implementation =
+                ImplementationDigest::parse(&spelling).map_err(|_| AdminError::InvalidBody)?;
+            if implementation.to_string() != spelling {
+                return Err(AdminError::InvalidBody);
+            }
+            HostFeature::new(&required_body_string(entry, "name")?, implementation)
+                .map_err(|_| AdminError::InvalidBody)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !valid_host_features(&features) {
+        return Err(AdminError::InvalidBody);
+    }
+    Ok(features)
+}
+
+fn valid_host_features(features: &[HostFeature]) -> bool {
+    features.len() <= MAX_HOST_FEATURES
+        && features.iter().enumerate().all(|(index, feature)| {
+            features[..index]
+                .iter()
+                .all(|earlier| earlier.name() != feature.name())
+        })
 }
 
 fn reload_receipt(

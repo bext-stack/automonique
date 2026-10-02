@@ -1834,6 +1834,7 @@ mod command_surface {
         RequestValue, generated_files, maintained_modules, module_file_name,
     };
     use automonique_protocol::digest::Sha256;
+    use automonique_protocol::sandbox::{HostFeature, ImplementationDigest};
     use automonique_protocol::tools::RunId;
 
     use super::*;
@@ -2804,7 +2805,8 @@ mod command_surface {
                 id.clone(),
                 IntakePause::new("ops", "why").expect("a pause"),
             ),
-            AdminRequest::resume_intake(id, IntakeResume::new("ops").expect("a resume")),
+            AdminRequest::resume_intake(id.clone(), IntakeResume::new("ops").expect("a resume")),
+            AdminRequest::new(id, AdminCommand::HostFeatures),
         ];
         // Every variant of the command enum is represented above. The match is
         // the point: a command added to `AdminCommand` fails to compile here.
@@ -2825,6 +2827,7 @@ mod command_surface {
             AdminCommand::PauseIntake,
             AdminCommand::ResumeIntake,
             AdminCommand::Shutdown,
+            AdminCommand::HostFeatures,
         ] {
             match command {
                 AdminCommand::Status
@@ -2841,7 +2844,8 @@ mod command_surface {
                 | AdminCommand::ReconcileOutbox
                 | AdminCommand::PauseIntake
                 | AdminCommand::ResumeIntake
-                | AdminCommand::Shutdown => {}
+                | AdminCommand::Shutdown
+                | AdminCommand::HostFeatures => {}
             }
             declared.insert(format!("{command:?}"));
         }
@@ -3024,6 +3028,17 @@ mod command_surface {
                 request_id: id.clone(),
                 category: AdminRefusalCategory::new("intake_paused").expect("a category"),
             },
+            AdminResponse::HostFeatures {
+                request_id: id.clone(),
+                features: vec![
+                    HostFeature::new(
+                        "descendant_containment",
+                        ImplementationDigest::parse(&format!("sha256:{}", "3".repeat(64)))
+                            .expect("a digest"),
+                    )
+                    .expect("a feature"),
+                ],
+            },
             AdminResponse::ShutdownAccepted { request_id: id },
         ];
         // The match is the point: a variant added to `AdminResponse` fails to
@@ -3047,6 +3062,7 @@ mod command_surface {
                 | AdminResponse::IntakePaused { .. }
                 | AdminResponse::IntakeResumed { .. }
                 | AdminResponse::Refused { .. }
+                | AdminResponse::HostFeatures { .. }
                 | AdminResponse::ShutdownAccepted { .. } => {}
             }
         }

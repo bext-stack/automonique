@@ -150,3 +150,85 @@ fn reported_execution_state_matches_an_independent_measurement() {
     ));
     thread.join().expect("daemon thread").expect("clean stop");
 }
+
+/// One admin request, one correlated answer.
+fn admin(config: &DaemonConfig, request: &AdminRequest) -> AdminResponse {
+    let mut stream = UnixStream::connect(config.admin_socket()).expect("connect to daemon");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("read deadline");
+    let payload = request
+        .to_message()
+        .expect("encode request")
+        .to_canonical_bytes();
+    let mut frame = Vec::new();
+    encode_frame(&payload, &mut frame).expect("frame request");
+    stream.write_all(&frame).expect("write request");
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).expect("response prefix");
+    let length = u32::from_be_bytes(prefix) as usize;
+    let mut response = vec![0_u8; length + 4];
+    response[..4].copy_from_slice(&prefix);
+    stream
+        .read_exact(&mut response[4..])
+        .expect("response body");
+    let FrameDecode::Frame { payload, .. } = decode_frame(&response).expect("response frame")
+    else {
+        panic!("complete response was incomplete")
+    };
+    let response = AdminResponse::from_canonical_bytes(payload).expect("admitted response");
+    assert_eq!(response.request_id(), request.request_id());
+    response
+}
+
+/// The host features a client negotiates against are the daemon's own: the
+/// list its execution lane measured in the daemon process and admits every
+/// start against, read over the socket rather than probed by the client.
+///
+/// Compared with an independent measurement taken in this same environment, so
+/// the answer is the measured one on every host — five features on a delegated
+/// host, none on one without — and not a default either way.
+#[test]
+fn the_daemon_reports_the_host_features_its_execution_lane_offers() {
+    let (_root, config) = fixture();
+    let daemon = Daemon::open(&config).expect("daemon opens");
+    let stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || daemon.serve(&serve_stop));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !config.admin_socket().exists() {
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let request = AdminRequest::new(
+        RequestId::new("host-features-1").expect("request ID"),
+        AdminCommand::HostFeatures,
+    );
+    let AdminResponse::HostFeatures { features, .. } = admin(&config, &request) else {
+        panic!("a daemon with a wired execution lane answers with its offer")
+    };
+    assert_eq!(
+        features,
+        automonique_daemon::execute::offered_host_features(),
+        "the reported offer must be the measured one"
+    );
+    // Read-only: asking twice changes nothing and answers the same.
+    let AdminResponse::HostFeatures {
+        features: again, ..
+    } = admin(&config, &request)
+    else {
+        panic!("a repeated read answers the same way")
+    };
+    assert_eq!(again, features);
+
+    let shutdown = AdminRequest::new(
+        RequestId::new("host-features-2").expect("request ID"),
+        AdminCommand::Shutdown,
+    );
+    assert!(matches!(
+        admin(&config, &shutdown),
+        AdminResponse::ShutdownAccepted { .. }
+    ));
+    thread.join().expect("daemon thread").expect("clean stop");
+}

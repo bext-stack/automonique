@@ -105,9 +105,20 @@ line is written to the daemon's standard error for the journal.
 baseline and answer lanes from a terminal against the live state and the
 running daemon, with no transport attached: nothing is sent or remembered, and
 a selected tool is printed rather than staged. `--approve` follows an
-escalation as an approved card would. The run lane needs a delegated cgroup,
-so run it under `systemd-run --user --scope -p Delegate=yes` with the daemon's
-`XDG_STATE_HOME`, `XDG_RUNTIME_DIR` and `AUTOMONIQUE_LAUNCH_HELPER`.
+escalation as an approved card would. Run it with the daemon's
+`XDG_STATE_HOME` and `XDG_RUNTIME_DIR`.
+
+Every run lane — the daemon's own chat threads, `automonique ask`, and the
+hosted dashboard's chat — negotiates a composed document against the host
+features the daemon's execution lane offers, read over the admin socket
+(`automonique.admin/host_features`, admin capability 11). A lane never probes
+its own process, so a client confined by service-manager hardening (which
+places a user service in a user namespace) composes exactly as the daemon
+would. When the daemon cannot answer, the turn is refused before anything is
+submitted and the dashboard reports `daemon_host_features_unsupported` (a
+daemon older than capability 11), `daemon_host_features_refused`,
+`daemon_host_features_unreachable` or `daemon_host_features_malformed`
+instead of the generic `run_unavailable`.
 
 ## Starting work from the dashboard
 

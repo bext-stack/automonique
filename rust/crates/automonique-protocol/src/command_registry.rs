@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the fifteen commands
+//! [`admin_command_registry`] describes the sixteen commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -1325,7 +1325,7 @@ impl CommandRegistry {
 
 /// The registry describing the local administration commands this build ships.
 ///
-/// Fifteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
+/// Sixteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
 /// the field names and byte bounds `crate::admin` actually encodes and
 /// enforces.
 ///
@@ -1355,6 +1355,7 @@ pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError>
         pause_intake_spec()?,
         resume_intake_spec()?,
         shutdown_spec()?,
+        host_features_spec()?,
     ])
 }
 
@@ -1433,6 +1434,19 @@ fn metrics_spec() -> Result<CommandSpec, CommandRegistryError> {
         id: CommandId::new("metrics")?,
         aliases: Vec::new(),
         summary: help("Read a Prometheus metrics snapshot.")?,
+        fields: Vec::new(),
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: MutationDiscipline::ReadOnly,
+    })
+}
+
+fn host_features_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("host_features")?,
+        aliases: Vec::new(),
+        summary: help("Read the host enforcement features the execution lane offers.")?,
         fields: Vec::new(),
         authorization: AuthorizationRequirement::LocalPeer,
         approval: ApprovalPolicy::None,

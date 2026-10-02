@@ -101,7 +101,7 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 15;
+const ADMIN_COMMAND_COUNT: usize = 16;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
@@ -120,6 +120,7 @@ const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::PauseIntake,
     AdminCommand::ResumeIntake,
     AdminCommand::Shutdown,
+    AdminCommand::HostFeatures,
 ];
 
 /// Each command's position in [`EVERY_ADMIN_COMMAND`].
@@ -146,6 +147,7 @@ fn position(command: AdminCommand) -> usize {
         AdminCommand::PauseIntake => 12,
         AdminCommand::ResumeIntake => 13,
         AdminCommand::Shutdown => 14,
+        AdminCommand::HostFeatures => 15,
     }
 }
 
@@ -176,6 +178,9 @@ fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
             AdminRequest::reload_status(request_id(), "reload-1").expect("a valid reload lookup"),
         ],
         AdminCommand::Shutdown => vec![AdminRequest::new(request_id(), AdminCommand::Shutdown)],
+        AdminCommand::HostFeatures => {
+            vec![AdminRequest::new(request_id(), AdminCommand::HostFeatures)]
+        }
         AdminCommand::SubmitSynthetic => vec![AdminRequest::submit(
             request_id(),
             SyntheticSubmission::new("scope-1", "synthetic-key-1", "do the synthetic thing")
@@ -378,7 +383,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the fifteen commands, and the partition is
+    /// The three disciplines partition the sixteen commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -397,6 +402,7 @@ mod anti_drift {
             named(|mutation| matches!(mutation, MutationDiscipline::ReadOnly)),
             [
                 "generations",
+                "host_features",
                 "inspect_outbox",
                 "inspect_reconciliation",
                 "metrics",
@@ -427,7 +433,7 @@ mod anti_drift {
                 .iter()
                 .filter(|spec| spec.mutation().mutates())
                 .count(),
-            ADMIN_COMMAND_COUNT - 6,
+            ADMIN_COMMAND_COUNT - 7,
             "a command belongs to no discipline"
         );
     }
@@ -456,6 +462,7 @@ mod seeded_registry {
             [
                 "fail_reconciliation",
                 "generations",
+                "host_features",
                 "inspect_outbox",
                 "inspect_reconciliation",
                 "metrics",

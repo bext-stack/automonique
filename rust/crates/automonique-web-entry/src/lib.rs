@@ -2096,6 +2096,27 @@ fn run_web_question_to_completion(
     Ok(answer)
 }
 
+/// The category a refused chat turn reports.
+///
+/// A turn refused because the daemon could not say what its host enforces is
+/// named as that, with the lane's own category, rather than as the generic
+/// `run_unavailable`: the two need different operator action (upgrade or
+/// restart the daemon, versus retry), and the generic word is exactly what hid
+/// a host-feature negotiation failure from operators before. The line written
+/// here carries the category alone.
+fn lane_failure_category(lane: &SocketRunLane, failure: RunFailure) -> &'static str {
+    match (failure, lane.host_features_refusal()) {
+        (RunFailure::Unavailable, Some(refusal)) => {
+            eprintln!(
+                "automonique web entry: chat turn refused before composition: {}",
+                refusal.category()
+            );
+            refusal.category()
+        }
+        _ => failure.category(),
+    }
+}
+
 struct LiveSiteContext {
     enabled_sites: String,
     manage_profiles: Option<String>,
@@ -3398,7 +3419,7 @@ impl WebIntegration {
                                     let answer = run_web_question_to_completion(
                                         &mut *lane, &prompt, profile,
                                     )
-                                    .map_err(|error| error.category())?;
+                                    .map_err(|error| lane_failure_category(&lane, error))?;
                                     (answer, None)
                                 }
                             }
@@ -3691,7 +3712,7 @@ impl WebIntegration {
         let routed = {
             let mut lane = self.lane.try_lock().map_err(|_| "chat_lane_busy")?;
             run_web_question_to_completion(&mut *lane, &prompt, QuestionProfile::OperationalLookup)
-                .map_err(|error| error.category())?
+                .map_err(|error| lane_failure_category(&lane, error))?
         };
         let Some(plan) = parse_agent_tool_plan(&routed, &tools, github_activity_configured) else {
             return Ok(AgentToolDecision::None);
@@ -3895,7 +3916,7 @@ impl WebIntegration {
                         &prompt,
                         QuestionProfile::OperationalLookup,
                     )
-                    .map_err(|error| error.category())?
+                    .map_err(|error| lane_failure_category(&lane, error))?
                 }
                 McpCallResult::InputRequired { .. } => {
                     return Err("manage_action_additional_approval_refused");
@@ -12090,6 +12111,66 @@ mod tests {
             )
             .unwrap(),
             "is_error=false\n{\"ok\":true}"
+        );
+    }
+
+    /// A chat turn refused because the daemon could not report its host
+    /// features names that reason instead of the generic `run_unavailable`,
+    /// and every other failure keeps its own category.
+    #[test]
+    fn a_host_feature_refusal_is_named_in_the_chat_failure_category() {
+        let root = tempfile::tempdir().expect("temporary root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let state_dir = root.path().join("state");
+        let home = state_dir.join("provider-home");
+        std::fs::create_dir_all(&home).expect("provider home");
+        for directory in [&state_dir, &home] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .expect("private directory");
+        }
+        let write_private = |name: &str, body: String| {
+            let path = state_dir.join(name);
+            std::fs::write(&path, body).expect("configuration written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("private configuration");
+        };
+        write_private(
+            automonique_daemon::compose::PROVIDER_CONFIG_NAME,
+            format!(
+                "binary=/usr/bin/busybox\nhome={}\nversion=busybox-hermetic\n\
+                 arg=sh\narg=-c\narg=true > {}\n",
+                home.display(),
+                automonique_daemon::compose::ANSWER_PLACEHOLDER
+            ),
+        );
+        write_private(
+            automonique_daemon::EGRESS_DESTINATIONS_NAME,
+            String::from("127.0.0.1 1 loopback\n"),
+        );
+        // No daemon listens on this socket.
+        let mut lane = SocketRunLane::open(
+            &state_dir,
+            &root.path().join("admin.sock"),
+            &state_dir.join(automonique_daemon::RUN_INDEX_NAME),
+        )
+        .expect("the run lane opens");
+        assert!(lane.configured());
+
+        let failure = run_web_question_to_completion(
+            &mut lane,
+            "is anybody there",
+            QuestionProfile::Operational,
+        )
+        .expect_err("no daemon answers");
+        assert_eq!(failure, RunFailure::Unavailable);
+        assert_eq!(
+            lane_failure_category(&lane, failure),
+            "daemon_host_features_unreachable"
+        );
+        assert_eq!(
+            lane_failure_category(&lane, RunFailure::Failed),
+            RunFailure::Failed.category()
         );
     }
 }

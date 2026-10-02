@@ -756,6 +756,18 @@ impl ExecutionLane {
         self.jcode_controls.steer(session_id, content)
     }
 
+    /// What this lane offers a document's enforcement negotiation.
+    ///
+    /// The list measured once, in this daemon's own process, when the lane
+    /// opened — the exact list [`AdmissionContextParts::host_features`] is built
+    /// from on every start. A client that composes a document in another
+    /// process reads this over the admin socket rather than probing itself,
+    /// because its process is not the host that runs the document.
+    #[must_use]
+    pub fn offered_host_features(&self) -> &[HostFeature] {
+        &self.offered
+    }
+
     /// Live progress replay for the attempts this lane is running.
     ///
     /// A renderer holds this, polls it with a cursor while an attempt is live,

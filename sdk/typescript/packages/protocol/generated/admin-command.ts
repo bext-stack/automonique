@@ -271,6 +271,7 @@ export function encodeSubmitRun(request_id: RequestId, body: SubmitRunBody): Uin
 export const ADMIN_REQUEST_KINDS_NOT_GENERATED: readonly string[] = [
   "fail_reconciliation",
   "generations",
+  "host_features",
   "inspect_outbox",
   "inspect_reconciliation",
   "reconcile_outbox",
@@ -399,7 +400,7 @@ export function decodeShutdownAccepted(request_id: RequestId, body: JsonValue): 
  * defined, and a client told otherwise might act on the lie. The body is not
  * handed back, because nothing here has validated it.
  */
-export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["generations_result", "metrics_result", "outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "reload_accepted", "reload_status_result", "reload_succeeded", "rollback_accepted", "rollback_succeeded", "status_result", "synthetic_accepted"] as const;
+export const ADMIN_RESPONSE_KINDS_NOT_DECODED = ["generations_result", "host_features_result", "metrics_result", "outbox_inspected", "outbox_reconciled", "reconciliation_failed", "reconciliation_inspected", "reload_accepted", "reload_status_result", "reload_succeeded", "rollback_accepted", "rollback_succeeded", "status_result", "synthetic_accepted"] as const;
 export type UndecodedAdminResponseKind = (typeof ADMIN_RESPONSE_KINDS_NOT_DECODED)[number];
 export function isUndecodedAdminResponseKind(value: string): value is UndecodedAdminResponseKind {
   return (ADMIN_RESPONSE_KINDS_NOT_DECODED as readonly string[]).includes(value);
