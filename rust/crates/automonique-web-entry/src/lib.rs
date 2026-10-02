@@ -5460,7 +5460,7 @@ fn compose_chat_prompt(
         prompt.push_str("[live_tool capability=slack_recent_messages channel=");
         prompt.push_str(channel);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, slack_budget);
+        push_bounded_per_channel(&mut prompt, content, slack_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
     if let Some((tool, content)) = context.live_github.filter(|_| github_budget > 0) {
@@ -5737,6 +5737,38 @@ fn all_channels_snapshot(
         Ok(content)
     } else {
         Err("slack_read_unavailable")
+    }
+}
+
+/// Bound a multi-channel Slack snapshot (`## #label` sections) so every
+/// channel keeps an equal share: cutting the concatenation from the end would
+/// drop whole channels, typically the people's channel after a bot's one.
+fn push_bounded_per_channel(target: &mut String, value: &str, characters: usize) {
+    let mut starts: Vec<usize> = vec![0];
+    starts.extend(value.match_indices("\n## #").map(|(index, _)| index + 1));
+    starts.dedup();
+    let sections: Vec<&str> = starts
+        .iter()
+        .zip(
+            starts
+                .iter()
+                .skip(1)
+                .copied()
+                .chain(std::iter::once(value.len())),
+        )
+        .map(|(&start, end)| &value[start..end])
+        .filter(|section| !section.trim().is_empty())
+        .collect();
+    if sections.len() < 2 || value.chars().count() <= characters {
+        push_bounded(target, value, characters);
+        return;
+    }
+    let share = characters / sections.len();
+    for section in sections {
+        push_bounded(target, section, share);
+        if !target.ends_with('\n') {
+            target.push('\n');
+        }
     }
 }
 
@@ -12095,6 +12127,21 @@ mod tests {
             .expect("issues kept first");
         assert!(prompt[issues_at..].contains("latest_comment_author=benfavre"));
         assert!(prompt.ends_with(&format!("{message}\n[/user_message]")));
+    }
+
+    #[test]
+    fn a_shrunk_slack_snapshot_keeps_every_channel() {
+        let snapshot = format!(
+            "## #deploiements\n{}\n\n## #operator-chat\n{}",
+            "canary generation ok ".repeat(300),
+            "Bruno: activ#1119 ".repeat(300)
+        );
+        let mut out = String::new();
+        push_bounded_per_channel(&mut out, &snapshot, 2_000);
+        assert!(out.contains("## #deploiements"));
+        assert!(out.contains("## #operator-chat"));
+        assert!(out.contains("Bruno: activ#1119"));
+        assert!(out.chars().count() <= 2_000 + 8);
     }
 
     #[test]

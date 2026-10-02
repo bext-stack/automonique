@@ -691,13 +691,27 @@ fn scan_mentions(text: &str, catalog: &RepositoryCatalog) -> Vec<Mention> {
                     | '»'
             )
     });
+    // "owner/repo #12" and "alias #12" name the repository in the word just
+    // before the number; remember it for exactly one following piece.
+    let mut preceding: Option<RepoTarget> = None;
     for piece in pieces {
         if mentions.len() >= MAX_MENTIONS_PER_TEXT {
             break;
         }
         let piece = piece.trim_end_matches(['.', ':']);
-        if piece.is_empty() || !piece.is_ascii() {
+        if piece.is_empty() {
             continue;
+        }
+        let named = preceding.take();
+        if !piece.is_ascii() {
+            continue;
+        }
+        if !piece.contains('#') {
+            preceding = if piece.contains('/') {
+                parse_repository(piece)
+            } else {
+                catalog.by_name(piece).cloned()
+            };
         }
         if piece.to_ascii_lowercase().contains("github.com") {
             if let Some(locator) = IssueLocator::parse(piece) {
@@ -723,6 +737,8 @@ fn scan_mentions(text: &str, catalog: &RepositoryCatalog) -> Vec<Mention> {
             if let Some(target) = parse_repository(prefix) {
                 mentions.push(Mention::Exact(target, number));
             }
+        } else if let (true, Some(target)) = (prefix.is_empty(), named) {
+            mentions.push(Mention::Exact(target, number));
         } else if prefix.is_empty()
             || GENERIC_ISSUE_PREFIXES
                 .iter()
@@ -740,6 +756,21 @@ fn scan_mentions(text: &str, catalog: &RepositoryCatalog) -> Vec<Mention> {
 mod tests {
     use super::*;
     use crate::github::GitHubContextComment;
+
+    #[test]
+    fn a_repository_named_just_before_a_bare_number_owns_it() {
+        let catalog = catalog();
+        let mentions = scan_mentions(
+            "see example-org/alpha-shop #1728 and gamma #31, then #9 alone",
+            &catalog,
+        );
+        assert_eq!(mentions.len(), 3);
+        assert!(matches!(&mentions[0], Mention::Exact(target, number)
+            if same_repository(target, &parse_repository("example-org/alpha-shop").unwrap()) && number.get() == 1728));
+        assert!(matches!(&mentions[1], Mention::Exact(target, number)
+            if same_repository(target, &parse_repository("example-user/gamma").unwrap()) && number.get() == 31));
+        assert!(matches!(&mentions[2], Mention::Bare(number) if number.get() == 9));
+    }
 
     fn catalog() -> RepositoryCatalog {
         RepositoryCatalog::new(
