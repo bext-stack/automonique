@@ -274,13 +274,28 @@ pub fn select_issue_references(
             selection.references.push(reference);
         }
     };
-    for mention in message
-        .iter()
-        .chain(live.iter().flatten())
-        .chain(history.iter().flatten())
-    {
+    for mention in message.iter().chain(live.iter().flatten()) {
         let reference = resolve(mention, catalog, &exact_seen, &named_repositories);
         push(&mut selection, reference);
+    }
+    // An unresolved bare number from history usually comes from an earlier
+    // answer that already called it ambiguous; re-reporting it next to issues
+    // that did resolve would keep that ambiguity alive forever. It is only
+    // reported when nothing else in the turn could be settled, so a follow-up
+    // still learns why it cannot be answered.
+    let mut unresolved_from_history = Vec::new();
+    for mention in history.iter().flatten() {
+        let reference = resolve(mention, catalog, &exact_seen, &named_repositories);
+        if matches!(reference, IssueReference::Ambiguous { .. }) {
+            unresolved_from_history.push(reference);
+        } else {
+            push(&mut selection, reference);
+        }
+    }
+    if !selection.has_allowlisted() {
+        for reference in unresolved_from_history {
+            push(&mut selection, reference);
+        }
     }
     if !selection.has_allowlisted() {
         for mention in &remembered {
@@ -756,6 +771,44 @@ fn scan_mentions(text: &str, catalog: &RepositoryCatalog) -> Vec<Mention> {
 mod tests {
     use super::*;
     use crate::github::GitHubContextComment;
+
+    #[test]
+    fn an_unresolvable_bare_number_from_history_is_not_reported_again() {
+        let catalog = catalog();
+        // Next to issues that resolve, a stale bare number from an earlier
+        // answer is not reported again.
+        let history = ["Two references are ambiguous: **#1728** and **#3177**."];
+        let sources = ReferenceSources {
+            message: "check if alpha#7 and gamma#8 are done",
+            live: &[],
+            history_newest_first: &history,
+            remembered: &[],
+        };
+        let selection = select_issue_references(&sources, &catalog);
+        assert!(selection.has_allowlisted());
+        assert!(
+            !selection
+                .references
+                .iter()
+                .any(|reference| matches!(reference, IssueReference::Ambiguous { .. })),
+            "{:?}",
+            selection.references
+        );
+        // When nothing resolves, the follow-up still learns why.
+        let sources = ReferenceSources {
+            message: "check who sent latest comments",
+            live: &[],
+            history_newest_first: &history,
+            remembered: &[],
+        };
+        let selection = select_issue_references(&sources, &catalog);
+        assert!(
+            selection.references.iter().any(|reference| matches!(
+                reference,
+                IssueReference::Ambiguous { number: 1728, .. }
+            ))
+        );
+    }
 
     #[test]
     fn a_repository_named_just_before_a_bare_number_owns_it() {

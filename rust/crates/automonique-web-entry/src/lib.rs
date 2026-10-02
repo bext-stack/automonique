@@ -5510,7 +5510,15 @@ fn compose_chat_prompt(
         push_bounded(&mut prompt, processes, processes_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
-    prompt.push_str("[/dashboard_context]\n[user_message]\n");
+    prompt.push_str("[/dashboard_context]\n");
+    // Stated last, next to the message: history, Slack and ticket text are
+    // often in another language and otherwise pull the reply into it.
+    if let Some(language) = message_language(message) {
+        prompt.push_str("[reply_language] Write the whole answer in ");
+        prompt.push_str(language);
+        prompt.push_str(", the language of user_message, even when the supplied data is in another language. [/reply_language]\n");
+    }
+    prompt.push_str("[user_message]\n");
     prompt.push_str(message);
     prompt.push_str("\n[/user_message]");
     prompt
@@ -5769,6 +5777,42 @@ fn push_bounded_per_channel(target: &mut String, value: &str, characters: usize)
         if !target.ends_with('\n') {
             target.push('\n');
         }
+    }
+}
+
+/// English or French when the message clearly is one of them, by common
+/// function words; `None` leaves the choice to the model.
+fn message_language(message: &str) -> Option<&'static str> {
+    const ENGLISH: &[&str] = &[
+        "the", "is", "are", "what", "who", "check", "if", "all", "done", "you", "today", "sent",
+        "latest", "show", "me", "and", "of", "in", "to", "please", "how", "which", "does", "did",
+        "was", "were", "have", "has", "any", "my", "our", "this", "that", "with", "for", "it",
+    ];
+    const FRENCH: &[&str] = &[
+        "le", "la", "les", "est", "sont", "quoi", "qui", "quels", "quelles", "quel", "quelle",
+        "vérifie", "verifie", "si", "tout", "fait", "aujourd", "hui", "envoyé", "dernier",
+        "derniers", "montre", "moi", "et", "de", "des", "du", "dans", "pour", "avec", "est-ce",
+        "que", "il", "elle", "nous", "vous", "mon", "nos", "ce", "cette", "sur", "pas", "une",
+        "un",
+    ];
+    let words: Vec<String> = message
+        .split(|character: char| !character.is_alphanumeric() && character != '-')
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let score = |list: &[&str]| {
+        words
+            .iter()
+            .filter(|word| list.contains(&word.as_str()))
+            .count()
+    };
+    let (english, french) = (score(ENGLISH), score(FRENCH));
+    if english >= 2 && english > french * 2 {
+        Some("English")
+    } else if french >= 2 && french > english * 2 {
+        Some("French")
+    } else {
+        None
     }
 }
 
@@ -12142,6 +12186,24 @@ mod tests {
         assert!(out.contains("## #operator-chat"));
         assert!(out.contains("Bruno: activ#1119"));
         assert!(out.chars().count() <= 2_000 + 8);
+    }
+
+    #[test]
+    fn the_reply_language_follows_the_current_message() {
+        assert_eq!(
+            message_language("check if what people sent you in slack today is all done"),
+            Some("English")
+        );
+        assert_eq!(
+            message_language("check who sent latest comments"),
+            Some("English")
+        );
+        assert_eq!(
+            message_language("Dans Manage, quels sites ACTIV sont listés ?"),
+            Some("French")
+        );
+        assert_eq!(message_language("ping"), None);
+        assert_eq!(message_language("#1119"), None);
     }
 
     #[test]
