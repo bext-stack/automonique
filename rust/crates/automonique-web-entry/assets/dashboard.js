@@ -201,9 +201,19 @@ function consoleFact(labelText, value) {
   return row;
 }
 
+let consoleDrawerOrigin = null;
+
 function consoleDrawer(id, open, reveal = false) {
   const drawer = byId(id);
   if (!drawer) return;
+  const narrow = window.matchMedia("(max-width: 760px)").matches;
+  if (open && reveal) consoleDrawerOrigin = document.querySelector(".view.is-visible [data-row].is-selected");
+  if (!open && narrow && drawer.classList.contains("is-open") && consoleDrawerOrigin?.isConnected) {
+    // On a phone the drawer sits under the list: closing it returns to the
+    // row it was opened from instead of leaving the reader at the bottom.
+    const origin = consoleDrawerOrigin;
+    window.requestAnimationFrame(() => origin.scrollIntoView({ block: "center" }));
+  }
   if (open && reveal) {
     // On a phone the drawer sits under the list; bring it into view.
     window.requestAnimationFrame(() => {
