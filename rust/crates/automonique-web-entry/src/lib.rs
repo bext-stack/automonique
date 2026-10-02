@@ -9,6 +9,7 @@ mod mobile_work;
 mod platform_cockpit;
 mod platform_task;
 mod platform_v2_bridge;
+mod ticket_detail;
 
 pub use agent_auth::AgentAuthConfig;
 
@@ -167,6 +168,7 @@ pub enum Route {
     ApiAgentAccounts,
     ApiAgentAccountsAction,
     ApiOperations,
+    ApiTicketDetail,
     ApiPlatform,
     ApiPlatformCockpit,
     ApiPlatformSession,
@@ -3189,6 +3191,26 @@ impl WebIntegration {
         }
     }
 
+    /// One ticket's conversation, read only from the configured server that
+    /// listed it, through that server's read-only ticket getter.
+    fn ticket_detail(
+        &self,
+        request: &ticket_detail::TicketDetailRequest,
+    ) -> Result<ticket_detail::TicketDetailView, ticket_detail::TicketDetailFailure> {
+        let (server, id) = ticket_detail::validate(request, &self.manage.mcp_servers)?;
+        // The shared registry is held only briefly by other readers; wait a
+        // bounded moment for it instead of blocking a worker indefinitely.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut mcp = loop {
+            match self.mcp.try_lock() {
+                Ok(mcp) => break mcp,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Err(_) => return Err(ticket_detail::TicketDetailFailure::Unavailable),
+            }
+        };
+        ticket_detail::fetch(&mut mcp, server, id)
+    }
+
     /// Current requester decisions projected into AI Operations.
     ///
     /// Manage mutations and deeper Monique investigations share the same
@@ -5978,6 +6000,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
+                "/api/tickets/detail" => Route::ApiTicketDetail,
                 "/api/platform" => {
                     if request.method == Method::Post {
                         Route::ApiPlatformRemote
@@ -6018,6 +6041,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiAgentAccountsAction
+                    | Route::ApiTicketDetail
                     | Route::ApiPlatformCockpit
                     | Route::ApiPlatformSession
                     | Route::ApiPlatformTask
@@ -6481,6 +6505,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiAgentAccounts
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
+        | Route::ApiTicketDetail
         | Route::ApiPlatform
         | Route::ApiPlatformCockpit
         | Route::ApiPlatformSession
@@ -6599,6 +6624,16 @@ fn api_response(
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiOperations => json_response("200 OK", &integration.operations()),
+        Route::ApiTicketDetail => {
+            let failure = ticket_detail::TicketDetailFailure::InvalidRequest;
+            match serde_json::from_slice::<ticket_detail::TicketDetailRequest>(body) {
+                Ok(request) => match integration.ticket_detail(&request) {
+                    Ok(view) => json_response("200 OK", &view),
+                    Err(failure) => json_error(failure.status(), failure.category()),
+                },
+                Err(_) => json_error(failure.status(), failure.category()),
+            }
+        }
         Route::ApiPlatform => match integration.platform() {
             Ok(view) => json_response("200 OK", &view),
             Err(failure) => json_refusal("503 Service Unavailable", &failure),
@@ -7301,6 +7336,7 @@ fn handle(
             | Route::ApiAgentAccounts
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
+            | Route::ApiTicketDetail
             | Route::ApiPlatform
             | Route::ApiPlatformCockpit
             | Route::ApiPlatformSession
@@ -11586,6 +11622,36 @@ mod tests {
             );
         }
         let get = request("GET", "/api/platform/task", CANONICAL_HOST);
+        assert_eq!(
+            route(&parse_request(&get).unwrap(), &fixture_hosts()),
+            Route::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn ticket_detail_is_post_only_and_requires_operator_authentication() {
+        let body = r#"{"integration_server":"support","id":"thr_1"}"#;
+        for auth in ["", "Authorization: Bearer untrusted\r\n"] {
+            let request = format!(
+                "POST /api/tickets/detail HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response =
+                String::from_utf8(exchange_without_integration(request.as_bytes())).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+                "{response}"
+            );
+            assert!(!response.contains("thr_1"));
+        }
+        let post = format!(
+            "POST /api/tickets/detail HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{{}}"
+        );
+        assert_eq!(
+            Route::ApiTicketDetail,
+            route(&parse_request(post.as_bytes()).unwrap(), &fixture_hosts())
+        );
+        let get = request("GET", "/api/tickets/detail", CANONICAL_HOST);
         assert_eq!(
             route(&parse_request(&get).unwrap(), &fixture_hosts()),
             Route::MethodNotAllowed

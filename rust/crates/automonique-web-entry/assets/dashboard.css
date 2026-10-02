@@ -1044,6 +1044,17 @@ input[type="text"], input:not([type]), textarea { border-radius: 7px; }
 .memory-confidence meter::-webkit-meter-bar { height: 6px; border: 0; border-radius: 3px; background: var(--line); }
 .memory-confidence meter::-webkit-meter-optimum-value, .memory-confidence meter::-webkit-meter-suboptimum-value, .memory-confidence meter::-webkit-meter-even-less-good-value { border-radius: 3px; background: var(--accent); }
 .memory-confidence meter::-moz-meter-bar { border-radius: 3px; background: var(--accent); }
+.ticket-thread { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ticket-thread-note { color: var(--quiet); font-size: var(--font-xs); }
+.ticket-message { display: grid; gap: 4px; padding: 8px 10px; border-radius: 8px; background: var(--panel-2); }
+.ticket-message[data-direction="outbound"] { background: var(--accent-surface); }
+.ticket-message[data-internal="true"] { background: color-mix(in srgb, var(--amber) 10%, var(--panel-2)); }
+.ticket-message-meta { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; color: var(--quiet); font-size: var(--font-2xs); }
+.ticket-message-meta strong { color: var(--muted); font-weight: 600; overflow-wrap: anywhere; }
+.ticket-message-meta time { margin-left: auto; }
+.ticket-message-body { margin: 0; color: var(--text); font-size: var(--font-sm); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ticket-message-cut { color: var(--quiet); font-size: var(--font-2xs); font-style: italic; }
+.ticket-conversation > .table-more { height: 30px; }
 .process-output-log { display: grid; gap: 8px; max-height: 360px; padding: 10px; overflow: auto; border-radius: 8px; background: var(--panel-2); }
 .process-output-log > p { color: var(--quiet); font-size: var(--font-xs); }
 .process-output-log article { display: grid; gap: 3px; }

@@ -243,6 +243,7 @@ function consoleOpenTicket(id, reveal = true) {
   }
   consoleState.ticketId = id;
   renderTicketDrawer(ticket);
+  loadTicketConversation(ticket, reveal);
   consoleMarkSelected(byId("ticket-list"), "data-ticket-id", id);
   if (reveal) consoleDrawer("ticket-drawer", true, true);
 }
@@ -1464,6 +1465,16 @@ const frenchUi = Object.freeze({
   "Ticket": "Ticket",
   "Other": "Autre",
   "Review with assistant": "Examiner avec l’assistant",
+  "Conversation": "Conversation",
+  "Loading the conversation…": "Chargement de la conversation…",
+  "This conversation was not found at its source.": "Cette conversation est introuvable dans sa source.",
+  "This source does not allow reading the conversation here.": "Cette source ne permet pas de lire la conversation ici.",
+  "The conversation could not be loaded right now.": "La conversation n’a pas pu être chargée pour le moment.",
+  "No messages in this conversation.": "Aucun message dans cette conversation.",
+  "Older messages are not shown.": "Les messages plus anciens ne sont pas affichés.",
+  "Unknown sender": "Expéditeur inconnu",
+  "Internal note": "Note interne",
+  "Message shortened": "Message raccourci",
   "Assigned to": "Attribué à",
   "Requested by": "Demandé par",
   "Client": "Client",
@@ -1709,6 +1720,7 @@ function translatePhraseForFrench(value) {
     [/^(\S+) (memory|memories)(?: for “(.+)”)?$/, (match) => `${match[1]} souvenir${match[2] === "memory" ? "" : "s"}${match[3] ? ` pour « ${match[3]} »` : ""}`],
     [/^(Live|Saved history)(?: · (\d+) to approve)?$/, (match) => `${match[1] === "Live" ? "En direct" : "Historique enregistré"}${match[2] ? ` · ${match[2]} à approuver` : ""}`],
     [/^Show all \((\d+)\)$/, (match) => `Tout afficher (${match[1]})`],
+    [/^Show earlier \((\d+)\)$/, (match) => `Afficher les précédents (${match[1]})`],
     [/^Could not open · (.+)$/, (match) => `Ouverture impossible · ${match[1]}`],
     [/^Conversation not available: (.+)$/, (match) => `Conversation indisponible : ${match[1]}`],
     [/^(\d+) seconds$/, (match) => `${match[1]} secondes`],
@@ -4270,7 +4282,152 @@ function renderTicketDrawer(ticket) {
     ["Ticket ID", ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`],
   ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(ticketDetail(labelText, value, exact)));
   detailsSection.append(detailsTitle, details);
-  body.append(summary, detailsSection);
+  const conversation = document.createElement("section");
+  conversation.className = "drawer-section ticket-conversation";
+  conversation.id = "ticket-conversation";
+  conversation.dataset.key = ticketConversationKey(ticket);
+  body.append(summary, conversation, detailsSection);
+}
+
+// One ticket's conversation, read on demand from the service that listed it.
+// Entries live for the session; one fetched before the latest ticket list is
+// fetched again the next time its drawer is opened.
+const ticketConversations = new Map();
+const TICKET_CONVERSATION_VISIBLE = 20;
+
+function ticketConversationKey(ticket) {
+  return `${ticket.integration_server || ""}\n${ticket.id}`;
+}
+
+function loadTicketConversation(ticket, opening) {
+  const key = ticketConversationKey(ticket);
+  if (!ticket.integration_server || ticket.id === "unreferenced") {
+    renderTicketConversation(key, { state: "failed", error: "ticket_detail_unavailable" });
+    return;
+  }
+  let entry = ticketConversations.get(key);
+  const outdated = entry && opening && entry.state !== "loading" && (entry.snapshot !== operationsSnapshot || entry.state === "failed");
+  if (!entry || outdated) {
+    entry = { state: "loading", snapshot: operationsSnapshot, view: null, error: null, expanded: entry?.expanded === true };
+    ticketConversations.set(key, entry);
+    const pending = entry;
+    api("/api/tickets/detail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ integration_server: ticket.integration_server, id: ticket.id }),
+    }).then((view) => {
+      pending.state = "ready";
+      pending.view = view;
+    }, (error) => {
+      pending.state = "failed";
+      pending.error = error.message;
+    }).finally(() => {
+      if (ticketConversations.get(key) === pending) renderTicketConversation(key, pending);
+    });
+  }
+  renderTicketConversation(key, entry);
+}
+
+// Sources may give epoch seconds or milliseconds instead of ISO text.
+function ticketMessageTimestamp(value) {
+  const text = String(value || "");
+  if (/^\d{9,13}$/.test(text)) {
+    const number = Number(text);
+    return new Date(number < 1e12 ? number * 1000 : number).toISOString();
+  }
+  return text;
+}
+
+function ticketConversationFailure(category) {
+  if (category === "not_found") return "This conversation was not found at its source.";
+  if (category === "refused") return "This source does not allow reading the conversation here.";
+  return "The conversation could not be loaded right now.";
+}
+
+function ticketConversationNote(text) {
+  const note = document.createElement("p");
+  note.className = "ticket-thread-note";
+  note.textContent = text;
+  return note;
+}
+
+function ticketMessageCard(message) {
+  const item = document.createElement("li");
+  item.className = "ticket-message";
+  if (message.direction === "inbound" || message.direction === "outbound") item.dataset.direction = message.direction;
+  if (message.internal === true) item.dataset.internal = "true";
+  const meta = document.createElement("div");
+  meta.className = "ticket-message-meta";
+  const author = document.createElement("strong");
+  if (message.author) {
+    author.setAttribute("data-i18n-skip", "");
+    author.textContent = message.author;
+  } else {
+    author.textContent = "Unknown sender";
+  }
+  meta.append(author);
+  if (message.internal === true) meta.append(consoleBadge("Internal note", "warn"));
+  const at = ticketMessageTimestamp(message.at);
+  const relative = ticketRelativeTime(at);
+  if (relative) {
+    const time = document.createElement("time");
+    time.setAttribute("data-i18n-skip", "");
+    time.dateTime = at;
+    time.title = ticketDateLabel(at);
+    time.textContent = relative;
+    meta.append(time);
+  }
+  const body = document.createElement("p");
+  body.className = "ticket-message-body";
+  body.setAttribute("data-i18n-skip", "");
+  body.textContent = typeof message.body === "string" ? message.body : "";
+  item.append(meta, body);
+  if (message.body_truncated === true) {
+    const cut = document.createElement("span");
+    cut.className = "ticket-message-cut";
+    cut.textContent = "Message shortened";
+    item.append(cut);
+  }
+  return item;
+}
+
+function renderTicketConversation(key, entry) {
+  const section = byId("ticket-conversation");
+  if (!section || section.dataset.key !== key) return;
+  const heading = document.createElement("h3");
+  heading.textContent = "Conversation";
+  section.replaceChildren(heading);
+  if (entry.state === "loading") {
+    section.append(ticketConversationNote("Loading the conversation…"));
+    return;
+  }
+  if (entry.state === "failed") {
+    section.append(ticketConversationNote(ticketConversationFailure(entry.error)));
+    return;
+  }
+  const messages = Array.isArray(entry.view?.messages) ? entry.view.messages : [];
+  if (!messages.length) {
+    section.append(ticketConversationNote("No messages in this conversation."));
+    return;
+  }
+  const hidden = entry.expanded ? 0 : Math.max(0, messages.length - TICKET_CONVERSATION_VISIBLE);
+  if (hidden > 0) {
+    const earlier = document.createElement("button");
+    earlier.type = "button";
+    earlier.className = "table-more";
+    earlier.textContent = `Show earlier (${hidden})`;
+    earlier.addEventListener("click", () => {
+      entry.expanded = true;
+      renderTicketConversation(key, entry);
+    });
+    section.append(earlier);
+  } else if (entry.view?.truncated === true) {
+    section.append(ticketConversationNote("Older messages are not shown."));
+  }
+  const thread = document.createElement("ol");
+  thread.className = "ticket-thread";
+  messages.slice(hidden).forEach((message) => thread.append(ticketMessageCard(message)));
+  section.append(thread);
 }
 
 function renderOperations(view) {

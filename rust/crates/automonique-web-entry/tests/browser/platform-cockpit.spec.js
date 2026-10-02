@@ -612,3 +612,56 @@ test("a failed execution is not presented as proof that nothing ran", async ({ p
   await expect(page.locator("#platform-task-status")).toContainText("Task did not complete");
   await expect(page.locator("#platform-task-status")).not.toContainText("did not run");
 });
+
+test("the ticket drawer reads the conversation once and keeps the facts when it fails", async ({ page }) => {
+  const ticket = (id, title) => ({
+    integration: "support", integration_server: "support", id, title, status: "open", workflow: "open",
+    priority: "normal", assignee: null, requester: "Ada", tenant: null, site: null, source: null,
+    comments: null, created_at: "2026-09-01T08:00:00Z", updated_at: "2026-09-02T09:00:00Z", url: null,
+  });
+  const operations = {
+    schema: "automonique.dashboard.operations/v1", health: "attached", console_url: null,
+    tools_total: 2, read_only_tools: 2, approval_tools: 0, ticket_tools: 2, pending_actions: 0, tools: [],
+    tickets: { health: "ready", sources: [], items: [ticket("thr_1", "Invoice missing"), ticket("thr_2", "Broken login")] },
+  };
+  const requests = [];
+  await page.route("**/api/operations", (route) => route.fulfill({ json: operations }));
+  await page.route("**/api/tickets/detail", (route) => {
+    const body = route.request().postDataJSON();
+    requests.push(body);
+    if (body.id === "thr_2") return route.fulfill({ status: 503, json: { error: "ticket_detail_unavailable" } });
+    const messages = Array.from({ length: 23 }, (_, index) => ({
+      author: index % 2 ? "Support" : "Ada",
+      at: `2026-09-01T08:${String(index).padStart(2, "0")}:00Z`,
+      body: `Message ${index}\nsecond line <b>kept as text</b>`,
+      body_truncated: false,
+      direction: index % 2 ? "outbound" : "inbound",
+    }));
+    return route.fulfill({ json: {
+      schema: "automonique.dashboard.ticket-detail/v1", integration_server: "support", id: "thr_1",
+      source_tool: "support_get_ticket", title: "Invoice missing", status: "open", requester: "Ada",
+      created_at: null, updated_at: null, messages, messages_total: 23, truncated: false,
+    } });
+  });
+  await page.goto("https://cockpit.test/#tickets");
+  await page.reload();
+  await page.locator("[data-ticket-id='thr_1']").click();
+  const conversation = page.locator("#ticket-conversation");
+  await expect(conversation.locator(".ticket-message")).toHaveCount(20);
+  await expect(conversation.locator(".ticket-message").last()).toContainText("Message 22");
+  await expect(conversation.locator(".ticket-message-body").last()).toHaveText("Message 22\nsecond line <b>kept as text</b>");
+  await expect(conversation.locator(".ticket-message b")).toHaveCount(0);
+  await expect(conversation.locator("time").first()).toHaveAttribute("title", /2026/);
+  await conversation.getByRole("button", { name: "Show earlier (3)" }).click();
+  await expect(conversation.locator(".ticket-message")).toHaveCount(23);
+  await expect(conversation.locator(".ticket-message").first()).toContainText("Message 0");
+  expect(requests).toEqual([{ integration_server: "support", id: "thr_1" }]);
+
+  await page.locator("[data-ticket-id='thr_2']").click();
+  await expect(page.locator("#ticket-conversation")).toContainText("The conversation could not be loaded right now.");
+  await expect(page.locator("#ticket-drawer-body")).toContainText("Ticket ID");
+
+  await page.locator("[data-ticket-id='thr_1']").click();
+  await expect(page.locator("#ticket-conversation .ticket-message")).toHaveCount(23);
+  expect(requests.filter(({ id }) => id === "thr_1")).toHaveLength(1);
+});
