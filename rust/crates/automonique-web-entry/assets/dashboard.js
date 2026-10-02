@@ -6,9 +6,9 @@ const byId = (id) => document.getElementById(id);
 const supportedLanguages = ["en", "fr"];
 let currentLanguage = storedPreference("monique-language", supportedLanguages, navigator.language.toLowerCase().startsWith("fr") ? "fr" : "en");
 const localeTag = () => currentLanguage === "fr" ? "fr-FR" : "en-US";
-const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString(localeTag()) : "—";
-const words = (value) => typeof value === "string" ? translatePhrase(value.replaceAll("_", " ")) : "—";
-const yesNo = (value) => value === true ? translatePhrase("YES") : value === false ? translatePhrase("NO") : "—";
+const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString(localeTag()) : "-";
+const words = (value) => typeof value === "string" ? translatePhrase(value.replaceAll("_", " ")) : "-";
+const yesNo = (value) => value === true ? translatePhrase("YES") : value === false ? translatePhrase("NO") : "-";
 const safeMetric = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
 const statusHistory = [];
 let memorySnapshot = null;
@@ -16,7 +16,7 @@ let memoryKind = "all";
 let memoryStatus = "all";
 let memorySensitivity = "all";
 let memorySort = "updated_desc";
-let memoryMode = storedPreference("monique-memory-view", ["graph", "list", "timeline"], "graph");
+let memoryMode = storedPreference("monique-memory-view", ["graph", "list", "timeline"], "list");
 let selectedMemoryReference = null;
 let memoryQuery = null;
 let operationsSnapshot = null;
@@ -73,6 +73,280 @@ let configurationQuery = "";
 let agentAccountsPollTimer = null;
 let statusRefreshTimer = null;
 let lastNotifiedAttentionKey = null;
+
+// Ops console: shared list rows, badges and drawer state. The views render
+// their lists through these helpers so every list scans, selects and opens
+// its detail drawer the same way.
+const consoleState = { expandedLists: new Set(), taskDrawerDismissed: false, ticketId: null, opsKind: null, opsKey: null, memoryOpen: false };
+
+function consoleViewName(name) {
+  return { sessions: "Tasks", tickets: "Tickets", operations: "Agents", memory: "Memory", overview: "Health", configuration: "Settings", chat: "Assistant" }[name] || name;
+}
+
+function consoleRow(className, onSelect) {
+  const row = document.createElement("div");
+  row.className = `row ${className}`;
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  row.dataset.row = "";
+  row.addEventListener("click", (event) => {
+    if (event.target.closest("a, button") && event.target.closest("a, button") !== row) return;
+    onSelect();
+  });
+  return row;
+}
+
+function consoleMsAgo(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "-";
+  return ticketRelativeTime(new Date(milliseconds).toISOString()) || "-";
+}
+
+// Long lists show the newest rows first and fold the rest behind one row.
+function consoleCapList(root, key, attribute, selectedValue, limit = 20) {
+  const rows = [...root.querySelectorAll(":scope > [data-row]")];
+  root.querySelector(":scope > .table-more")?.remove();
+  if (rows.length <= limit) return;
+  const expanded = consoleState.expandedLists.has(key);
+  rows.forEach((row, index) => {
+    row.hidden = !expanded && index >= limit && row.getAttribute(attribute) !== selectedValue;
+  });
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "table-more";
+  more.textContent = expanded ? "Show fewer" : `Show all (${rows.length})`;
+  more.addEventListener("click", () => {
+    if (expanded) consoleState.expandedLists.delete(key);
+    else consoleState.expandedLists.add(key);
+    consoleCapList(root, key, attribute, selectedValue, limit);
+  });
+  root.append(more);
+}
+
+// "Open" only means the conversation exists. Working needs real evidence: a
+// running agent job on that session, or its workspace reporting "working".
+function consoleSessionWorking(sessionId) {
+  if (!sessionId) return false;
+  const running = (processesSnapshot?.jobs || []).some((job) => job.status === "running" && job.session_id === sessionId);
+  const workspace = (cockpitPresentation?.workspaces || []).some((item) => item.attention === "working" && (item.session_ids || []).includes(sessionId));
+  return running || workspace;
+}
+
+function consoleSessionObservedMs(session) {
+  const value = Number(session?.session?.observed_at_ms ?? session?.observed_at_ms);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function consoleShortId(id) {
+  const text = String(id || "-");
+  return text.length <= 14 ? text : `${text.slice(0, 12)}…`;
+}
+
+function consoleSessionTitle(session) {
+  const observed = consoleSessionObservedMs(session);
+  if (!observed) return `${translatePhrase("Session")} ${consoleShortId(session?.session?.resource?.id)}`;
+  const when = new Intl.DateTimeFormat(localeTag(), { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(observed);
+  return `${translatePhrase("Session")} · ${when}`;
+}
+
+function consoleSentence(value) {
+  const text = words(value);
+  return text.charAt(0).toLocaleUpperCase(localeTag()) + text.slice(1);
+}
+
+function consoleCell(text, className = "cell") {
+  const cell = document.createElement("span");
+  cell.className = className;
+  cell.textContent = text;
+  return cell;
+}
+
+function consoleCellWrap(child) {
+  const cell = document.createElement("span");
+  cell.className = "cell";
+  cell.append(child);
+  return cell;
+}
+
+function consoleBadge(text, tone = "quiet") {
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.dataset.tone = tone;
+  badge.textContent = text;
+  return badge;
+}
+
+function consolePriority(priority) {
+  const node = document.createElement("span");
+  node.className = "prio";
+  node.dataset.p = ["urgent", "high", "normal", "low"].includes(priority) ? priority : "normal";
+  const bars = document.createElement("i");
+  bars.setAttribute("aria-hidden", "true");
+  bars.append(document.createElement("span"));
+  const text = document.createElement("span");
+  text.textContent = operationLabel(priority || "normal");
+  node.append(bars, text);
+  return node;
+}
+
+function consoleFact(labelText, value) {
+  const row = document.createElement("div");
+  const term = document.createElement("dt");
+  term.textContent = labelText;
+  const detail = document.createElement("dd");
+  detail.setAttribute("data-i18n-skip", "");
+  detail.textContent = value || "-";
+  row.append(term, detail);
+  return row;
+}
+
+function consoleDrawer(id, open, reveal = false) {
+  const drawer = byId(id);
+  if (!drawer) return;
+  if (open && reveal) {
+    // On a phone the drawer sits under the list; bring it into view.
+    window.requestAnimationFrame(() => {
+      if (window.matchMedia("(max-width: 760px)").matches) drawer.scrollIntoView({ block: "start" });
+    });
+  }
+  drawer.classList.toggle("is-open", open);
+  drawer.inert = !open;
+  drawer.closest(".view-split")?.classList.toggle("has-drawer", open);
+  document.documentElement.dataset.sheet = document.querySelector(".view.is-visible .drawer.is-open") ? "open" : "closed";
+}
+
+function consoleDrawerIsOpen(id) {
+  return byId(id)?.classList.contains("is-open") === true;
+}
+
+function consoleMarkSelected(root, attribute, value) {
+  root?.querySelectorAll("[data-row]").forEach((row) => row.classList.toggle("is-selected", value !== null && row.getAttribute(attribute) === value));
+}
+
+function consoleOpenTicket(id, reveal = true) {
+  const ticket = (operationsSnapshot?.tickets?.items || []).find((item) => item.id === id);
+  if (!ticket) {
+    consoleState.ticketId = null;
+    consoleDrawer("ticket-drawer", false);
+    return;
+  }
+  consoleState.ticketId = id;
+  renderTicketDrawer(ticket);
+  consoleMarkSelected(byId("ticket-list"), "data-ticket-id", id);
+  if (reveal) consoleDrawer("ticket-drawer", true, true);
+}
+
+function consoleRefreshTicketDrawer() {
+  if (consoleState.ticketId && consoleDrawerIsOpen("ticket-drawer")) consoleOpenTicket(consoleState.ticketId, false);
+}
+
+function consoleOpenProcess(id, reveal = true) {
+  const job = (processesSnapshot?.jobs || []).find((item) => item.id === id);
+  if (!job) {
+    if (reveal) return;
+    if (consoleState.opsKind === "process") consoleCloseOps();
+    return;
+  }
+  if (!reveal && !consoleDrawerIsOpen("ops-drawer")) return;
+  consoleState.opsKind = "process";
+  consoleState.opsKey = id;
+  renderProcessDrawer(job);
+  consoleMarkSelected(byId("process-list"), "data-process-id", id);
+  consoleMarkSelected(byId("operations-tool-grid"), "data-tool-key", null);
+  if (reveal) consoleDrawer("ops-drawer", true, true);
+}
+
+function consoleOpenTool(key, reveal = true) {
+  const tool = (operationsSnapshot?.tools || []).find((item) => `${item.server}:${item.name}` === key);
+  if (!tool) {
+    if (!reveal && consoleState.opsKind === "tool") consoleCloseOps();
+    return;
+  }
+  if (!reveal && !consoleDrawerIsOpen("ops-drawer")) return;
+  consoleState.opsKind = "tool";
+  consoleState.opsKey = key;
+  renderToolDrawer(tool);
+  consoleMarkSelected(byId("operations-tool-grid"), "data-tool-key", key);
+  consoleMarkSelected(byId("process-list"), "data-process-id", null);
+  if (reveal) consoleDrawer("ops-drawer", true, true);
+}
+
+function consoleCloseOps() {
+  consoleState.opsKind = null;
+  consoleState.opsKey = null;
+  consoleMarkSelected(byId("process-list"), "data-process-id", null);
+  consoleMarkSelected(byId("operations-tool-grid"), "data-tool-key", null);
+  consoleDrawer("ops-drawer", false);
+}
+
+function consoleOpenMemory(reference) {
+  selectedMemoryReference = reference;
+  consoleState.memoryOpen = true;
+  renderSelectedMemory();
+  byId("memory-drawer-title").setAttribute("data-i18n-skip", "");
+  byId("memory-drawer-title").textContent = reference;
+  consoleDrawer("memory-drawer", true, true);
+}
+
+function consoleShowTaskPane(pane) {
+  const workspace = pane === "workspace";
+  byId("drawer-workspace-pane").hidden = !workspace;
+  const workspaceTab = document.querySelector("[data-drawer-pane='workspace']");
+  workspaceTab.classList.toggle("is-active", workspace);
+  workspaceTab.setAttribute("aria-selected", String(workspace));
+  workspaceTab.tabIndex = workspace ? 0 : -1;
+  if (workspace) {
+    document.querySelectorAll("[data-cockpit-surface]").forEach((item) => {
+      item.classList.remove("is-active");
+      item.setAttribute("aria-selected", "false");
+      item.tabIndex = -1;
+      const panel = byId(item.getAttribute("aria-controls"));
+      panel.hidden = true;
+      panel.classList.remove("is-active");
+    });
+  } else {
+    document.querySelector(`[data-cockpit-surface="${pane}"]`)?.click();
+  }
+  consoleSyncTaskDrawerTitle();
+}
+
+function consoleTaskPane() {
+  if (!byId("drawer-workspace-pane").hidden) return "workspace";
+  return document.querySelector("[data-cockpit-surface].is-active")?.dataset.cockpitSurface || "conversation";
+}
+
+function consoleSyncTaskDrawerTitle() {
+  const title = byId("task-drawer-title");
+  const kicker = byId("task-drawer-kicker");
+  if (!title || !kicker) return;
+  title.setAttribute("data-i18n-skip", "");
+  if (consoleTaskPane() === "conversation") {
+    kicker.textContent = "Conversation";
+    title.textContent = byId("platform-session-detail").hidden ? translatePhrase("Nothing selected") : byId("platform-session-summary").textContent;
+  } else {
+    kicker.textContent = "Workspace";
+    title.textContent = byId("cockpit-workspace-title").textContent;
+  }
+}
+
+function consoleTaskDrawerOpened() {
+  if (!consoleDrawerIsOpen("task-drawer")) {
+    consoleDrawer("task-drawer", true);
+    consoleShowTaskPane("conversation");
+  }
+}
+
+function consoleOpenSession(sessionId) {
+  consoleDrawer("task-drawer", true, true);
+  consoleShowTaskPane("conversation");
+  selectPlatformSession(sessionId);
+}
+
+function consoleOpenWorkspace(workspace) {
+  consoleDrawer("task-drawer", true, true);
+  consoleShowTaskPane("workspace");
+  selectCockpitWorkspace(workspace);
+}
 const frenchUi = Object.freeze({
   "Skip to workspace": "Aller à l’espace de travail",
   "Primary navigation": "Navigation principale",
@@ -147,7 +421,11 @@ const frenchUi = Object.freeze({
   "Appearance settings reset.": "Les paramètres d’apparence ont été réinitialisés.",
   "CONTROL PLANE / LIVE": "PLAN DE CONTRÔLE / TEMPS RÉEL",
   "Operations overview": "Vue d’ensemble des opérations",
-  "A live, secret-safe view of Monique’s execution path and delivery certainty.": "Une vue en temps réel et sans secrets du parcours d’exécution de Monique et de la certitude de livraison.",
+  "Start a task, then follow its workspace and conversation in one place.": "Lancez une tâche, puis suivez son espace de travail et sa conversation au même endroit.",
+  "See what agents are running and which Support and Manage tools Monique can use. Anything that changes data waits for your approval.": "Voyez quels agents tournent et quels outils Support et Manage Monique peut utiliser. Tout changement de données attend votre accord.",
+  "Pick a session to read its history. Reading never takes control, and every follow-up is checked against the latest state first.": "Choisissez une session pour lire son historique. La lecture ne prend jamais le contrôle, et chaque relance est vérifiée sur l’état le plus récent.",
+  "Its history, progress and approvals will appear here.": "Son historique, sa progression et ses validations apparaîtront ici.",
+  "What Monique is doing right now, and anything that needs you.": "Ce que fait Monique en ce moment, et ce qui demande votre attention.",
   "Open Manage ↗": "Ouvrir Manage ↗",
   "Establishing snapshot": "Établissement de l’instantané",
   "Waiting for the daemon’s sanitized operational projection.": "En attente de la projection opérationnelle assainie du démon.",
@@ -159,11 +437,11 @@ const frenchUi = Object.freeze({
   "OUTBOX": "BOÎTE DE SORTIE",
   "awaiting delivery": "en attente de livraison",
   "RECONCILE": "RÉCONCILIATION",
-  "manual outcomes": "résultats manuels",
+  "need a manual check": "à vérifier à la main",
   "AMBIGUOUS": "AMBIGU",
-  "uncertain effects": "effets incertains",
+  "outcome unclear": "résultat incertain",
   "ATTENTION": "ATTENTION",
-  "failed invariants": "invariants en échec",
+  "checks failing": "contrôles en échec",
   "Suggested operational questions": "Questions opérationnelles suggérées",
   "QUICK BRIEFS": "RÉSUMÉS RAPIDES",
   "Explain health": "Expliquer l’état de santé",
@@ -174,13 +452,13 @@ const frenchUi = Object.freeze({
   "LIVE": "TEMPS RÉEL",
   "Work pipeline": "Pipeline de travail",
   "Intake": "Admission",
-  "Durable admission": "Admission durable",
+  "Received and saved": "Reçu et enregistré",
   "Execution": "Exécution",
-  "Fenced provider runs": "Exécutions fournisseur cloisonnées",
+  "Agents at work": "Agents au travail",
   "Delivery": "Livraison",
-  "Idempotent effects": "Effets idempotents",
+  "Results being sent": "Résultats en cours d’envoi",
   "Reconcile": "Réconcilier",
-  "Outcome certainty": "Certitude du résultat",
+  "Results being confirmed": "Résultats en cours de confirmation",
   "INVARIANTS": "INVARIANTS",
   "Runtime posture": "Posture d’exécution",
   "CHECKING": "VÉRIFICATION",
@@ -341,7 +619,7 @@ const frenchUi = Object.freeze({
   "Loading the live ticket queue…": "Chargement de la file de tickets en temps réel…",
   "TYPED / REVISIONED / PROVENANCE-BOUND": "TYPÉ / VERSIONNÉ / PROVENANCE LIÉE",
   "Memory system": "Système de mémoire",
-  "Inspect the evidence Monique can retrieve without exposing raw private state.": "Examinez les éléments que Monique peut récupérer sans exposer l’état privé brut.",
+  "What Monique remembers, where it came from, and when to review it.": "Ce dont Monique se souvient, d’où cela vient, et quand le revoir.",
   "Search memory evidence": "Rechercher dans les éléments de mémoire",
   "Clear memory search": "Effacer la recherche en mémoire",
   "Search": "Rechercher",
@@ -374,6 +652,12 @@ const frenchUi = Object.freeze({
   "Provenance": "Provenance",
   "Revision": "Révision",
   "Updated": "Mis à jour",
+  "Project, host, and workspace navigation": "Navigation par projet, serveur et espace de travail",
+  "Structured workspace attention inbox": "Éléments qui vous attendent",
+  "Chronological workspace activity": "Activité récente de l’espace de travail",
+  "Live": "En direct",
+  "Saved history": "Historique enregistré",
+  "No linked run": "Aucune exécution liée",
   "Next review": "Prochain réexamen",
   "No review scheduled": "Aucun réexamen planifié",
   "Review due": "Réexamen requis",
@@ -395,7 +679,7 @@ const frenchUi = Object.freeze({
   "Typed memory evidence graph": "Graphe typé des éléments de mémoire",
   "EFFECTIVE / SECRET-SAFE PROJECTION": "PROJECTION EFFECTIVE / SANS SECRETS",
   "SYSTEM / WORKSPACE / PREFERENCES": "SYSTÈME / ESPACE / PRÉFÉRENCES",
-  "Tune your workspace and understand every active system boundary from one place.": "Personnalisez votre espace et comprenez chaque périmètre actif du système depuis un seul endroit.",
+  "Your preferences, connected accounts and how this dashboard is protected.": "Vos préférences, vos comptes connectés et la protection de ce tableau de bord.",
   "SECRET-SAFE": "SANS SECRETS",
   "Configuration summary": "Résumé de la configuration",
   "Workspace": "Espace de travail",
@@ -480,7 +764,7 @@ const frenchUi = Object.freeze({
   "Effective · secret-safe": "Effectif · sans secrets",
   "Configure with Monique →": "Configurer avec Monique →",
   "Review the complete system configuration. Identify missing or unhealthy integrations, explain the safest next configuration change, and stage any mutation for my explicit approval.": "Examine la configuration complète du système. Identifie les intégrations manquantes ou défaillantes, explique la prochaine modification la plus sûre et prépare toute action pour mon approbation explicite.",
-  "Effective capabilities, boundaries, and limits—not credentials or private coordinates.": "Fonctionnalités, limites et périmètres effectifs — sans identifiants ni coordonnées privées.",
+  "Effective capabilities, boundaries, and limits-not credentials or private coordinates.": "Fonctionnalités, limites et périmètres effectifs - sans identifiants ni coordonnées privées.",
   "SECRETS CONCEALED": "SECRETS MASQUÉS",
   "Values are allowlisted.": "Les valeurs sont explicitement autorisées.",
   "Credentials, account identifiers, filesystem locations and provider payloads are structurally absent from this API.": "Les identifiants, références de compte, emplacements de fichiers et charges utiles fournisseur sont structurellement absents de cette API.",
@@ -861,6 +1145,504 @@ const frenchUi = Object.freeze({
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
+  // Ops console layout.
+  "READY": "PRÊT",
+  "Session": "Session",
+  "Show fewer": "Afficher moins",
+  "Closed": "Fermé",
+  "Has a linked run": "Exécution liée",
+  "History only": "Historique seulement",
+  "Can be opened": "Peut être ouverte",
+  "Updated": "Mis à jour",
+  "completed": "terminé",
+  "unread": "non lu",
+  "View": "Voir",
+  "Tasks": "Tâches",
+  "Agents": "Agents",
+  "Health": "Santé",
+  "Settings": "Réglages",
+  "Assistant": "Assistant",
+  "TASKS": "TÂCHES",
+  "Main sections": "Sections principales",
+  "Monique, open tasks": "Monique, ouvrir les tâches",
+  "Search or jump to": "Rechercher ou aller à",
+  "System health": "Santé du système",
+  "Healthy": "En bonne santé",
+  "Degraded": "Dégradé",
+  "Offline": "Hors ligne",
+  "conversations": "conversations",
+  "workspaces": "espaces de travail",
+  "Task counts": "Compteurs de tâches",
+  "Describe a new task, for example: fix the contact form on regalterre.fr and test it": "Décrivez une nouvelle tâche, par exemple : corrige le formulaire de contact de regalterre.fr et teste-le",
+  "Run task": "Lancer la tâche",
+  "Run a task": "Lancer une tâche",
+  "What should Monique do?": "Que doit faire Monique ?",
+  "Ready for a new task.": "Prêt pour une nouvelle tâche.",
+  "Check task status": "Vérifier l’état de la tâche",
+  "Open task conversation": "Ouvrir la conversation de la tâche",
+  "Monique works in a private copy. Code changes go through a ticket.": "Monique travaille dans une copie privée. Les changements de code passent par un ticket.",
+  "Conversations": "Conversations",
+  "Conversation": "Conversation",
+  "Task": "Tâche",
+  "Sync": "Synchro",
+  "Reference": "Référence",
+  "Status": "État",
+  "Working": "En cours",
+  "Idle": "Inactif",
+  "Up to date": "À jour",
+  "Out of date": "Pas à jour",
+  "Unknown": "Inconnu",
+  "Untitled task": "Tâche sans titre",
+  "Updated just now": "Mis à jour à l’instant",
+  "The list is not available": "La liste n’est pas disponible",
+  "Not loaded yet": "Pas encore chargé",
+  "Loading": "Chargement",
+  "Loading conversations…": "Chargement des conversations…",
+  "No conversations yet. Start a task above.": "Aucune conversation pour l’instant. Lancez une tâche ci-dessus.",
+  "Workspaces": "Espaces de travail",
+  "Filter workspaces": "Filtrer les espaces de travail",
+  "All": "Tous",
+  "Needs you": "Vous attend",
+  "Needs": "Besoin",
+  "Branch": "Branche",
+  "Checking workspaces": "Vérification des espaces de travail",
+  "Conversations stay available while this loads.": "Les conversations restent disponibles pendant le chargement.",
+  "Workspaces are up to date.": "Les espaces de travail sont à jour.",
+  "Some workspace details are missing.": "Certains détails des espaces de travail manquent.",
+  "Workspaces are not available on this server.": "Les espaces de travail ne sont pas disponibles sur ce serveur.",
+  "This data is out of date. Workspace actions are paused until it refreshes.": "Ces données ne sont pas à jour. Les actions sont en pause jusqu’à la prochaine actualisation.",
+  "Projects, servers, workspaces and their status are listed below.": "Projets, serveurs, espaces de travail et leur état sont listés ci-dessous.",
+  "No workspaces yet.": "Aucun espace de travail pour l’instant.",
+  "No workspaces yet. Conversations above still work.": "Aucun espace de travail pour l’instant. Les conversations ci-dessus fonctionnent toujours.",
+  "No workspaces match this filter.": "Aucun espace de travail ne correspond à ce filtre.",
+  "No branch yet": "Pas encore de branche",
+  "Projects": "Projets",
+  "Servers": "Serveurs",
+  "None listed.": "Aucun.",
+  "Hosted workspaces": "Espaces de travail hébergés",
+  "Task details": "Détails de la tâche",
+  "Nothing selected": "Rien de sélectionné",
+  "Close details": "Fermer les détails",
+  "Close (Esc)": "Fermer (Échap)",
+  "Workspace": "Espace de travail",
+  "Files & review": "Fichiers et revue",
+  "Activity": "Activité",
+  "Selected workspace surfaces": "Vues de l’espace sélectionné",
+  "No conversation open": "Aucune conversation ouverte",
+  "Pick a task in the list to read its conversation.": "Choisissez une tâche dans la liste pour lire sa conversation.",
+  "Close conversation": "Fermer la conversation",
+  "Read only": "Lecture seule",
+  "Opening…": "Ouverture…",
+  "Opening conversation…": "Ouverture de la conversation…",
+  "Conversation history": "Historique de la conversation",
+  "Load newer messages": "Charger les nouveaux messages",
+  "Reply in this conversation": "Répondre dans cette conversation",
+  "Reply to Monique…": "Répondre à Monique…",
+  "Send": "Envoyer",
+  "Replies are checked against the latest state first.": "Chaque réponse est d’abord vérifiée avec l’état le plus récent.",
+  "Up to date · read only": "À jour · lecture seule",
+  "Out of date · read only": "Pas à jour · lecture seule",
+  "You": "Vous",
+  "Monique started working": "Monique a commencé",
+  "Monique finished": "Monique a terminé",
+  "The run failed": "L’exécution a échoué",
+  "The run was cancelled": "L’exécution a été annulée",
+  "Waiting for your last reply to be confirmed before you can send another.": "En attente de la confirmation de votre dernière réponse avant d’en envoyer une autre.",
+  "Replies are not available for this conversation right now.": "Les réponses ne sont pas disponibles pour cette conversation pour le moment.",
+  "This conversation is no longer in the list.": "Cette conversation n’est plus dans la liste.",
+  "Older messages were trimmed. Reloading the conversation…": "Les anciens messages ont été raccourcis. Rechargement de la conversation…",
+  "Not sure your reply arrived. Checking, without sending it twice.": "Pas sûr que votre réponse soit arrivée. Vérification, sans l’envoyer deux fois.",
+  "NO WORKSPACE": "AUCUN ESPACE",
+  "No workspace selected": "Aucun espace de travail sélectionné",
+  "Copy link": "Copier le lien",
+  "Workspace status": "État de l’espace de travail",
+  "OUTSIDE WORK": "TRAVAIL EXTERNE",
+  "AGENT": "AGENT",
+  "Not reported": "Non signalé",
+  "ACTIONS": "ACTIONS",
+  "Create or resume a workspace": "Créer ou reprendre un espace de travail",
+  "Not available until the server answers.": "Indisponible tant que le serveur n’a pas répondu.",
+  "No linked task": "Aucune tâche liée",
+  "Start from": "Partir de",
+  "Base branch": "Branche de base",
+  "New branch": "Nouvelle branche",
+  "Branch name": "Nom de la branche",
+  "Creating or resuming a workspace from here is not available yet.": "Créer ou reprendre un espace de travail depuis ici n’est pas encore possible.",
+  "Creating or resuming a workspace from here is not available yet. Server setup and checkout are ready.": "Créer ou reprendre un espace de travail depuis ici n’est pas encore possible. La préparation du serveur et la récupération du code sont prêtes.",
+  "Creating or resuming a workspace from here is not available yet. Server setup is only partly ready.": "Créer ou reprendre un espace de travail depuis ici n’est pas encore possible. La préparation du serveur n’est que partielle.",
+  "REFERENCES": "RÉFÉRENCES",
+  "Workspace references": "Références de l’espace de travail",
+  "Pane": "Volet",
+  "Code line": "Ligne de code",
+  "conversation": "conversation",
+  "activity": "activité",
+  "FILES": "FICHIERS",
+  "REVIEW": "REVUE",
+  "CHECKS": "VÉRIFICATIONS",
+  "DELIVERY": "LIVRAISON",
+  "Not available": "Indisponible",
+  "Files and review": "Fichiers et revue",
+  "Comment on a line of code": "Commenter une ligne de code",
+  "Open a link to a specific line before commenting": "Ouvrez un lien vers une ligne précise avant de commenter",
+  "Check to run again": "Vérification à relancer",
+  "No check can be run again": "Aucune vérification ne peut être relancée",
+  "No rerunnable check available": "Aucune vérification ne peut être relancée",
+  "Run this check again?": "Relancer cette vérification ?",
+  "Confirm": "Confirmer",
+  "Review actions need fresh data first.": "Les actions de revue nécessitent d’abord des données à jour.",
+  "To comment, open a link to a specific line of code first.": "Pour commenter, ouvrez d’abord un lien vers une ligne de code précise.",
+  "You can run the selected check again.": "Vous pouvez relancer la vérification sélectionnée.",
+  "Only the review actions this server offers are shown.": "Seules les actions de revue proposées par ce serveur sont affichées.",
+  "Waiting for your last action to be confirmed. New actions are paused.": "En attente de la confirmation de votre dernière action. Les nouvelles actions sont en pause.",
+  "Workspace activity": "Activité de l’espace de travail",
+  "Items that need you": "Éléments qui vous attendent",
+  "Nothing needs you": "Rien ne vous attend",
+  "This workspace has no open requests.": "Cet espace de travail n’a aucune demande en cours.",
+  "Recent activity": "Activité récente",
+  "Recent workspace activity": "Activité récente de l’espace de travail",
+  "No activity yet": "Aucune activité pour l’instant",
+  "The conversation keeps the full history.": "La conversation garde tout l’historique.",
+  "Open exact context": "Ouvrir le contexte",
+  "Open exact attention context": "Ouvrir le contexte",
+  "GENERAL HELP": "AIDE GÉNÉRALE",
+  "Ask anything about Monique. For work on a task, reply inside that task instead.": "Posez n’importe quelle question sur Monique. Pour le travail sur une tâche, répondez plutôt dans cette tâche.",
+  "Back to tasks": "Retour aux tâches",
+  "General assistant": "Assistant général",
+  "Mode": "Mode",
+  "Ask naturally. I can use what I remember, read connected tools, and prepare actions for your approval.": "Demandez naturellement. Je peux utiliser ce dont je me souviens, lire les outils connectés et préparer des actions pour votre approbation.",
+  "Live status and risks": "État en direct et risques",
+  "Recent Slack messages": "Messages Slack récents",
+  "What Monique remembers": "Ce dont Monique se souvient",
+  "Prepare an action for approval": "Préparer une action à approuver",
+  "Monique can make mistakes. Answers show when they rely on memory or live sources. Voice uses your browser and starts only when you press a voice button.": "Monique peut se tromper. Les réponses indiquent quand elles s’appuient sur la mémoire ou des sources en direct. La voix utilise votre navigateur et ne démarre que lorsque vous appuyez sur un bouton vocal.",
+  "Agent counts": "Compteurs des agents",
+  "running": "en cours",
+  "waiting": "en attente",
+  "finished": "terminées",
+  "failed": "en échec",
+  "tools": "outils",
+  "read only": "lecture seule",
+  "need approval": "à approuver",
+  "waiting for you": "vous attendent",
+  "Open Manage ↗": "Ouvrir Manage ↗",
+  "Connecting to Support and Manage": "Connexion à Support et Manage",
+  "Looking for available tools…": "Recherche des outils disponibles…",
+  "CHECKING": "VÉRIFICATION",
+  "Support and Manage are connected": "Support et Manage sont connectés",
+  "Monique can see their tools and tickets.": "Monique voit leurs outils et leurs tickets.",
+  "Only part of Support and Manage is connected": "Support et Manage ne sont que partiellement connectés",
+  "One service needs attention. The other still works.": "Un service demande votre attention. L’autre fonctionne toujours.",
+  "Support and Manage are not connected": "Support et Manage ne sont pas connectés",
+  "Connect them in the server settings to see tools and tickets.": "Connectez-les dans les réglages du serveur pour voir outils et tickets.",
+  "Support and Manage are not answering": "Support et Manage ne répondent pas",
+  "They did not send a usable list of tools.": "Ils n’ont pas envoyé de liste d’outils exploitable.",
+  "Support and Manage are busy": "Support et Manage sont occupés",
+  "Another request is using them. Try again in a moment.": "Une autre requête les utilise. Réessayez dans un instant.",
+  "Connection state unknown": "État de connexion inconnu",
+  "Refresh to check again.": "Actualisez pour vérifier à nouveau.",
+  "CONNECTED": "CONNECTÉ",
+  "NOT CONNECTED": "NON CONNECTÉ",
+  "Agent runs": "Exécutions d’agents",
+  "Waiting for the worker": "En attente du worker",
+  "Loading the worker…": "Chargement du worker…",
+  "Filter agent runs": "Filtrer les exécutions",
+  "Running": "En cours",
+  "Waiting": "En attente",
+  "Failed": "Échec",
+  "Finished": "Terminé",
+  "Connecting…": "Connexion…",
+  "Queued in Manage means waiting for a worker. Only Running means an agent is executing.": "En file dans Manage signifie en attente d’un worker. Seul En cours signifie qu’un agent travaille.",
+  "Queued": "En file",
+  "queued": "en file",
+  "Run": "Exécution",
+  "Agent": "Agent",
+  "Updated": "Mis à jour",
+  "State": "État",
+  "Loading agent runs…": "Chargement des exécutions…",
+  "No agent runs to show yet.": "Aucune exécution à afficher pour l’instant.",
+  "No agent runs match this filter.": "Aucune exécution ne correspond à ce filtre.",
+  "No worker has reported in yet.": "Aucun worker ne s’est encore signalé.",
+  "Model": "Modèle",
+  "Busy": "Occupation",
+  "Seen": "Vu",
+  "Issue": "Ticket",
+  "Subtask": "Sous-tâche",
+  "Tools Monique can use": "Outils que Monique peut utiliser",
+  "Read-only tools run right away. Anything that changes data is shown to you first and runs only after you approve it.": "Les outils en lecture seule s’exécutent tout de suite. Tout ce qui modifie des données vous est d’abord montré et ne s’exécute qu’après votre approbation.",
+  "Tool": "Outil",
+  "Service": "Service",
+  "Access": "Accès",
+  "Input": "Saisie",
+  "Loading tools…": "Chargement des outils…",
+  "No tools are connected yet.": "Aucun outil n’est encore connecté.",
+  "Needs approval": "À approuver",
+  "Needs details": "Détails requis",
+  "Ready": "Prêt",
+  "Ask the assistant which tool to use →": "Demander à l’assistant quel outil utiliser →",
+  "Connected service tool.": "Outil d’un service connecté.",
+  "Monique can use this right away. It only reads data.": "Monique peut l’utiliser tout de suite. Il ne fait que lire des données.",
+  "This changes data. Monique shows you exactly what it will do and waits for your approval.": "Ceci modifie des données. Monique vous montre exactement ce qu’elle va faire et attend votre approbation.",
+  "Use with assistant": "Utiliser avec l’assistant",
+  "Category": "Catégorie",
+  "Server": "Serveur",
+  "Technical name": "Nom technique",
+  "Agent details": "Détails de l’agent",
+  "Agent run": "Exécution d’agent",
+  "Approved": "Approuvé",
+  "Part of a larger run": "Fait partie d’une exécution plus large",
+  "Waiting for a free agent to pick it up.": "En attente qu’un agent libre la prenne en charge.",
+  "An agent is working on this right now.": "Un agent y travaille en ce moment.",
+  "The agent finished this run.": "L’agent a terminé cette exécution.",
+  "This run failed. Check the output below, then retry from Manage.": "Cette exécution a échoué. Consultez la sortie ci-dessous, puis relancez depuis Manage.",
+  "This run was cancelled.": "Cette exécution a été annulée.",
+  "No output from the agent yet.": "Aucune sortie de l’agent pour l’instant.",
+  "CUT SHORT": "TRONQUÉ",
+  "Came from": "Provenance",
+  "On this worker": "Sur ce worker",
+  "Decisions": "Décisions",
+  "Run ID": "ID d’exécution",
+  "Part of": "Fait partie de",
+  "Ticket ID": "ID du ticket",
+  "Yes": "Oui",
+  "No": "Non",
+  "total": "au total",
+  "open": "ouverts",
+  "in progress": "en cours",
+  "blocked": "bloqués",
+  "urgent": "urgents",
+  "Ask assistant": "Demander à l’assistant",
+  "Ask assistant →": "Demander à l’assistant →",
+  "Filter by source": "Filtrer par source",
+  "Filter by status": "Filtrer par état",
+  "Any status": "Tous les états",
+  "In progress": "En cours",
+  "Urgent": "Urgent",
+  "Search tickets": "Rechercher des tickets",
+  "Filter by title, client, site, person": "Filtrer par titre, client, site, personne",
+  "Clear search": "Effacer la recherche",
+  "Sort by": "Trier par",
+  "Waiting for Support and Manage": "En attente de Support et Manage",
+  "Loading tickets…": "Chargement des tickets…",
+  "ID": "ID",
+  "Title": "Titre",
+  "Source": "Source",
+  "Priority": "Priorité",
+  "Assignee": "Responsable",
+  "Ticket details": "Détails du ticket",
+  "Ticket": "Ticket",
+  "Other": "Autre",
+  "Review with assistant": "Examiner avec l’assistant",
+  "Assigned to": "Attribué à",
+  "Requested by": "Demandé par",
+  "Client": "Client",
+  "Site": "Site",
+  "Comments": "Commentaires",
+  "Created": "Créé",
+  "No tickets right now.": "Aucun ticket pour le moment.",
+  "Support and Manage are connected but cannot list tickets.": "Support et Manage sont connectés mais ne peuvent pas lister les tickets.",
+  "Monique needs more details to list these tickets. Ask the assistant.": "Monique a besoin de plus de détails pour lister ces tickets. Demandez à l’assistant.",
+  "Tickets are not available right now.": "Les tickets ne sont pas disponibles pour le moment.",
+  "One source is down. Tickets from the other are shown below.": "Une source est indisponible. Les tickets de l’autre sont affichés ci-dessous.",
+  "Connect Support and Manage to see tickets here.": "Connectez Support et Manage pour voir les tickets ici.",
+  "No tickets match these filters.": "Aucun ticket ne correspond à ces filtres.",
+  "Tickets are not available right now": "Les tickets ne sont pas disponibles pour le moment",
+  "Memory counts": "Compteurs de la mémoire",
+  "in use": "utilisés",
+  "to approve": "à approuver",
+  "to recheck": "à revérifier",
+  "replaced": "remplacés",
+  "deleted": "supprimés",
+  "messages": "messages",
+  "Search memory": "Rechercher dans la mémoire",
+  "Search what Monique remembers": "Rechercher ce dont Monique se souvient",
+  "Memory view": "Vue de la mémoire",
+  "List": "Liste",
+  "Timeline": "Chronologie",
+  "Map": "Carte",
+  "All types": "Tous les types",
+  "Privacy": "Confidentialité",
+  "Most certain": "Les plus sûrs",
+  "Recheck date": "Date de revérification",
+  "Reset": "Réinitialiser",
+  "Loading…": "Chargement…",
+  "Searching…": "Recherche…",
+  "Memory map": "Carte de la mémoire",
+  "Memory details": "Détails du souvenir",
+  "Pick a memory": "Choisissez un souvenir",
+  "Select a row to see where it came from and when to recheck it.": "Sélectionnez une ligne pour voir d’où elle vient et quand la revérifier.",
+  "Certainty": "Certitude",
+  "Recheck": "À revérifier",
+  "How sure Monique is": "Degré de certitude de Monique",
+  "Learned from": "Appris de",
+  "Visible to": "Visible par",
+  "Version": "Version",
+  "Not scheduled": "Non planifié",
+  "Nothing matches these filters.": "Rien ne correspond à ces filtres.",
+  "Preference": "Préférence",
+  "Fact": "Fait",
+  "Procedure": "Procédure",
+  "Decision": "Décision",
+  "Active": "Actif",
+  "Candidate": "Proposition",
+  "Superseded": "Remplacé",
+  "Deleted": "Supprimé",
+  "preference": "préférence",
+  "fact": "fait",
+  "procedure": "procédure",
+  "decision": "décision",
+  "Internal": "Interne",
+  "Confidential": "Confidentiel",
+  "Public": "Public",
+  "Operator": "Opérateur",
+  "Live counters": "Compteurs en direct",
+  "waiting to start": "en attente de démarrage",
+  "waiting to send": "en attente d’envoi",
+  "to double-check": "à revérifier",
+  "unclear result": "résultat incertain",
+  "to fix": "à corriger",
+  "Pair a phone": "Associer un téléphone",
+  "Open tasks": "Ouvrir les tâches",
+  "Checking": "Vérification",
+  "Waiting for the first status update.": "En attente de la première mise à jour d’état.",
+  "Problems": "Problèmes",
+  "Everything is running normally": "Tout fonctionne normalement",
+  "Agents, new work and deliveries all look fine.": "Agents, nouvelles demandes et envois : tout va bien.",
+  "How work flows": "Comment le travail avance",
+  "Work flow": "Flux de travail",
+  "Received": "Reçu",
+  "Saved and waiting": "Enregistré, en attente",
+  "Agents at work": "Agents au travail",
+  "Sending": "Envoi",
+  "Results going out": "Résultats en cours d’envoi",
+  "Double-check": "Revérification",
+  "Results to confirm": "Résultats à confirmer",
+  "ACTIVE": "ACTIF",
+  "CLEAR": "RAS",
+  "WAIT": "ATTENTE",
+  "CHECK": "À VÉRIFIER",
+  "ALL GOOD": "TOUT VA BIEN",
+  "System": "Système",
+  "Monique": "Monique",
+  "AI provider": "Fournisseur d’IA",
+  "Accepting new work": "Accepte de nouvelles demandes",
+  "Status data": "Données d’état",
+  "Available": "Disponible",
+  "Unavailable": "Indisponible",
+  "Activity since you opened this page": "Activité depuis l’ouverture de cette page",
+  "Recent activity levels": "Niveaux d’activité récents",
+  "Running work, waiting to start, and waiting to send, as seen by this browser.": "Travail en cours, en attente de démarrage et en attente d’envoi, vus par ce navigateur.",
+  "Waiting to start": "En attente de démarrage",
+  "Waiting to send": "En attente d’envoi",
+  "Samples": "Échantillons",
+  "Window": "Fenêtre",
+  "Last change": "Dernier changement",
+  "Ask the assistant": "Demander à l’assistant",
+  "Monique is not fully healthy": "Monique n’est pas en pleine forme",
+  "Status is out of date": "L’état n’est pas à jour",
+  "This page has not received a recent status update.": "Cette page n’a pas reçu de mise à jour récente.",
+  "Results need a double-check": "Des résultats sont à revérifier",
+  "Some messages may not have been sent": "Certains messages n’ont peut-être pas été envoyés",
+  "AI provider unavailable": "Fournisseur d’IA indisponible",
+  "Monique cannot reach its AI provider.": "Monique ne parvient pas à joindre son fournisseur d’IA.",
+  "Not accepting new work": "N’accepte plus de nouvelles demandes",
+  "Monique is not taking new requests right now.": "Monique ne prend pas de nouvelles demandes pour le moment.",
+  "Agent list is out of date": "La liste des agents n’est pas à jour",
+  "The list of agent runs has not refreshed recently.": "La liste des exécutions ne s’est pas actualisée récemment.",
+  "Open it in Manage to see what went wrong.": "Ouvrez-la dans Manage pour voir ce qui n’a pas marché.",
+  "NO SECRETS SHOWN": "AUCUN SECRET AFFICHÉ",
+  "Settings summary": "Résumé des réglages",
+  "This browser": "Ce navigateur",
+  "Manage": "Manage",
+  "Connections": "Connexions",
+  "Agent sign-in": "Connexion des agents",
+  "Not connected": "Non connecté",
+  "Settings sections": "Sections des réglages",
+  "Search settings": "Rechercher un réglage",
+  "Filter settings": "Filtrer les réglages",
+  "All settings": "Tous les réglages",
+  "AI and agents": "IA et agents",
+  "Security": "Sécurité",
+  "Passwords and keys are never shown here. Only names and on/off states are.": "Les mots de passe et clés ne sont jamais affichés ici. Seuls les noms et les états activé ou désactivé le sont.",
+  "Look and feel": "Apparence",
+  "Saved in this browser and applied right away.": "Enregistré dans ce navigateur et appliqué immédiatement.",
+  "Theme": "Thème",
+  "Colours of the whole app": "Couleurs de toute l’application",
+  "Language": "Langue",
+  "Labels and menus": "Libellés et menus",
+  "Text size": "Taille du texte",
+  "Applies everywhere": "S’applique partout",
+  "Spacing": "Espacement",
+  "How tight lists are": "Densité des listes",
+  "Start page": "Page de démarrage",
+  "What opens first": "Ce qui s’ouvre en premier",
+  "Reduce motion": "Réduire les animations",
+  "Fewer animations": "Moins d’animations",
+  "Assistant and refresh": "Assistant et actualisation",
+  "How the assistant answers and how often data updates.": "Comment l’assistant répond et à quelle fréquence les données s’actualisent.",
+  "Assistant mode": "Mode de l’assistant",
+  "For new conversations": "Pour les nouvelles conversations",
+  "Refresh every": "Actualiser toutes les",
+  "While this tab is open": "Tant que cet onglet est ouvert",
+  "Technical details": "Détails techniques",
+  "Show limits and internal values": "Afficher les limites et valeurs internes",
+  "Alerts": "Alertes",
+  "Notify me when a new problem appears": "Me prévenir quand un nouveau problème apparaît",
+  "Agent accounts": "Comptes des agents",
+  "Sign agents in with your Claude or ChatGPT subscription. No API keys needed.": "Connectez les agents avec votre abonnement Claude ou ChatGPT. Aucune clé d’API nécessaire.",
+  "Loading accounts…": "Chargement des comptes…",
+  "Each account is kept separate. Monique only switches the worker account when you ask.": "Chaque compte reste séparé. Monique ne change de compte de worker que si vous le demandez.",
+  "System settings": "Réglages du système",
+  "Read from the running server. Change them on the server.": "Lus sur le serveur en marche. Modifiez-les sur le serveur.",
+  "Loading settings…": "Chargement des réglages…",
+  "No matching settings": "Aucun réglage correspondant",
+  "Try another word or section.": "Essayez un autre mot ou une autre section.",
+  "Web access": "Accès web",
+  "AI providers": "Fournisseurs d’IA",
+  "Safety": "Sécurité",
+  "Extensions": "Extensions",
+  "Who can reach this page and request limits.": "Qui peut accéder à cette page et limites des requêtes.",
+  "How Monique stores and finds what it remembers.": "Comment Monique stocke et retrouve ce dont elle se souvient.",
+  "Whether agents are signed in and ready to work.": "Si les agents sont connectés et prêts à travailler.",
+  "The AI models Monique uses.": "Les modèles d’IA utilisés par Monique.",
+  "Slack, Telegram, GitHub and other connections.": "Slack, Telegram, GitHub et autres connexions.",
+  "Tools and tickets from Manage.": "Outils et tickets de Manage.",
+  "Approvals, audit log and backups.": "Approbations, journal d’audit et sauvegardes.",
+  "Extra tools, knowledge and automations.": "Outils, connaissances et automatisations supplémentaires.",
+  "On": "Activé",
+  "Off": "Désactivé",
+  "ON": "ACTIVÉ",
+  "OFF": "DÉSACTIVÉ",
+  "From the server · no secrets": "Depuis le serveur · aucun secret",
+  "Mobile": "Mobile",
+  "Conversations this phone may open": "Conversations que ce téléphone peut ouvrir",
+  "An invite works once and lasts five minutes. Create it with the phone already in your hand.": "Une invitation ne sert qu’une fois et dure cinq minutes. Créez-la avec le téléphone déjà en main.",
+  "Every listed conversation is selected. The phone can only reach the ones named here.": "Chaque conversation listée est sélectionnée. Le téléphone ne peut atteindre que celles nommées ici.",
+  "Allow this phone to read the Slack channel and submit, approve or reject Manage tickets": "Autoriser ce téléphone à lire le canal Slack et à soumettre, approuver ou refuser les tickets Manage",
+  "Allow this phone to start tasks and continue the ones it creates": "Autoriser ce téléphone à lancer des tâches et à poursuivre celles qu’il crée",
+  "Reset to defaults": "Rétablir les valeurs par défaut",
+  "Saved only in this browser.": "Enregistré uniquement dans ce navigateur.",
+  "Command palette": "Palette de commandes",
+  "Type a command or search…": "Tapez une commande ou une recherche…",
+  "Type a command or search": "Tapez une commande ou une recherche",
+  "Commands": "Commandes",
+  "move": "déplacer",
+  "run": "exécuter",
+  "move in lists": "se déplacer dans les listes",
+  "Go to": "Aller à",
+  "Actions": "Actions",
+  "Search": "Rechercher",
+  "Tickets": "Tickets",
+  "New task": "Nouvelle tâche",
+  "Refresh": "Actualiser",
+  "Switch to light theme": "Passer au thème clair",
+  "Switch to dark theme": "Passer au thème sombre",
+  "Use the system theme": "Utiliser le thème du système",
+  "Appearance settings": "Réglages d’apparence",
+  "No matching command": "Aucune commande correspondante",
+  "Search tickets for": "Rechercher dans les tickets :",
+  "Search memory for": "Rechercher dans la mémoire :",
+  "Ask the assistant:": "Demander à l’assistant :",
+  "Memory": "Mémoire",
 });
 const localizedTextSources = new WeakMap();
 const localizedAttributeSources = new WeakMap();
@@ -874,7 +1656,25 @@ function translatePhraseForFrench(value) {
     [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
     [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
-    [/^Updated (.+)$/, (match) => `Mis à jour ${match[1]}`],
+    [/^Updated (.+)$/, (match) => `Mis à jour ${translatePhraseForFrench(match[1])}`],
+    [/^(\d+) items? needs? attention$/, (match) => `${match[1]} élément${match[1] === "1" ? " requiert" : "s requièrent"} votre attention`],
+    [/^(.+?) of (.+?) runs$/, (match) => `${match[1]} exécution${match[1] === "1" ? "" : "s"} sur ${match[2]}`],
+    [/^(\d+)% sure · (.+)$/, (match) => `sûr à ${match[1]} % · ${match[2]}`],
+    [/^(\d+) comments$/, (match) => `${match[1]} commentaires`],
+    [/^Open ([A-Z]+-\d+)$/, (match) => `Ouvrir ${match[1]}`],
+    [/^Open in (.+) ↗$/, (match) => `Ouvrir dans ${translatePhraseForFrench(match[1])} ↗`],
+    [/^(.+) ticket · (.+)$/, (match) => `Ticket ${translatePhraseForFrench(match[1])} · ${match[2]}`],
+    [/^(.+) tool · (.+)$/, (match) => `Outil ${translatePhraseForFrench(match[1])} · ${translatePhraseForFrench(match[2])}`],
+    [/^Agent run · (.+)$/, (match) => `Exécution d’agent · ${translatePhraseForFrench(match[1])}`],
+    [/^Agent run (.+) failed$/, (match) => `L’exécution d’agent ${match[1]} a échoué`],
+    [/^Live output · (.+) events$/, (match) => `Sortie en direct · ${match[1]} événements`],
+    [/^Ready to reply \(version (\d+)\)\.$/, (match) => `Prêt à répondre (version ${match[1]}).`],
+    [/^(\d+) \/ (\d+) accounts$/, (match) => `${match[1]} / ${match[2]} comptes`],
+    [/^(\S+) (memory|memories)(?: for “(.+)”)?$/, (match) => `${match[1]} souvenir${match[2] === "memory" ? "" : "s"}${match[3] ? ` pour « ${match[3]} »` : ""}`],
+    [/^(Live|Saved history) · (Has a linked run|No linked run) · (?:nothing to approve|(\d+) to approve)$/, (match) => `${match[1] === "Live" ? "En direct" : "Historique enregistré"} · ${match[2] === "No linked run" ? "Aucune exécution liée" : "Exécution liée"} · ${match[3] ? `${match[3]} à approuver` : "rien à approuver"}`],
+    [/^Show all \((\d+)\)$/, (match) => `Tout afficher (${match[1]})`],
+    [/^Could not open · (.+)$/, (match) => `Ouverture impossible · ${match[1]}`],
+    [/^Conversation not available: (.+)$/, (match) => `Conversation indisponible : ${match[1]}`],
     [/^(\d+) seconds$/, (match) => `${match[1]} secondes`],
     [/^Expires in (\d+) seconds$/, (match) => `Expire dans ${match[1]} secondes`],
     [/^(\d+)s ago$/, (match) => `il y a ${match[1]} s`],
@@ -1261,19 +2061,19 @@ function attention(status) {
   const add = (key, title, detail, href = null) => {
     if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href });
   };
-  if (status.health !== "operational") add("runtime", "Runtime health", `Daemon status is ${status.health || "unavailable"}.`);
-  if (status.stale) add("stale", "Stale daemon snapshot", "The dashboard has not received a current daemon status snapshot.");
-  if ((status.reconciliation_pending || 0) > 0) add("reconciliation", "Reconciliation required", `${count(status.reconciliation_pending)} daemon run or delivery outcome(s) need reconciliation.`);
-  if ((status.outbox_ambiguous || 0) > 0) add("ambiguous", "Ambiguous deliveries", `${count(status.outbox_ambiguous)} outbox effect(s) have an uncertain delivery outcome.`);
-  if (status.provider_available === false) add("provider", "Provider lane unavailable", "The daemon reports no available provider lane.");
-  if (status.accepting_intake === false) add("intake", "Intake closed", "The daemon is not accepting new work.");
-  if (processesSnapshot?.health === "stale") add("manage-stale", "Stale Manage process snapshot", "Manage process state is older than the dashboard freshness window.");
+  if (status.health !== "operational") add("runtime", "Monique is not fully healthy", `Current state: ${status.health || "unavailable"}.`);
+  if (status.stale) add("stale", "Status is out of date", "This page has not received a recent status update.");
+  if ((status.reconciliation_pending || 0) > 0) add("reconciliation", "Results need a double-check", `${count(status.reconciliation_pending)} result(s) need to be confirmed.`);
+  if ((status.outbox_ambiguous || 0) > 0) add("ambiguous", "Some messages may not have been sent", `${count(status.outbox_ambiguous)} message(s) have an unclear delivery result.`);
+  if (status.provider_available === false) add("provider", "AI provider unavailable", "Monique cannot reach its AI provider.");
+  if (status.accepting_intake === false) add("intake", "Not accepting new work", "Monique is not taking new requests right now.");
+  if (processesSnapshot?.health === "stale") add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
   const manageJobs = Array.isArray(processesSnapshot?.jobs) && ["ready", "degraded"].includes(processesSnapshot.health) ? processesSnapshot.jobs : [];
   manageJobs.filter((job) => job.status === "failed").slice(0, 5).forEach((job) => {
     add(
       `manage:${job.id}`,
-      `Manage job ${shortProcessReference(job.id)} failed`,
-      "Manage control-plane state; inspect its issue or process record for authoritative delivery evidence.",
+      `Agent run ${shortProcessReference(job.id)} failed`,
+      "Open it in Manage to see what went wrong.",
       safeTicketLink(job.manage_url) || safeTicketLink(job.issue_url),
     );
   });
@@ -1289,9 +2089,10 @@ function renderAttention(status) {
     new Notification("Monique · attention required", { body: items.map((item) => item.title).join(" · "), tag: "monique-operational-attention" });
   }
   lastNotifiedAttentionKey = attentionKey;
-  byId("attention-title").textContent = items.length === 0 ? "All operational invariants hold" : `${items.length} item${items.length === 1 ? "" : "s"} need attention`;
-  byId("attention-detail").textContent = items.length === 0 ? "Provider, intake, delivery certainty and reconciliation are clear." : items.map((item) => item.title).join(" · ");
-  byId("metric-attention").textContent = count(items.length);
+  byId("attention-title").textContent = items.length === 0 ? "Everything is running normally" : `${items.length} item${items.length === 1 ? " needs" : "s need"} attention`;
+  byId("attention-bar").dataset.state = items.length === 0 ? "clear" : "attention";
+  byId("attention-detail").textContent = items.length === 0 ? "Agents, new work and deliveries all look fine." : items.map((item) => item.title).join(" · ");
+  setMetric("metric-attention", items.length);
   const list = byId("attention-list");
   list.replaceChildren();
   items.forEach((item) => {
@@ -1323,7 +2124,7 @@ function renderAttention(status) {
 
 function pipelineState(value, danger = false) {
   if (!Number.isSafeInteger(value)) return "WAIT";
-  if (danger && value > 0) return "REVIEW";
+  if (danger && value > 0) return "CHECK";
   return value > 0 ? "ACTIVE" : "CLEAR";
 }
 
@@ -1387,26 +2188,35 @@ function renderPulse() {
   byId("pulse-tag").textContent = statusHistory.length > 1 ? "LIVE" : "COLLECTING";
 }
 
+// Zero counters recede so a non-zero one stands out.
+function setMetric(id, value) {
+  const element = byId(id);
+  element.textContent = count(value);
+  const card = element.closest("article");
+  if (card) card.dataset.zero = String(value === 0);
+}
+
 function renderStatus(status) {
   lastStatusSnapshot = status;
   const health = ["operational", "degraded", "unavailable"].includes(status.health) ? status.health : "unavailable";
   document.documentElement.dataset.health = health;
   const issues = renderAttention(status);
-  byId("global-health").textContent = health;
+  byId("global-health").textContent = { operational: "Healthy", degraded: "Degraded", unavailable: "Offline" }[health];
   byId("generation").textContent = `GEN ${count(status.generation)}`;
   byId("footer-state").textContent = `${health.toUpperCase()} / GEN ${count(status.generation)}`;
-  byId("metric-running").textContent = count(status.running);
-  byId("metric-inbox").textContent = count(status.inbox_pending);
-  byId("metric-outbox").textContent = count(status.outbox_pending);
-  byId("metric-reconciliation").textContent = count(status.reconciliation_pending);
-  byId("metric-ambiguous").textContent = count(status.outbox_ambiguous);
+  setMetric("metric-running", status.running);
+  setMetric("metric-inbox", status.inbox_pending);
+  setMetric("metric-outbox", status.outbox_pending);
+  setMetric("metric-reconciliation", status.reconciliation_pending);
+  setMetric("metric-ambiguous", status.outbox_ambiguous);
   byId("runtime-daemon").textContent = words(status.state);
-  byId("runtime-provider").textContent = status.provider_available === true ? "AVAILABLE" : status.provider_available === false ? "UNAVAILABLE" : "—";
-  byId("runtime-intake").textContent = yesNo(status.accepting_intake);
+  byId("runtime-provider").textContent = status.provider_available === true ? "Available" : status.provider_available === false ? "Unavailable" : "-";
+  byId("runtime-intake").textContent = status.accepting_intake === true ? "Yes" : status.accepting_intake === false ? "No" : "-";
   byId("runtime-execution").textContent = words(status.execution_state);
   byId("runtime-telegram").textContent = words(status.telegram_state);
-  byId("runtime-snapshot").textContent = status.stale ? "STALE" : "CURRENT";
-  byId("runtime-tag").textContent = issues.length === 0 ? "CLEAR" : "REVIEW";
+  byId("runtime-snapshot").textContent = status.stale ? "Out of date" : "Up to date";
+  byId("runtime-tag").textContent = issues.length === 0 ? "ALL GOOD" : "CHECK";
+  byId("runtime-tag").dataset.state = issues.length === 0 ? "operational" : "degraded";
   const pipeline = [
     ["inbox", status.inbox_pending, false],
     ["running", status.running, false],
@@ -1416,6 +2226,7 @@ function renderStatus(status) {
   pipeline.forEach(([name, value, danger]) => {
     byId(`pipe-${name}`).textContent = `${count(value)} ${name === "running" ? "active" : "pending"}`;
     byId(`pipe-${name}-state`).textContent = pipelineState(value, danger);
+    byId(`pipe-${name}-state`).dataset.state = pipelineState(value, danger).toLowerCase();
   });
   recordStatus(status);
   updateObservedAge();
@@ -1449,7 +2260,8 @@ function showView(name) {
     node.classList.toggle("is-active", active);
     if (active) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current");
   });
-  byId("current-view").textContent = name === "tickets" ? "WORK QUEUES" : name.toUpperCase();
+  byId("current-view").textContent = consoleViewName(name);
+  document.title = `${translatePhrase(consoleViewName(name))} · Monique`;
   const linkedSessions = name === "sessions" && (link.workspace || link.session || link.pane || link.file);
   const targetHash = linkedSessions ? globalThis.AutomoniquePlatformCockpit.buildDeepLink(link) : `#${name}`;
   if (window.location.hash !== targetHash) history.replaceState(null, "", targetHash);
@@ -1460,6 +2272,7 @@ function showView(name) {
   if (name === "configuration") loadConfiguration();
   if (name === "chat") loadChatHistory();
   if (window.matchMedia("(max-width: 760px)").matches) mobileSidebarOpen(false);
+  document.querySelector(".tab.is-active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
@@ -1500,7 +2313,7 @@ function updateMemoryFacet(id, entries, field, allLabel, previous) {
 }
 
 function memoryDateLabel(value) {
-  if (!Number.isSafeInteger(value) || value <= 0) return "—";
+  if (!Number.isSafeInteger(value) || value <= 0) return "-";
   return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(value);
 }
 
@@ -1510,7 +2323,7 @@ function memoryReviewLabel(value) {
 }
 
 function setMemoryMode(mode) {
-  memoryMode = ["graph", "list", "timeline"].includes(mode) ? mode : "graph";
+  memoryMode = ["graph", "list", "timeline"].includes(mode) ? mode : "list";
   savePreference("monique-memory-view", memoryMode);
   document.querySelectorAll("[data-memory-mode]").forEach((item) => {
     const active = item.dataset.memoryMode === memoryMode;
@@ -1531,7 +2344,7 @@ function renderMemory(view) {
   byId("memory-deleted").textContent = count(view.counts?.deleted);
   byId("memory-review-due").textContent = count(entries.filter((entry) => Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
   byId("memory-messages").textContent = count(view.counts?.messages);
-  memoryKind = updateMemoryFacet("memory-kind", entries, "kind", "All evidence", memoryKind);
+  memoryKind = updateMemoryFacet("memory-kind", entries, "kind", "All types", memoryKind);
   memoryStatus = updateMemoryFacet("memory-status", entries, "status", "All statuses", memoryStatus);
   memorySensitivity = updateMemoryFacet("memory-sensitivity", entries, "sensitivity", "All levels", memorySensitivity);
   if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
@@ -1542,9 +2355,8 @@ function renderMemory(view) {
 function renderSelectedMemory() {
   const entries = selectedMemoryEntries();
   if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
-  const scope = memoryKind === "all" ? "evidence" : words(memoryKind);
   const query = memoryQuery ? ` for “${memoryQuery}”` : "";
-  byId("memory-result-label").textContent = `${count(entries.length)} ${scope} record${entries.length === 1 ? "" : "s"}${query}`;
+  byId("memory-result-label").textContent = `${count(entries.length)} ${entries.length === 1 ? "memory" : "memories"}${query}`;
   renderMemoryList(entries);
   renderMemoryGraph(entries);
   renderMemoryTimeline(entries);
@@ -1563,30 +2375,46 @@ function renderMemoryList(entries) {
   const root = byId("memory-list");
   root.replaceChildren();
   if (entries.length === 0) {
-    root.append(memoryEmpty("No memory evidence matches this view."));
+    root.append(memoryEmpty("Nothing matches these filters."));
     return;
   }
-  entries.forEach((entry) => {
-    const card = document.createElement("button");
-    card.type = "button";
-    card.className = "memory-record";
-    card.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
-    card.setAttribute("aria-pressed", String(entry.reference === selectedMemoryReference));
-    const ref = document.createElement("strong");
-    ref.textContent = entry.reference;
-    const text = document.createElement("p");
-    text.setAttribute("data-i18n-skip", "");
-    text.textContent = entry.content;
-    const meta = document.createElement("div");
-    meta.className = "record-meta";
-    meta.textContent = `${words(entry.status)} · ${entry.confidence / 10}% confidence\n${memoryDateLabel(entry.updated_at_ms)}`;
-    card.append(ref, text, meta);
-    card.addEventListener("click", () => {
-      selectedMemoryReference = entry.reference;
-      renderSelectedMemory();
-    });
-    root.append(card);
+  const head = document.createElement("div");
+  head.className = "table-head";
+  head.setAttribute("aria-hidden", "true");
+  ["Reference", "Memory", "Type", "Status", "Certainty", "Updated"].forEach((text) => {
+    const cell = document.createElement("span");
+    cell.textContent = text;
+    head.append(cell);
   });
+  const body = document.createElement("div");
+  body.className = "table-body";
+  entries.forEach((entry) => {
+    const row = consoleRow("memory-record", () => consoleOpenMemory(entry.reference));
+    row.classList.toggle("is-selected", consoleState.memoryOpen && entry.reference === selectedMemoryReference);
+    row.dataset.memoryReference = entry.reference;
+    const ref = consoleCell(entry.reference, "cell cell-mono");
+    ref.setAttribute("data-i18n-skip", "");
+    const text = consoleCell(entry.content, "cell memory-row-content");
+    text.setAttribute("data-i18n-skip", "");
+    const kind = consoleCell(consoleSentence(entry.kind), "cell");
+    const due = Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now();
+    const status = consoleBadge(due ? "Recheck" : consoleSentence(entry.status), due ? "warn" : { active: "ok", candidate: "info", superseded: "quiet", deleted: "danger" }[entry.status] || "quiet");
+    const confidence = document.createElement("span");
+    confidence.className = "confidence";
+    const bar = document.createElement("i");
+    const fill = document.createElement("span");
+    fill.className = `c-${Math.max(0, Math.min(10, Math.round(entry.confidence / 100)))}`;
+    bar.append(fill);
+    const value = document.createElement("b");
+    value.textContent = `${Math.round(entry.confidence / 10)}%`;
+    confidence.append(bar, value);
+    const updated = consoleCell(Number.isSafeInteger(entry.updated_at_ms) ? ticketRelativeTime(new Date(entry.updated_at_ms).toISOString()) : "-", "cell cell-time");
+    updated.title = memoryDateLabel(entry.updated_at_ms);
+    row.append(ref, text, kind, consoleCellWrap(status), confidence, updated);
+    body.append(row);
+  });
+  root.append(head, body);
+  consoleCapList(body, "memory", "data-memory-reference", consoleState.memoryOpen ? selectedMemoryReference : null);
 }
 
 function renderMemoryGraph(entries) {
@@ -1597,7 +2425,7 @@ function renderMemoryGraph(entries) {
   core.textContent = "MONIQUE";
   graph.append(core);
   if (entries.length === 0) {
-    const empty = memoryEmpty("No evidence nodes to display.");
+    const empty = memoryEmpty("Nothing matches these filters.");
     empty.classList.add("graph-empty");
     graph.append(empty);
     return;
@@ -1606,20 +2434,18 @@ function renderMemoryGraph(entries) {
     const node = document.createElement("button");
     node.type = "button";
     node.className = `graph-node slot-${index}`;
-    node.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
-    node.setAttribute("aria-label", `Open ${entry.reference} in the record list`);
+    node.classList.toggle("is-selected", consoleState.memoryOpen && entry.reference === selectedMemoryReference);
+    node.setAttribute("aria-label", `Open ${entry.reference}`);
     const reference = document.createElement("span");
-    reference.textContent = `${entry.reference} / ${words(entry.kind).toUpperCase()}`;
+    reference.textContent = `${entry.reference} · ${words(entry.kind)}`;
     const content = document.createElement("strong");
     content.setAttribute("data-i18n-skip", "");
     content.textContent = entry.content;
     const metadata = document.createElement("small");
-    metadata.textContent = `${entry.confidence / 10}% · ${entry.provenance} · R${entry.revision}`;
+    metadata.textContent = `${Math.round(entry.confidence / 10)}% sure · ${entry.provenance}`;
     node.append(reference, content, metadata);
-    node.addEventListener("click", () => {
-      selectedMemoryReference = entry.reference;
-      renderSelectedMemory();
-    });
+    node.dataset.row = "";
+    node.addEventListener("click", () => consoleOpenMemory(entry.reference));
     graph.append(node);
   });
 }
@@ -1628,14 +2454,14 @@ function renderMemoryTimeline(entries) {
   const root = byId("memory-timeline");
   root.replaceChildren();
   if (entries.length === 0) {
-    root.append(memoryEmpty("No timeline events to display."));
+    root.append(memoryEmpty("Nothing matches these filters."));
     return;
   }
   [...entries].sort((left, right) => right.updated_at_ms - left.updated_at_ms).forEach((entry) => {
     const item = document.createElement("button");
     item.type = "button";
     item.className = "memory-timeline-item";
-    item.classList.toggle("is-selected", entry.reference === selectedMemoryReference);
+    item.classList.toggle("is-selected", consoleState.memoryOpen && entry.reference === selectedMemoryReference);
     const marker = document.createElement("i");
     marker.setAttribute("aria-hidden", "true");
     const date = document.createElement("time");
@@ -1648,13 +2474,11 @@ function renderMemoryTimeline(entries) {
     content.setAttribute("data-i18n-skip", "");
     content.textContent = entry.content;
     const meta = document.createElement("small");
-    meta.textContent = `${words(entry.kind)} · ${words(entry.status)} · R${entry.revision}`;
+    meta.textContent = `${words(entry.kind)} · ${words(entry.status)}`;
     body.append(heading, content, meta);
     item.append(marker, date, body);
-    item.addEventListener("click", () => {
-      selectedMemoryReference = entry.reference;
-      renderSelectedMemory();
-    });
+    item.dataset.row = "";
+    item.addEventListener("click", () => consoleOpenMemory(entry.reference));
     root.append(item);
   });
 }
@@ -1665,7 +2489,7 @@ function memoryInspectorFact(labelText, value) {
   term.textContent = labelText;
   const detail = document.createElement("dd");
   detail.setAttribute("data-i18n-skip", "");
-  detail.textContent = value || "—";
+  detail.textContent = value || "-";
   row.append(term, detail);
   return row;
 }
@@ -1679,9 +2503,9 @@ function renderMemoryInspector(entry) {
     const icon = document.createElement("span");
     icon.textContent = "◇";
     const title = document.createElement("strong");
-    title.textContent = "Select evidence";
+    title.textContent = "Pick a memory";
     const detail = document.createElement("p");
-    detail.textContent = "Choose a graph node, record, or timeline event to inspect its provenance and review state.";
+    detail.textContent = "Select a row to see where it came from and when to recheck it.";
     empty.append(icon, title, detail);
     root.append(empty);
     return;
@@ -1690,7 +2514,7 @@ function renderMemoryInspector(entry) {
   head.className = "memory-inspector-head";
   const headingCopy = document.createElement("div");
   const eyebrow = document.createElement("span");
-  eyebrow.textContent = "Evidence details";
+  eyebrow.textContent = "Memory";
   const title = document.createElement("h2");
   title.setAttribute("data-i18n-skip", "");
   title.textContent = entry.reference;
@@ -1707,7 +2531,7 @@ function renderMemoryInspector(entry) {
   confidence.className = "memory-confidence";
   const confidenceLabel = document.createElement("div");
   const confidenceName = document.createElement("span");
-  confidenceName.textContent = "Confidence";
+  confidenceName.textContent = "How sure Monique is";
   const confidenceValue = document.createElement("strong");
   confidenceValue.textContent = `${entry.confidence / 10}%`;
   confidenceLabel.append(confidenceName, confidenceValue);
@@ -1720,14 +2544,14 @@ function renderMemoryInspector(entry) {
   const facts = document.createElement("dl");
   facts.className = "memory-inspector-facts";
   [
-    ["Kind", words(entry.kind)],
-    ["Status", words(entry.status)],
-    ["Sensitivity", words(entry.sensitivity)],
-    ["Visibility", words(entry.visibility)],
-    ["Provenance", entry.provenance],
-    ["Revision", `R${entry.revision}`],
+    ["Type", consoleSentence(entry.kind)],
+    ["Status", consoleSentence(entry.status)],
+    ["Learned from", entry.provenance],
     ["Updated", memoryDateLabel(entry.updated_at_ms)],
-    ["Next review", memoryReviewLabel(entry.review_at_ms)],
+    ["Recheck", memoryReviewLabel(entry.review_at_ms)],
+    ["Privacy", consoleSentence(entry.sensitivity)],
+    ["Visible to", consoleSentence(entry.visibility)],
+    ["Version", String(entry.revision)],
   ].forEach(([labelText, value]) => facts.append(memoryInspectorFact(labelText, value)));
   const actions = document.createElement("div");
   actions.className = "memory-inspector-actions";
@@ -1746,7 +2570,7 @@ function renderMemoryInspector(entry) {
   const ask = document.createElement("button");
   ask.type = "button";
   ask.className = "button secondary";
-  ask.textContent = "Use recovery assistant";
+  ask.textContent = "Ask assistant";
   ask.dataset.openChat = `Review memory evidence ${entry.reference}. Explain what it establishes, its provenance and confidence, whether it needs review, and how it should influence current work.`;
   actions.append(copy, ask);
   root.append(head, content, confidence, facts, actions);
@@ -1755,7 +2579,7 @@ function renderMemoryInspector(entry) {
 async function loadMemory(query = null) {
   memoryQuery = query?.trim() || null;
   byId("memory-clear").hidden = memoryQuery === null;
-  byId("memory-result-label").textContent = memoryQuery ? "Searching canonical memory…" : "Loading canonical memory…";
+  byId("memory-result-label").textContent = memoryQuery ? "Searching…" : "Loading…";
   try {
     const view = memoryQuery === null
       ? await api("/api/memory")
@@ -1816,17 +2640,17 @@ function operationLabel(value) {
 
 function operationsMessage(health) {
   const messages = {
-    attached: ["Operational services connected", "Live capabilities are discovered independently from Support and Manage."],
-    degraded: ["Operational services partially available", "At least one configured service is connected while another needs attention."],
-    not_attached: ["Operational services are not attached", "Configure the Support and Manage MCP servers to enable their relevant capabilities."],
-    unavailable: ["Operational services are unavailable", "The configured services did not return a valid capability catalog."],
-    busy: ["Operational services are busy", "Another contained request is using the live tool connections. Try again shortly."],
+    attached: ["Support and Manage are connected", "Monique can see their tools and tickets."],
+    degraded: ["Only part of Support and Manage is connected", "One service needs attention. The other still works."],
+    not_attached: ["Support and Manage are not connected", "Connect them in the server settings to see tools and tickets."],
+    unavailable: ["Support and Manage are not answering", "They did not send a usable list of tools."],
+    busy: ["Support and Manage are busy", "Another request is using them. Try again in a moment."],
   };
-  return messages[health] || ["AI Operations state unknown", "Refresh to discover the current control-plane state."];
+  return messages[health] || ["Connection state unknown", "Refresh to check again."];
 }
 
 function processStatusLabel(status) {
-  const labels = { pending: "Queued in Manage", running: "Running", done: "Completed", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown" };
+  const labels = { pending: "Queued in Manage", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", authenticated: "Signed in" };
   return labels[status] || operationLabel(status);
 }
 
@@ -1856,7 +2680,7 @@ function processIssueReference(job) {
 
 function processTimeLabel(value) {
   const timestamp = ticketTimestamp(value);
-  if (timestamp === null) return "—";
+  if (timestamp === null) return "-";
   return ticketRelativeTime(value) || ticketDateLabel(value);
 }
 
@@ -1867,7 +2691,7 @@ function processDetail(labelText, value, title = null) {
   labelNode.textContent = labelText;
   const valueNode = document.createElement("strong");
   valueNode.setAttribute("data-i18n-skip", "");
-  valueNode.textContent = value || "—";
+  valueNode.textContent = value || "-";
   if (title) valueNode.title = title;
   detail.append(labelNode, valueNode);
   return detail;
@@ -1879,7 +2703,7 @@ function renderProcessWorker(worker, health) {
   if (!worker) {
     const empty = document.createElement("div");
     empty.className = "integration-empty process-empty";
-    empty.textContent = "No worker process snapshot is available yet.";
+    empty.textContent = "No worker has reported in yet.";
     root.append(empty);
     return;
   }
@@ -1902,11 +2726,9 @@ function renderProcessWorker(worker, health) {
   const facts = document.createElement("div");
   facts.className = "process-worker-facts";
   [
-    ["Harness", [worker.agent, worker.binary, worker.cli_version].filter(Boolean).join(" · ")],
     ["Model", worker.model],
-    ["Authentication", `${worker.provider} · ${processStatusLabel(worker.auth_status)}`],
-    ["Capacity", `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
-    ["Updated", processTimeLabel(worker.last_seen_at), worker.last_seen_at],
+    ["Busy", `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
+    ["Seen", processTimeLabel(worker.last_seen_at), worker.last_seen_at],
   ].forEach(([labelText, value, exact]) => facts.append(processDetail(labelText, value, exact)));
   root.append(identity, status, facts);
 }
@@ -1949,7 +2771,7 @@ function renderProcesses(view) {
   byId("processes-health").textContent = health.toUpperCase();
   byId("processes-health").dataset.state = health;
   const observed = Number.isSafeInteger(view.observed_at_ms) ? new Date(view.observed_at_ms).toISOString() : null;
-  byId("process-observed").textContent = observed ? `Observed ${processTimeLabel(observed)}` : "Waiting for worker snapshot";
+  byId("process-observed").textContent = observed ? `Updated ${processTimeLabel(observed)}` : "Waiting for the worker";
   byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
   byId("process-running").textContent = count(view.stats?.running);
   byId("process-queued").textContent = count(view.stats?.queued);
@@ -1965,179 +2787,158 @@ function renderProcesses(view) {
   };
   Object.entries(filterCounts).forEach(([name, value]) => { byId(`process-filter-${name}`).textContent = count(value); });
   const visible = processHierarchy(jobs).filter(({ job }) => processMatches(job, processFilter));
-  byId("process-result-state").textContent = `${visible.length.toLocaleString(localeTag())} of ${jobs.length.toLocaleString(localeTag())} processes`;
+  byId("process-result-state").textContent = `${visible.length.toLocaleString(localeTag())} of ${jobs.length.toLocaleString(localeTag())} runs`;
   const root = byId("process-list");
   root.replaceChildren();
   if (visible.length === 0) {
     const empty = document.createElement("div");
     empty.className = "integration-empty process-empty";
-    empty.textContent = health === "unavailable" ? "No worker process snapshot is available yet." : "No processes match this filter.";
+    empty.textContent = health === "unavailable" ? "No agent runs to show yet." : "No agent runs match this filter.";
     root.append(empty);
     return;
   }
-  visible.forEach(({ job, depth }, index) => {
-    const card = document.createElement("article");
-    card.className = `process-card status-${job.status}`;
-    if (depth > 0) {
-      card.classList.add("is-child", `depth-${depth}`);
-    }
-    const row = document.createElement("div");
-    row.className = "process-row";
-    const reference = document.createElement("div");
-    reference.className = "process-reference";
-    const dot = document.createElement("i");
-    dot.setAttribute("aria-hidden", "true");
-    const referenceCopy = document.createElement("div");
+  visible.forEach(({ job, depth }) => {
+    const row = consoleRow(`process-card status-${job.status}`, () => consoleOpenProcess(job.id));
+    row.dataset.processId = job.id;
+    if (depth > 0) row.classList.add("is-child", `depth-${depth}`);
+    row.classList.toggle("is-selected", consoleState.opsKind === "process" && consoleState.opsKey === job.id);
+    const issueReference = processIssueReference(job);
+    const main = document.createElement("span");
+    main.className = "cell-main";
     const referenceTitle = document.createElement("strong");
     referenceTitle.setAttribute("data-i18n-skip", "");
-    const issueReference = processIssueReference(job);
     referenceTitle.textContent = issueReference.label;
     const referenceId = document.createElement("small");
     referenceId.setAttribute("data-i18n-skip", "");
-    referenceId.textContent = shortProcessReference(job.id);
+    referenceId.textContent = `${job.kind ? `${translatePhrase(operationLabel(job.kind))} · ` : ""}${shortProcessReference(job.id)}`;
     referenceId.title = job.id;
-    referenceCopy.append(referenceTitle, referenceId);
-    reference.append(dot, referenceCopy);
-    const execution = document.createElement("div");
-    execution.className = "process-execution";
-    const executionTitle = document.createElement("strong");
+    main.append(referenceTitle, referenceId);
     const executionName = [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ");
-    const executionState = {
-      pending: "Awaiting worker claim",
-      running: "Active agent execution",
-      done: "Completed agent execution",
-      failed: "Failed agent execution",
-      cancelled: "Cancelled agent execution",
-    }[job.status] || "Agent execution";
-    executionTitle.textContent = executionName || executionState;
-    const facts = document.createElement("div");
-    facts.className = "process-facts";
-    [job.kind ? operationLabel(job.kind) : null, job.parent_id ? "Observed child process" : null, operationLabel(job.source), job.assigned_to_worker ? "Assigned to this worker" : "Unassigned from this worker", job.approved ? "Approval recorded" : "No approval recorded", job.status === "running" && job.session_id ? "Live session reported" : job.status === "pending" ? "No active session reported" : null]
-      .filter(Boolean)
-      .forEach((value) => {
-        const fact = document.createElement("span");
-        fact.textContent = value;
-        facts.append(fact);
-      });
-    execution.append(executionTitle, facts);
-    const timing = document.createElement("div");
-    timing.className = "process-timing";
-    const updated = document.createElement("strong");
-    updated.textContent = processTimeLabel(job.updated_at);
+    const execution = consoleCell(executionName || "Agent", "cell");
+    const updated = consoleCell(processTimeLabel(job.updated_at), "cell cell-time");
     if (job.updated_at) updated.title = ticketDateLabel(job.updated_at);
-    const created = document.createElement("small");
-    created.textContent = job.created_at ? `Created ${processTimeLabel(job.created_at)}` : "Created —";
-    if (job.created_at) created.title = ticketDateLabel(job.created_at);
-    timing.append(updated, created);
-    const lifecycle = document.createElement("div");
-    lifecycle.className = "process-lifecycle";
-    const status = document.createElement("span");
-    status.className = `process-status status-${job.status}`;
-    status.textContent = processStatusLabel(job.status);
-    const detailsButton = document.createElement("button");
-    detailsButton.type = "button";
-    detailsButton.textContent = "Details";
-    const detailsId = `process-details-${index}`;
-    detailsButton.setAttribute("aria-controls", detailsId);
-    detailsButton.setAttribute("aria-expanded", "false");
-    lifecycle.append(status, detailsButton);
-    if (issueReference.href) {
-      const issueLink = document.createElement("a");
-      issueLink.href = issueReference.href;
-      issueLink.target = "_blank";
-      issueLink.rel = "noreferrer";
-      issueLink.textContent = "GitHub ↗";
-      lifecycle.append(issueLink);
-    }
-    const manageHref = safeTicketLink(job.manage_url);
-    if (manageHref) {
-      const manageLink = document.createElement("a");
-      manageLink.href = manageHref;
-      manageLink.target = "_blank";
-      manageLink.rel = "noreferrer";
-      manageLink.textContent = "Manage ↗";
-      lifecycle.append(manageLink);
-    }
-    const details = document.createElement("div");
-    details.className = "process-details";
-    details.id = detailsId;
-    details.hidden = true;
-    [
-      ["Process", job.id],
-      ["Kind", job.kind ? operationLabel(job.kind) : null],
-      ["Parent", job.parent_id],
-      ["Issue", job.issue_id],
-      ["Session", job.session_id],
-      ["Site", job.site_id],
-      ["Provider", operationLabel(job.provider)],
-      ["Runtime", operationLabel(job.runtime)],
-      ["Decisions", String(job.decision_count)],
-      ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
-      ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
-    ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
-    const output = document.createElement("section");
-    output.className = "process-output";
-    output.setAttribute("aria-label", "Live agent output");
-    const outputHead = document.createElement("div");
-    const outputTitle = document.createElement("strong");
-    outputTitle.textContent = "Live agent output";
-    const outputCount = document.createElement("small");
-    const outputLines = Array.isArray(job.output) ? job.output : [];
-    outputCount.textContent = `${outputLines.length.toLocaleString(localeTag())} events`;
-    outputHead.append(outputTitle, outputCount);
-    const outputLog = document.createElement("div");
-    outputLog.className = "process-output-log";
-    outputLog.setAttribute("role", "log");
-    if (outputLines.length === 0) {
-      const emptyOutput = document.createElement("p");
-      emptyOutput.textContent = "The worker has not published output for this process yet.";
-      outputLog.append(emptyOutput);
-    } else {
-      outputLines.forEach((line) => {
-        const entry = document.createElement("article");
-        const meta = document.createElement("div");
-        const kind = document.createElement("span");
-        kind.textContent = operationLabel(line.kind);
-        const at = document.createElement("time");
-        const timestamp = Number.isSafeInteger(line.at_ms) ? new Date(line.at_ms).toISOString() : null;
-        at.textContent = timestamp ? processTimeLabel(timestamp) : "—";
-        if (timestamp) {
-          at.dateTime = timestamp;
-          at.title = ticketDateLabel(timestamp);
-        }
-        meta.append(kind, at);
-        if (line.truncated) {
-          const truncated = document.createElement("i");
-          truncated.textContent = "TRUNCATED";
-          meta.append(truncated);
-        }
-        const text = document.createElement("pre");
-        text.setAttribute("data-i18n-skip", "");
-        text.textContent = line.text;
-        entry.append(meta, text);
-        outputLog.append(entry);
-      });
-    }
-    output.append(outputHead, outputLog);
-    details.append(output);
-    const initiallyExpanded = expandedProcesses.has(job.id);
-    detailsButton.setAttribute("aria-expanded", String(initiallyExpanded));
-    detailsButton.textContent = initiallyExpanded ? "Hide details" : "Details";
-    details.hidden = !initiallyExpanded;
-    card.classList.toggle("is-expanded", initiallyExpanded);
-    detailsButton.addEventListener("click", () => {
-      const expanded = detailsButton.getAttribute("aria-expanded") === "true";
-      detailsButton.setAttribute("aria-expanded", String(!expanded));
-      detailsButton.textContent = expanded ? "Details" : "Hide details";
-      details.hidden = expanded;
-      card.classList.toggle("is-expanded", !expanded);
-      if (expanded) expandedProcesses.delete(job.id);
-      else expandedProcesses.add(job.id);
-    });
-    row.append(reference, execution, timing, lifecycle);
-    card.append(row, details);
-    root.append(card);
+    const status = consoleBadge(processStatusLabel(job.status), processStatusTone(job.status));
+    status.classList.add("process-status", `status-${job.status}`);
+    row.append(main, execution, updated, consoleCellWrap(status));
+    root.append(row);
   });
+  consoleCapList(root, "processes", "data-process-id", consoleState.opsKind === "process" ? consoleState.opsKey : null);
+  if (consoleState.opsKind === "process") consoleOpenProcess(consoleState.opsKey, false);
+}
+
+function processStatusTone(status) {
+  return { pending: "quiet", running: "info", done: "ok", failed: "danger", cancelled: "quiet" }[status] || "quiet";
+}
+
+function renderProcessDrawer(job) {
+  const issueReference = processIssueReference(job);
+  byId("ops-drawer-kicker").textContent = `Agent run · ${processStatusLabel(job.status)}`;
+  const title = byId("ops-drawer-title");
+  title.setAttribute("data-i18n-skip", "");
+  title.textContent = issueReference.label;
+  const body = byId("ops-drawer-body");
+  body.replaceChildren();
+  const summary = document.createElement("section");
+  summary.className = "drawer-section";
+  const badges = document.createElement("div");
+  badges.className = "drawer-badges";
+  badges.append(consoleBadge(processStatusLabel(job.status), processStatusTone(job.status)));
+  if (job.approved) badges.append(consoleBadge("Approved", "ok"));
+  if (job.parent_id) badges.append(consoleBadge("Part of a larger run", "quiet"));
+  const lede = document.createElement("p");
+  lede.className = "inline-hint";
+  lede.textContent = {
+    pending: "Waiting for a free agent to pick it up.",
+    running: "An agent is working on this right now.",
+    done: "The agent finished this run.",
+    failed: "This run failed. Check the output below, then retry from Manage.",
+    cancelled: "This run was cancelled.",
+  }[job.status] || "Agent run.";
+  const actions = document.createElement("div");
+  actions.className = "drawer-actions";
+  if (issueReference.href) {
+    const issueLink = document.createElement("a");
+    issueLink.className = "button ghost small";
+    issueLink.href = issueReference.href;
+    issueLink.target = "_blank";
+    issueLink.rel = "noreferrer";
+    issueLink.textContent = "GitHub ↗";
+    actions.append(issueLink);
+  }
+  const manageHref = safeTicketLink(job.manage_url);
+  if (manageHref) {
+    const manageLink = document.createElement("a");
+    manageLink.className = "button ghost small";
+    manageLink.href = manageHref;
+    manageLink.target = "_blank";
+    manageLink.rel = "noreferrer";
+    manageLink.textContent = "Manage ↗";
+    actions.append(manageLink);
+  }
+  summary.append(badges, lede);
+  if (actions.childNodes.length) summary.append(actions);
+  const output = document.createElement("section");
+  output.className = "drawer-section process-output";
+  output.setAttribute("aria-label", "Live agent output");
+  const outputTitle = document.createElement("h3");
+  const outputLines = Array.isArray(job.output) ? job.output : [];
+  outputTitle.textContent = `Live output · ${outputLines.length.toLocaleString(localeTag())} events`;
+  const outputLog = document.createElement("div");
+  outputLog.className = "process-output-log";
+  outputLog.setAttribute("role", "log");
+  if (outputLines.length === 0) {
+    const emptyOutput = document.createElement("p");
+    emptyOutput.textContent = "No output from the agent yet.";
+    outputLog.append(emptyOutput);
+  } else {
+    outputLines.forEach((line) => {
+      const entry = document.createElement("article");
+      const meta = document.createElement("div");
+      const kind = document.createElement("span");
+      kind.textContent = operationLabel(line.kind);
+      const at = document.createElement("time");
+      const timestamp = Number.isSafeInteger(line.at_ms) ? new Date(line.at_ms).toISOString() : null;
+      at.textContent = timestamp ? processTimeLabel(timestamp) : "-";
+      if (timestamp) {
+        at.dateTime = timestamp;
+        at.title = ticketDateLabel(timestamp);
+      }
+      meta.append(kind, at);
+      if (line.truncated) {
+        const truncated = document.createElement("i");
+        truncated.textContent = "CUT SHORT";
+        meta.append(truncated);
+      }
+      const text = document.createElement("pre");
+      text.setAttribute("data-i18n-skip", "");
+      text.textContent = line.text;
+      entry.append(meta, text);
+      outputLog.append(entry);
+    });
+  }
+  output.append(outputTitle, outputLog);
+  const detailsSection = document.createElement("section");
+  detailsSection.className = "drawer-section";
+  const detailsTitle = document.createElement("h3");
+  detailsTitle.textContent = "Details";
+  const details = document.createElement("div");
+  details.className = "process-details";
+  [
+    ["Agent", [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ")],
+    ["Type", job.kind ? translatePhrase(operationLabel(job.kind)) : null],
+    ["Came from", operationLabel(job.source)],
+    ["On this worker", translatePhrase(job.assigned_to_worker ? "Yes" : "No")],
+    ["Decisions", String(job.decision_count)],
+    ["Site", job.site_id],
+    ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
+    ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
+    ["Run ID", job.id],
+    ["Part of", job.parent_id],
+    ["Ticket ID", job.issue_id],
+    ["Conversation", job.session_id],
+  ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
+  detailsSection.append(detailsTitle, details);
+  body.append(summary, output, detailsSection);
 }
 
 async function loadProcesses({ announce = false } = {}) {
@@ -2179,11 +2980,11 @@ function cockpitSignal(id, label, signal) {
   const source = document.createElement("small");
   source.textContent = label;
   const state = document.createElement("strong");
-  state.textContent = signal ? words(signal.state) : "Unavailable";
+  state.textContent = signal ? words(signal.state) : "Unknown";
   const detail = document.createElement("span");
   detail.textContent = signal
     ? `${signal.reference ? `${signal.reference} · ` : ""}${words(signal.freshness)} · ${signal.unread === null ? "unread unknown" : `${count(signal.unread)} unread`}`
-    : "Freshness unknown · unread unknown";
+    : "Not reported";
   root.dataset.freshness = signal?.freshness || "unknown";
   root.append(source, state, detail);
 }
@@ -2285,18 +3086,18 @@ function renderHostedCockpit(view) {
   capability.dataset.mode = cockpitPresentation.mode;
   capability.replaceChildren();
   const capabilityTitle = document.createElement("strong");
-  capabilityTitle.textContent = cockpitPresentation.mode === "v2" ? "Structured workspace context" : cockpitPresentation.mode === "partial" ? "Partial workspace capability" : "Platform v1 retained-session mode";
+  capabilityTitle.textContent = cockpitPresentation.mode === "v2" ? "Workspaces are up to date." : cockpitPresentation.mode === "partial" ? "Some workspace details are missing." : "Workspaces are not available on this server.";
   const capabilityDetail = document.createElement("span");
   capabilityDetail.textContent = cockpitPresentation.stale
-    ? "Snapshot is stale. Workspace actions are read-only until a fresh exact capability arrives."
-    : cockpitPresentation.degradation || "Structured projects, hosts, workspaces, status signals, and read models are available.";
+    ? "This data is out of date. Workspace actions are paused until it refreshes."
+    : cockpitPresentation.degradation || "Projects, servers, workspaces and their status are listed below.";
   capability.append(capabilityTitle, capabilityDetail);
 
   byId("cockpit-project-count").textContent = count(cockpitPresentation.projects.length);
   byId("cockpit-host-count").textContent = count(cockpitPresentation.hosts.length);
   byId("cockpit-workspace-count").textContent = count(cockpitPresentation.workspaces.length);
-  cockpitReplaceNamedList("cockpit-project-list", cockpitPresentation.projects, "Structured project context unavailable.");
-  cockpitReplaceNamedList("cockpit-host-list", cockpitPresentation.hosts, "Structured host context unavailable.");
+  cockpitReplaceNamedList("cockpit-project-list", cockpitPresentation.projects, "None listed.");
+  cockpitReplaceNamedList("cockpit-host-list", cockpitPresentation.hosts, "None listed.");
 
   const workspaceRoot = byId("cockpit-workspace-list");
   workspaceRoot.replaceChildren();
@@ -2304,22 +3105,31 @@ function renderHostedCockpit(view) {
   if (filtered.length === 0) {
     const empty = document.createElement("div");
     empty.className = "cockpit-unavailable";
-    empty.textContent = cockpitPresentation.workspaces.length === 0 ? "No structured workspaces advertised." : "No workspaces match this attention state.";
+    empty.textContent = cockpitPresentation.workspaces.length === 0 ? "No workspaces yet. Conversations above still work." : "No workspaces match this filter.";
     workspaceRoot.append(empty);
   }
   filtered.forEach((workspace) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "cockpit-workspace-option";
+    button.className = "row cockpit-workspace-option";
+    button.dataset.row = "";
     button.setAttribute("role", "option");
     button.setAttribute("aria-selected", String(cockpitPresentation.selectedWorkspace?.id === workspace.id));
     button.classList.toggle("is-selected", cockpitPresentation.selectedWorkspace?.id === workspace.id);
+    const main = document.createElement("span");
+    main.className = "cell-main";
     const labelNode = document.createElement("strong");
     labelNode.textContent = workspace.label;
-    const context = document.createElement("span");
-    context.textContent = `${workspace.branch || "branch unavailable"} · ${workspace.attention ? words(workspace.attention) : "attention unavailable"}`;
-    button.append(labelNode, context);
-    button.addEventListener("click", () => selectCockpitWorkspace(workspace));
+    const context = document.createElement("small");
+    context.setAttribute("data-i18n-skip", "");
+    context.textContent = workspace.id;
+    main.append(labelNode, context);
+    const tones = { needs_you: "warn", blocked: "danger", working: "info", done: "ok" };
+    const attentionNames = { needs_you: "Needs you", blocked: "Blocked", working: "Working", done: "Done" };
+    const attentionBadge = consoleBadge(workspace.attention ? attentionNames[workspace.attention] || words(workspace.attention) : "Unknown", tones[workspace.attention] || "quiet");
+    const branch = consoleCell(workspace.branch || "No branch yet", "cell cell-mono");
+    button.append(main, consoleCellWrap(attentionBadge), branch);
+    button.addEventListener("click", () => consoleOpenWorkspace(workspace));
     workspaceRoot.append(button);
   });
 
@@ -2335,11 +3145,18 @@ function renderHostedCockpit(view) {
   });
 
   const workspace = cockpitPresentation.selectedWorkspace;
-  byId("cockpit-workspace-coordinate").textContent = workspace ? workspace.id : "NO STRUCTURED WORKSPACE";
-  byId("cockpit-workspace-title").textContent = workspace?.label || "Retained session mode";
-  byId("cockpit-workspace-branch").textContent = workspace?.branch ? `Branch ${workspace.branch}` : "Branch unavailable · no inference from conversation summaries";
-  cockpitSignal("cockpit-external-signal", "EXTERNAL WORK", workspace?.external_work);
-  cockpitSignal("cockpit-agent-signal", "INTERNAL AGENT", workspace?.internal_agent);
+  byId("cockpit-workspace-coordinate").textContent = workspace ? workspace.id : "NO WORKSPACE";
+  byId("cockpit-workspace-title").textContent = workspace?.label || "No workspace selected";
+  byId("cockpit-workspace-branch").textContent = workspace?.branch ? `Branch ${workspace.branch}` : "No branch yet";
+  cockpitSignal("cockpit-external-signal", "OUTSIDE WORK", workspace?.external_work);
+  cockpitSignal("cockpit-agent-signal", "AGENT", workspace?.internal_agent);
+  // With structured workspaces the selected workspace is the primary context,
+  // so its drawer starts open until the operator closes it.
+  if (workspace && !consoleState.taskDrawerDismissed && !consoleDrawerIsOpen("task-drawer")) {
+    consoleDrawer("task-drawer", true);
+    if (byId("platform-session-detail").hidden) consoleShowTaskPane("workspace");
+  }
+  consoleSyncTaskDrawerTitle();
 
   const create = byId("cockpit-create-preview");
   const resume = byId("cockpit-resume-preview");
@@ -2351,7 +3168,19 @@ function renderHostedCockpit(view) {
   const localLifecycle = globalThis.AutomoniquePlatformCockpit.lifecycleStatus(cockpitPresentation.localLifecycle);
   const lifecycleReason = byId("cockpit-action-reason");
   lifecycleReason.dataset.localLifecycle = localLifecycle.state;
-  lifecycleReason.textContent = localLifecycle.message;
+  // A plain summary first, then the server's exact categories: a refusal
+  // reason is never paraphrased away.
+  const lifecyclePlain = document.createElement("span");
+  lifecyclePlain.textContent = {
+    available: "Creating or resuming a workspace from here is not available yet. Server setup and checkout are ready.",
+    partial: "Creating or resuming a workspace from here is not available yet. Server setup is only partly ready.",
+    unavailable: "Creating or resuming a workspace from here is not available yet.",
+  }[localLifecycle.state] || "";
+  const lifecycleExact = document.createElement("small");
+  lifecycleExact.className = "exact-reason";
+  lifecycleExact.setAttribute("data-i18n-skip", "");
+  lifecycleExact.textContent = localLifecycle.message;
+  lifecycleReason.replaceChildren(...(lifecyclePlain.textContent ? [lifecyclePlain, document.createTextNode(" ")] : []), lifecycleExact);
   if (workspace?.id !== cockpitTaskWorkspaceId) {
     byId("cockpit-task-input").value = cockpitPresentation.create.task_id || cockpitPresentation.resume.task_id || "";
     cockpitTaskWorkspaceId = workspace?.id || null;
@@ -2363,9 +3192,9 @@ function renderHostedCockpit(view) {
   const copy = byId("cockpit-copy-link");
   copy.disabled = !workspace;
   byId("cockpit-inspector-workspace").textContent = workspace?.id || "No workspace selected";
-  byId("cockpit-inspector-session").textContent = link.session || workspace?.session_id || "—";
-  byId("cockpit-inspector-pane").textContent = link.pane || "—";
-  byId("cockpit-inspector-anchor").textContent = link.file ? `${link.file} · ${link.hunk} · ${link.side}:${link.line}` : "—";
+  byId("cockpit-inspector-session").textContent = link.session || workspace?.session_id || "-";
+  byId("cockpit-inspector-pane").textContent = link.pane || "-";
+  byId("cockpit-inspector-anchor").textContent = link.file ? `${link.file} · ${link.hunk} · ${link.side}:${link.line}` : "-";
 
   renderCockpitReadModels(cockpitPresentation.readModels);
   renderCockpitReceipt(cockpitState.receipt.state === "idle" ? cockpitPresentation.receipt : cockpitState.receipt);
@@ -2414,12 +3243,12 @@ function renderHostedCockpit(view) {
   byId("cockpit-rerun-cancel").disabled = !cockpitRerunPreview || cockpitControlBusy;
   byId("cockpit-review-comment").disabled = !addComment.available || unresolvedControl;
   byId("cockpit-review-action-reason").textContent = unresolvedControl
-    ? "An unresolved durable receipt is lookup-only. New writes are disabled."
+    ? "Waiting for your last action to be confirmed. New actions are paused."
     : !exactAnchor
-      ? "Add comment requires an exact file, hunk, side, and line deep link."
+      ? "To comment, open a link to a specific line of code first."
       : rerunCheck.available
-        ? "CI rerun is enabled only for the selected server-advertised exact check revision."
-        : "Only explicitly advertised review actions are enabled; unavailable families are not inferred.";
+        ? "You can run the selected check again."
+        : "Only the review actions this server offers are shown.";
   const inbox = byId("cockpit-inbox-list");
   inbox.replaceChildren();
   if (cockpitPresentation.inbox.length > 0) {
@@ -2428,12 +3257,17 @@ function renderHostedCockpit(view) {
       const title = document.createElement("strong");
       title.textContent = `${words(entry.state)} · ${words(entry.reason)}`;
       const detail = document.createElement("span");
-      detail.textContent = `${words(entry.source_kind)} · observed ${entry.observed_at_ms} ms · source revision ${entry.source_revision} · item revision ${entry.item_revision} · ${entry.unread} unread`;
+      detail.textContent = `${consoleSentence(entry.source_kind)} · ${consoleMsAgo(entry.observed_at_ms)} · ${entry.unread} unread`;
+      // The exact generation stays visible: cross-client acceptance compares
+      // this line verbatim, so it is never rounded or paraphrased.
+      const generation = document.createElement("small");
+      generation.className = "cockpit-exact-generation";
+      generation.textContent = `${words(entry.source_kind)} · observed ${entry.observed_at_ms} ms · source revision ${entry.source_revision} · item revision ${entry.item_revision} · ${entry.unread} unread`;
       const exactLink = document.createElement("a");
       exactLink.href = entry.deep_link;
-      exactLink.textContent = "Open exact attention context";
+      exactLink.textContent = "View";
       exactLink.setAttribute("aria-label", `Open exact attention context for ${words(entry.reason)} at source revision ${entry.source_revision}`);
-      item.append(title, detail, exactLink);
+      item.append(title, detail, generation, exactLink);
       inbox.append(item);
     });
   }
@@ -2452,11 +3286,11 @@ function renderHostedCockpit(view) {
       const title = document.createElement("strong");
       title.textContent = entry.label;
       const detail = document.createElement("span");
-      detail.textContent = `Observed ${entry.at} ms · ${entry.source || entry.kind} · ${words(entry.freshness)} · source revision ${entry.source_revision}`;
+      detail.textContent = `${consoleMsAgo(entry.at)} · ${consoleSentence(entry.source || entry.kind)} · ${words(entry.freshness)} · source revision ${entry.source_revision}`;
       if (entry.deep_link) {
         const exactLink = document.createElement("a");
         exactLink.href = entry.deep_link;
-        exactLink.textContent = "Open exact context";
+        exactLink.textContent = "View";
         exactLink.setAttribute("aria-label", `Open exact context for ${entry.label} at source revision ${entry.source_revision}`);
         item.append(title, detail, exactLink);
       } else {
@@ -2488,47 +3322,59 @@ function renderRetainedPlatform(retained) {
   byId("platform-health").textContent = words(retained.health || "unavailable").toUpperCase();
   byId("platform-health").dataset.state = retained.health || "unavailable";
   byId("platform-cursor").textContent = retained.sessions_cursor
-    ? `${words(retained.sessions_cursor.authority)} / ${retained.sessions_cursor.topic} / seq ${String(retained.sessions_cursor.sequence)}`
+    ? "Updated just now"
     : inventory.state === "refused"
-      ? "Session inventory refused"
-      : "No session cursor";
+      ? "The list is not available"
+      : "Not loaded yet";
   const root = byId("platform-session-list");
   root.replaceChildren();
   if (sessions.length === 0) {
     const empty = document.createElement("div");
     empty.className = "integration-empty";
     empty.textContent = inventory.state === "refused"
-      ? `Session listing unavailable: ${inventory.explanation || "refused by the platform authority"}.`
-      : "No retained sessions are currently visible.";
+      ? `Conversations not available: ${inventory.explanation || "the server refused the request"}.`
+      : "No conversations yet. Start a task above.";
     root.append(empty);
     return;
   }
-  sessions.forEach((session) => {
+  // The server's summary is only a state word ("open"/"closed"), so rows are
+  // titled by time and short id, newest first.
+  const ordered = [...sessions].sort((left, right) => consoleSessionObservedMs(right) - consoleSessionObservedMs(left));
+  ordered.forEach((session) => {
     const record = session.session || {};
     const coordinate = record.resource || {};
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "platform-session-option";
-    button.classList.toggle("is-selected", coordinate.id === platformSelectedSession);
+    const row = consoleRow("platform-session-option", () => consoleOpenSession(coordinate.id));
+    row.classList.toggle("is-selected", coordinate.id === platformSelectedSession);
     // A retained session can be read and resumed without a live attachment.
-    button.dataset.sessionId = coordinate.id || "";
+    row.dataset.sessionId = coordinate.id || "";
+    const main = document.createElement("span");
+    main.className = "cell-main";
     const title = document.createElement("strong");
     title.setAttribute("data-i18n-skip", "");
-    title.textContent = coordinate.id || "Unnamed session";
-    const summary = document.createElement("span");
-    summary.setAttribute("data-i18n-skip", "");
-    summary.textContent = record.summary || "No bounded summary";
-    const posture = document.createElement("small");
-    posture.textContent = `${words(record.freshness || "unknown")} · ${session.run ? "run present" : "idle"} · ${session.controllable ? "control available" : "observe only"}`;
-    button.append(title, summary, posture);
-    button.addEventListener("click", () => selectPlatformSession(coordinate.id));
-    root.append(button);
+    title.textContent = consoleSessionTitle(session);
+    const detail = document.createElement("small");
+    detail.textContent = [session.run ? "Has a linked run" : null, session.attachable === false ? "History only" : null].filter(Boolean).join(" · ") || "Can be opened";
+    main.append(title, detail);
+    const stateWord = String(record.summary || "").trim().toLowerCase();
+    const state = consoleSessionWorking(coordinate.id)
+      ? consoleBadge("Working", "info")
+      : consoleBadge(stateWord === "open" ? "Open" : stateWord === "closed" ? "Closed" : stateWord ? consoleSentence(stateWord) : "Unknown", "quiet");
+    if (!consoleSessionWorking(coordinate.id)) state.classList.add("plain");
+    const observed = consoleSessionObservedMs(session);
+    const updated = consoleCell(observed ? consoleMsAgo(observed) : "", "cell cell-time");
+    if (observed) updated.title = memoryDateLabel(observed);
+    const reference = consoleCell(consoleShortId(coordinate.id), "cell cell-mono");
+    reference.title = coordinate.id || "";
+    reference.setAttribute("data-i18n-skip", "");
+    row.append(main, consoleCellWrap(state), updated, reference);
+    root.append(row);
   });
+  consoleCapList(root, "sessions", "data-session-id", platformSelectedSession);
   if (platformSelectedSession && !sessions.some((session) => session.session?.resource?.id === platformSelectedSession)) {
     platformExactRevision = null;
     byId("platform-session-empty").hidden = true;
     byId("platform-session-detail").hidden = false;
-    byId("platform-session-status").textContent = "Selected session is no longer visible in the fresh authority listing.";
+    byId("platform-session-status").textContent = "This conversation is no longer in the list.";
     settlePlatformFence(null);
   }
 }
@@ -2588,7 +3434,7 @@ function renderPlatformHistory(history, replace = false) {
     if (replace) {
       const item = document.createElement("div");
       item.className = "platform-history-notice";
-      item.textContent = `History refused: ${history?.explanation || "no explanation"}.`;
+      item.textContent = `History not available: ${history?.explanation || "no reason given"}.`;
       root.append(item);
     }
     byId("platform-history-more").hidden = true;
@@ -2598,7 +3444,7 @@ function renderPlatformHistory(history, replace = false) {
     root.replaceChildren();
     const item = document.createElement("div");
     item.className = "platform-history-notice";
-    item.textContent = `History retention changed (${history.snapshot_from}–${history.snapshot_to}). Replacing with a fresh snapshot…`;
+    item.textContent = "Older messages were trimmed. Reloading the conversation…";
     root.append(item);
     byId("platform-history-more").hidden = true;
     window.setTimeout(() => openPlatformSession(platformSelectedSession), 0);
@@ -2611,18 +3457,19 @@ function renderPlatformHistory(history, replace = false) {
     const item = document.createElement("article");
     item.className = `platform-history-event is-${event.kind || "unknown"}`;
     item.dataset.cursor = event.cursor || "";
+    if (event.kind === "message") item.dataset.role = event.role === "user" ? "user" : "assistant";
     const head = document.createElement("div");
     const kind = document.createElement("strong");
-    kind.textContent = event.kind === "message" ? words(event.role || "message") : words(event.kind || "event");
+    kind.textContent = event.kind === "message" ? (event.role === "user" ? "You" : event.role === "assistant" ? "Monique" : words(event.role || "message")) : words(event.kind || "event");
     const cursor = document.createElement("small");
-    cursor.textContent = `#${event.cursor || "—"}`;
+    cursor.textContent = `#${event.cursor || "-"}`;
     head.append(kind, cursor);
     const content = document.createElement("p");
     content.setAttribute("data-i18n-skip", "");
     if (event.kind === "message") content.textContent = event.text || "";
     else if (event.kind === "tool_state") content.textContent = `${event.label || "Tool step"}: ${words(event.state)}`;
-    else if (event.kind === "run_state") content.textContent = `Run ${words(event.state)}`;
-    else content.textContent = `Sanitized ${words(event.source || "unknown event")}`;
+    else if (event.kind === "run_state") content.textContent = { running: "Monique started working", completed: "Monique finished", failed: "The run failed", cancelled: "The run was cancelled" }[event.state] || `Run ${words(event.state)}`;
+    else content.textContent = `Event from ${words(event.source || "unknown source")}`;
     item.append(head, content);
     root.append(item);
   });
@@ -2635,15 +3482,15 @@ function renderPlatformReceipt(view) {
   root.hidden = false;
   root.dataset.state = view.state;
   if (view.state === "ambiguous") {
-    root.textContent = "Outcome uncertain. Reconciling this idempotency key without replaying the follow-up.";
+    root.textContent = "Not sure your reply arrived. Checking, without sending it twice.";
     return;
   }
   if (view.state === "refused") {
-    root.textContent = `Refused (${words(view.outcome)}): ${view.explanation}`;
+    root.textContent = `Not accepted (${words(view.outcome)}): ${view.explanation}`;
     return;
   }
   const receipt = view.receipt || {};
-  root.textContent = `Receipt ${receipt.id || "—"}: ${words(receipt.outcome || "unknown")} · ${words(receipt.lifecycle || "unknown")}.`;
+  root.textContent = `Reply ${words(receipt.outcome || "unknown")} · ${words(receipt.lifecycle || "unknown")}.`;
 }
 
 function settlePlatformFence(command) {
@@ -2657,10 +3504,10 @@ function settlePlatformFence(command) {
   byId("platform-follow-up").disabled = blocked;
   byId("platform-send").disabled = blocked;
   byId("platform-composer-note").textContent = platformMutation
-    ? "This mutation is fenced until its receipt is reconciled and a newer session revision is observed."
+    ? "Waiting for your last reply to be confirmed before you can send another."
     : revision
-      ? `Exact session revision ${revision}.`
-      : "Follow-up unavailable until command state supplies an exact revision.";
+      ? `Ready to reply (version ${revision}).`
+      : "Replies are not available for this conversation right now.";
 }
 
 async function openPlatformSession(sessionId) {
@@ -2668,28 +3515,31 @@ async function openPlatformSession(sessionId) {
   platformBusy = true;
   byId("platform-session-empty").hidden = true;
   byId("platform-session-detail").hidden = false;
-  byId("platform-session-status").textContent = "Opening session…";
+  byId("platform-session-status").textContent = "Opening conversation…";
+  consoleTaskDrawerOpened();
   settlePlatformFence(null);
   try {
     const view = await platformPost({ action: "open", session_id: sessionId });
     if (view.state === "refused") {
       renderPlatformReceipt(view);
-      byId("platform-session-status").textContent = `Attach refused · ${words(view.outcome)}`;
+      byId("platform-session-status").textContent = `Could not open · ${words(view.outcome)}`;
       return;
     }
     if (view.state !== "open") throw new Error("Unexpected retained-session response");
     const record = view.session?.session || {};
     const coordinate = record.resource || {};
     byId("platform-session-coordinate").textContent = `${coordinate.authority || "automonique"} / ${coordinate.kind || "session"} / ${coordinate.id || sessionId}`;
-    byId("platform-session-summary").textContent = record.summary || "No bounded summary";
-    byId("platform-session-posture").textContent = `${words(record.freshness || "unknown")} · Observer · control not claimed${view.control?.available ? " · control available to claim elsewhere" : ""}`;
+    byId("platform-session-summary").textContent = consoleSessionTitle(view.session || {});
+    byId("platform-session-posture").textContent = record.freshness === "stale" ? "Out of date · read only" : "Up to date · read only";
     const approvals = view.command?.state === "ready" && Array.isArray(view.command.pending_approvals) ? view.command.pending_approvals.length : 0;
-    const run = view.command?.state === "ready" && view.command.run ? "run present" : "no active run target";
-    byId("platform-session-status").textContent = `${view.attachment_cursor ? "Attached" : "Retained session"} · ${run} · ${approvals} pending approval${approvals === 1 ? "" : "s"}`;
+    // A run target is not proof that anything is executing, so it is named as linked only.
+    const run = view.command?.state === "ready" && view.command.run ? "Has a linked run" : "No linked run";
+    byId("platform-session-status").textContent = `${view.attachment_cursor ? "Live" : "Saved history"} · ${run} · ${approvals === 0 ? "nothing to approve" : `${approvals} to approve`}`;
+    consoleSyncTaskDrawerTitle();
     renderPlatformHistory(view.history, true);
     settlePlatformFence(view.command);
   } catch (error) {
-    byId("platform-session-status").textContent = `Session unavailable: ${error.message}`;
+    byId("platform-session-status").textContent = `Conversation not available: ${error.message}`;
   } finally {
     platformBusy = false;
     settlePlatformFence(null);
@@ -2834,38 +3684,77 @@ function renderOperationsCatalog(tools) {
   if (tools.length === 0) {
     const empty = document.createElement("div");
     empty.className = "integration-empty";
-    empty.textContent = "No AI Operations tools are currently available to this dashboard.";
+    empty.textContent = "No tools are connected yet.";
     root.append(empty);
     return;
   }
   tools.forEach((tool) => {
-    const card = document.createElement("article");
-    card.className = "tool-card";
-    const head = document.createElement("div");
-    const category = document.createElement("span");
-    category.textContent = `${operationLabel(tool.surface)} · ${operationLabel(tool.category)}`;
-    category.title = `Configured server: ${tool.server}`;
-    const authority = document.createElement("i");
-    authority.className = tool.authority === "read_only" ? "safe" : "approval";
-    authority.textContent = tool.authority === "read_only" ? "SAFE READ" : "APPROVAL";
-    head.append(category, authority);
+    const key = `${tool.server}:${tool.name}`;
+    const row = consoleRow("tool-card", () => consoleOpenTool(key));
+    row.dataset.toolKey = key;
+    row.classList.toggle("is-selected", consoleState.opsKind === "tool" && consoleState.opsKey === key);
+    const main = document.createElement("span");
+    main.className = "cell-main";
     const title = document.createElement("strong");
     title.setAttribute("data-i18n-skip", "");
     title.textContent = operationLabel(tool.name);
-    const description = document.createElement("p");
+    const description = document.createElement("small");
     if (tool.description) description.setAttribute("data-i18n-skip", "");
-    description.textContent = tool.description || "Live connected-service capability.";
-    const footer = document.createElement("div");
-    const input = document.createElement("small");
-    input.textContent = tool.requires_input ? "Details required" : "Ready to plan";
-    const use = document.createElement("button");
-    use.type = "button";
-    use.textContent = "Use with Monique →";
-    use.dataset.openChat = `Help me use the ${operationLabel(tool.surface)} capability “${operationLabel(tool.name)}”. Explain what it does, collect any required details, and stage any mutation for my approval.`;
-    footer.append(input, use);
-    card.append(head, title, description, footer);
-    root.append(card);
+    description.textContent = tool.description || "Connected service tool.";
+    main.append(title, description);
+    const service = document.createElement("span");
+    service.className = "source-pill";
+    service.textContent = operationLabel(tool.surface);
+    service.title = `${operationLabel(tool.category)} · ${tool.server}`;
+    const access = consoleBadge(tool.authority === "read_only" ? "Read only" : "Needs approval", tool.authority === "read_only" ? "ok" : "warn");
+    const input = consoleCell(tool.requires_input ? "Needs details" : "Ready", "cell cell-time");
+    row.append(main, consoleCellWrap(service), consoleCellWrap(access), input);
+    root.append(row);
   });
+  consoleCapList(root, "tools", "data-tool-key", consoleState.opsKind === "tool" ? consoleState.opsKey : null);
+  if (consoleState.opsKind === "tool") consoleOpenTool(consoleState.opsKey, false);
+}
+
+function renderToolDrawer(tool) {
+  byId("ops-drawer-kicker").textContent = `${operationLabel(tool.surface)} tool · ${operationLabel(tool.category)}`;
+  const title = byId("ops-drawer-title");
+  title.setAttribute("data-i18n-skip", "");
+  title.textContent = operationLabel(tool.name);
+  const body = byId("ops-drawer-body");
+  body.replaceChildren();
+  const summary = document.createElement("section");
+  summary.className = "drawer-section";
+  const description = document.createElement("p");
+  description.className = "drawer-lede";
+  if (tool.description) description.setAttribute("data-i18n-skip", "");
+  description.textContent = tool.description || "Connected service tool.";
+  const badges = document.createElement("div");
+  badges.className = "drawer-badges";
+  badges.append(consoleBadge(tool.authority === "read_only" ? "Read only" : "Needs approval", tool.authority === "read_only" ? "ok" : "warn"), consoleBadge(tool.requires_input ? "Needs details" : "Ready", "quiet"));
+  const note = document.createElement("p");
+  note.className = "inline-hint";
+  note.textContent = tool.authority === "read_only"
+    ? "Monique can use this right away. It only reads data."
+    : "This changes data. Monique shows you exactly what it will do and waits for your approval.";
+  const actions = document.createElement("div");
+  actions.className = "drawer-actions";
+  const use = document.createElement("button");
+  use.type = "button";
+  use.className = "button primary small";
+  use.textContent = "Use with assistant";
+  use.dataset.openChat = `Help me use the ${operationLabel(tool.surface)} capability “${operationLabel(tool.name)}”. Explain what it does, collect any required details, and stage any mutation for my approval.`;
+  actions.append(use);
+  summary.append(description, badges, note, actions);
+  const detailsSection = document.createElement("section");
+  detailsSection.className = "drawer-section";
+  const detailsTitle = document.createElement("h3");
+  detailsTitle.textContent = "Details";
+  const details = document.createElement("dl");
+  details.className = "kv";
+  [["Service", operationLabel(tool.surface)], ["Category", operationLabel(tool.category)], ["Server", tool.server], ["Technical name", tool.name]]
+    .forEach(([labelText, value]) => details.append(consoleFact(labelText, value)));
+  detailsSection.append(detailsTitle, details);
+  body.append(summary, detailsSection);
 }
 
 function ticketStatusLabel(status) {
@@ -2903,7 +3792,7 @@ function ticketRelativeTime(value) {
 
 function ticketDateLabel(value) {
   const timestamp = ticketTimestamp(value);
-  if (timestamp === null) return value || "—";
+  if (timestamp === null) return value || "-";
   return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(timestamp);
 }
 
@@ -2964,14 +3853,14 @@ function safeTicketLink(value) {
 
 function ticketEmptyMessage(health) {
   const messages = {
-    empty: "The connected work queues are currently empty.",
-    no_read_surface: "The services are connected, but they do not advertise a zero-input read-only queue.",
-    input_required: "A work source needs additional scope. Ask Monique to retrieve the exact queue you need.",
-    unavailable: "The live work sources are temporarily unavailable.",
-    degraded: "One work source is unavailable; available items are shown below.",
-    not_attached: "Attach Support and Manage to load their work queues.",
+    empty: "No tickets right now.",
+    no_read_surface: "Support and Manage are connected but cannot list tickets.",
+    input_required: "Monique needs more details to list these tickets. Ask the assistant.",
+    unavailable: "Tickets are not available right now.",
+    degraded: "One source is down. Tickets from the other are shown below.",
+    not_attached: "Connect Support and Manage to see tickets here.",
   };
-  return messages[health] || "No work items match this filter.";
+  return messages[health] || "No tickets match these filters.";
 }
 
 function setTicketFilter(filter) {
@@ -2993,7 +3882,7 @@ function ticketDetail(labelText, value, title = null) {
   labelNode.textContent = labelText;
   const valueNode = document.createElement("strong");
   valueNode.setAttribute("data-i18n-skip", "");
-  valueNode.textContent = value || "—";
+  valueNode.textContent = value || "-";
   if (title) valueNode.title = title;
   detail.append(labelNode, valueNode);
   return detail;
@@ -3022,12 +3911,12 @@ function renderTickets() {
   const visible = filteredTickets();
   const health = operationsSnapshot?.tickets?.health || "not_attached";
   byId("tickets-state").textContent = ["ready", "degraded"].includes(health)
-    ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} work items`
+    ? `${visible.length.toLocaleString(localeTag())} of ${tickets.length.toLocaleString(localeTag())} tickets`
     : ticketEmptyMessage(health);
   const sources = operationsSnapshot?.tickets?.sources || [];
   byId("tickets-source").textContent = sources.length
-    ? sources.map((source) => `${operationLabel(source.surface)}: ${operationLabel(source.health)}`).join(" · ")
-    : "Waiting for live sources";
+    ? sources.map((source) => `${operationLabel(source.surface)}: ${translatePhrase(operationLabel(source.health)).toLocaleLowerCase(localeTag())}`).join(" · ")
+    : "Waiting for Support and Manage";
   const root = byId("ticket-list");
   root.replaceChildren();
   if (visible.length === 0) {
@@ -3048,117 +3937,121 @@ function renderTickets() {
         renderTickets();
       });
     } else {
-      action.textContent = "Use recovery assistant";
+      action.textContent = "Ask assistant";
       action.dataset.openChat = "Inspect the available Support and Manage capabilities and help me retrieve or review the right work queue.";
     }
     empty.append(title, action);
     root.append(empty);
     return;
   }
-  visible.forEach((ticket, index) => {
-    const card = document.createElement("article");
-    card.className = `ticket-card priority-${ticket.priority}`;
-    const row = document.createElement("div");
-    row.className = "ticket-row";
-    const reference = document.createElement("div");
-    reference.className = "ticket-reference";
-    const dot = document.createElement("i");
-    dot.setAttribute("aria-label", `${operationLabel(ticket.priority)} priority`);
-    const id = document.createElement("span");
-    const fullReference = ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`;
-    id.setAttribute("data-i18n-skip", "");
-    id.textContent = ticketReferenceLabel(ticket.id);
-    reference.title = fullReference;
-    reference.append(dot, id);
-    const body = document.createElement("div");
-    body.className = "ticket-body";
+  visible.forEach((ticket) => {
+    const row = consoleRow(`ticket-row priority-${ticket.priority}`, () => consoleOpenTicket(ticket.id));
+    row.dataset.ticketId = ticket.id;
+    row.classList.toggle("is-selected", consoleState.ticketId === ticket.id);
+    const reference = consoleCell(ticketReferenceLabel(ticket.id), "cell cell-mono");
+    reference.setAttribute("data-i18n-skip", "");
+    reference.title = ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`;
+    const titleCell = document.createElement("span");
+    titleCell.className = "cell-main";
+    const titleLine = document.createElement("span");
+    titleLine.className = "ticket-row-title";
     const title = document.createElement("strong");
     title.setAttribute("data-i18n-skip", "");
     title.textContent = ticket.title;
-    const meta = document.createElement("small");
-    const relative = ticketRelativeTime(ticket.updated_at);
-    meta.textContent = [ticket.assignee ? `Assigned to ${ticket.assignee}` : "Unassigned", relative ? `Updated ${relative}` : null].filter(Boolean).join(" · ");
-    if (ticket.updated_at) meta.title = ticketDateLabel(ticket.updated_at);
-    const facts = document.createElement("div");
-    facts.className = "ticket-facts";
-    [ticket.integration ? operationLabel(ticket.integration) : null, ticket.tenant, ticket.site, ticket.requester ? `By ${ticket.requester}` : null, Number.isSafeInteger(ticket.comments) ? `${ticket.comments} comments` : null]
-      .filter(Boolean)
-      .slice(0, 3)
-      .forEach((value) => {
-        const fact = document.createElement("span");
-        fact.setAttribute("data-i18n-skip", "");
-        fact.textContent = value;
-        facts.append(fact);
-      });
-    body.append(title, meta, facts);
-    const lifecycle = document.createElement("div");
-    lifecycle.className = "ticket-lifecycle";
-    const status = document.createElement("span");
-    status.className = `ticket-status status-${ticket.status}`;
-    status.textContent = ticketStatusLabel(ticket.status);
-    const workflow = document.createElement("small");
-    workflow.className = "ticket-workflow";
-    const workflowConflict = (ticket.status === "closed" || ticket.status === "done") && !["closed", "done", "unknown"].includes(ticket.workflow);
-    const workflowAligned = ticket.status === ticket.workflow;
-    if (workflowConflict) workflow.classList.add("is-conflict");
-    workflow.textContent = workflowConflict
-      ? `Workflow mismatch · ${ticketStatusLabel(ticket.workflow)}`
-      : workflowAligned
-        ? "Lifecycle and workflow aligned"
-        : `Workflow · ${ticketStatusLabel(ticket.workflow)}`;
-    lifecycle.append(status, workflow);
-    const actions = document.createElement("div");
-    actions.className = "ticket-actions";
-    const detailId = `ticket-details-${index}`;
-    const detailsButton = document.createElement("button");
-    detailsButton.type = "button";
-    detailsButton.textContent = "Details";
-    detailsButton.setAttribute("aria-expanded", "false");
-    detailsButton.setAttribute("aria-controls", detailId);
-    const ask = document.createElement("button");
-    ask.type = "button";
-    ask.textContent = "Review";
-    ask.dataset.openChat = `Review this ${ticket.integration || "work"} item ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action without conflating Support, Manage, or GitHub state.`;
-    actions.append(detailsButton, ask);
-    const href = safeTicketLink(ticket.url);
-    if (href) {
-      const openLink = document.createElement("a");
-      openLink.href = href;
-      openLink.target = "_blank";
-      openLink.rel = "noreferrer";
-      openLink.textContent = "Open ↗";
-      actions.append(openLink);
+    titleLine.append(title);
+    if (Number.isSafeInteger(ticket.comments) && ticket.comments > 0) {
+      const comments = document.createElement("span");
+      comments.className = "comments";
+      comments.textContent = String(ticket.comments);
+      comments.setAttribute("aria-label", `${ticket.comments} comments`);
+      titleLine.append(comments);
     }
-    const details = document.createElement("div");
-    details.className = "ticket-details";
-    details.id = detailId;
-    details.hidden = true;
-    [
-      ["Ticket ID", fullReference],
-      ["Integration", ticket.integration ? operationLabel(ticket.integration) : null],
-      ["Configured server", ticket.integration_server],
-      ["Priority", operationLabel(ticket.priority)],
-      ["Workflow", ticketStatusLabel(ticket.workflow)],
-      ["Assignee", ticket.assignee || "Unassigned"],
-      ["Requester", ticket.requester],
-      ["Tenant", ticket.tenant],
-      ["Site", ticket.site],
-      ["Source", ticket.source],
-      ["Comments", Number.isSafeInteger(ticket.comments) ? String(ticket.comments) : null],
-      ["Created", ticket.created_at ? ticketDateLabel(ticket.created_at) : null, ticket.created_at],
-      ["Updated", ticket.updated_at ? ticketDateLabel(ticket.updated_at) : null, ticket.updated_at],
-    ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(ticketDetail(labelText, value, exact)));
-    detailsButton.addEventListener("click", () => {
-      const expanded = detailsButton.getAttribute("aria-expanded") === "true";
-      detailsButton.setAttribute("aria-expanded", String(!expanded));
-      detailsButton.textContent = expanded ? "Details" : "Hide details";
-      details.hidden = expanded;
-      card.classList.toggle("is-expanded", !expanded);
-    });
-    row.append(reference, body, lifecycle, actions);
-    card.append(row, details);
-    root.append(card);
+    const context = document.createElement("small");
+    context.setAttribute("data-i18n-skip", "");
+    context.textContent = [ticket.site || ticket.tenant, ticket.requester].filter(Boolean).join(" · ");
+    titleCell.append(titleLine);
+    if (context.textContent) titleCell.append(context);
+    const source = document.createElement("span");
+    source.className = "source-pill";
+    source.textContent = ticket.integration ? operationLabel(ticket.integration) : "Other";
+    const workflowConflict = (ticket.status === "closed" || ticket.status === "done") && !["closed", "done", "unknown"].includes(ticket.workflow);
+    const status = consoleBadge(ticketStatusLabel(ticket.status), ticketStatusTone(ticket.status));
+    status.classList.add("ticket-status", `status-${ticket.status}`);
+    if (workflowConflict) status.title = `Workflow mismatch · ${ticketStatusLabel(ticket.workflow)}`;
+    const priority = consolePriority(ticket.priority);
+    const assignee = consoleCell(ticket.assignee || "Unassigned", "cell");
+    assignee.setAttribute("data-i18n-skip", "");
+    if (!ticket.assignee) assignee.removeAttribute("data-i18n-skip");
+    const relative = ticketRelativeTime(ticket.updated_at);
+    const updated = consoleCell(relative || "", "cell cell-time");
+    if (ticket.updated_at) updated.title = ticketDateLabel(ticket.updated_at);
+    row.append(reference, titleCell, consoleCellWrap(source), consoleCellWrap(status), consoleCellWrap(priority), assignee, updated);
+    root.append(row);
   });
+  root.closest(".table").classList.toggle("no-updated", !visible.some((ticket) => ticketRelativeTime(ticket.updated_at)));
+  consoleCapList(root, "tickets", "data-ticket-id", consoleState.ticketId);
+  consoleRefreshTicketDrawer();
+}
+
+function ticketStatusTone(status) {
+  return { open: "info", triaging: "info", in_progress: "warn", blocked: "danger", done: "ok", closed: "quiet" }[status] || "quiet";
+}
+
+function renderTicketDrawer(ticket) {
+  byId("ticket-drawer-kicker").textContent = `${ticket.integration ? operationLabel(ticket.integration) : "Work"} ticket · ${ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`}`;
+  const title = byId("ticket-drawer-title");
+  title.setAttribute("data-i18n-skip", "");
+  title.textContent = ticket.title;
+  const body = byId("ticket-drawer-body");
+  body.replaceChildren();
+  const badges = document.createElement("div");
+  badges.className = "drawer-badges";
+  badges.append(consoleBadge(ticketStatusLabel(ticket.status), ticketStatusTone(ticket.status)), consolePriority(ticket.priority));
+  const workflowConflict = (ticket.status === "closed" || ticket.status === "done") && !["closed", "done", "unknown"].includes(ticket.workflow);
+  if (ticket.workflow && ticket.workflow !== ticket.status) {
+    badges.append(consoleBadge(workflowConflict ? `Workflow mismatch · ${ticketStatusLabel(ticket.workflow)}` : `Workflow · ${ticketStatusLabel(ticket.workflow)}`, workflowConflict ? "warn" : "quiet"));
+  }
+  const actions = document.createElement("div");
+  actions.className = "drawer-actions";
+  const ask = document.createElement("button");
+  ask.type = "button";
+  ask.className = "button primary small";
+  ask.textContent = "Review with assistant";
+  ask.dataset.openChat = `Review this ${ticket.integration || "work"} item ${ticket.id}: “${ticket.title}”. Summarize its current state and recommend the next action without conflating Support, Manage, or GitHub state.`;
+  actions.append(ask);
+  const href = safeTicketLink(ticket.url);
+  if (href) {
+    const openLink = document.createElement("a");
+    openLink.className = "button ghost small";
+    openLink.href = href;
+    openLink.target = "_blank";
+    openLink.rel = "noreferrer";
+    openLink.textContent = `Open in ${ticket.integration ? operationLabel(ticket.integration) : "source"} ↗`;
+    actions.append(openLink);
+  }
+  const summary = document.createElement("section");
+  summary.className = "drawer-section";
+  summary.append(badges, actions);
+  const detailsSection = document.createElement("section");
+  detailsSection.className = "drawer-section";
+  const detailsTitle = document.createElement("h3");
+  detailsTitle.textContent = "Details";
+  const details = document.createElement("div");
+  details.className = "ticket-details";
+  [
+    ["Assigned to", ticket.assignee || "Unassigned"],
+    ["Requested by", ticket.requester],
+    ["Client", ticket.tenant],
+    ["Site", ticket.site],
+    ["Comments", Number.isSafeInteger(ticket.comments) ? String(ticket.comments) : null],
+    ["Created", ticket.created_at ? ticketDateLabel(ticket.created_at) : null, ticket.created_at],
+    ["Updated", ticket.updated_at ? ticketDateLabel(ticket.updated_at) : null, ticket.updated_at],
+    ["Came from", ticket.source],
+    ["Service", ticket.integration_server],
+    ["Ticket ID", ticket.id.startsWith("#") ? ticket.id : `#${ticket.id}`],
+  ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(ticketDetail(labelText, value, exact)));
+  detailsSection.append(detailsTitle, details);
+  body.append(summary, detailsSection);
 }
 
 function renderOperations(view) {
@@ -3167,12 +4060,13 @@ function renderOperations(view) {
   byId("operations-banner").dataset.state = view.health;
   byId("operations-health").textContent = title;
   byId("operations-detail").textContent = detail;
-  byId("operations-authority").textContent = ["attached", "degraded"].includes(view.health) ? "AUTHORITY BOUNDED" : "NOT ATTACHED";
+  byId("operations-authority").textContent = ["attached", "degraded"].includes(view.health) ? "CONNECTED" : "NOT CONNECTED";
   byId("operations-tools").textContent = count(view.tools_total);
   byId("operations-reads").textContent = count(view.read_only_tools);
   byId("operations-actions").textContent = count(view.approval_tools);
   byId("operations-pending").textContent = count(view.pending_actions);
   byId("operations-catalog-tag").textContent = ["attached", "degraded"].includes(view.health) ? `${count(view.tools_total)} LIVE` : "UNAVAILABLE";
+  byId("operations-catalog-tag").dataset.state = ["attached", "degraded"].includes(view.health) ? "ready" : "unavailable";
   renderOperationsCatalog(view.tools || []);
   renderTickets();
 }
@@ -3185,9 +4079,9 @@ async function loadOperations(force = false) {
     if (force) toast("AI Operations and tickets refreshed.");
   } catch (error) {
     byId("operations-banner").dataset.state = "unavailable";
-    byId("operations-health").textContent = "AI Operations unavailable";
+    byId("operations-health").textContent = "Support and Manage are not answering";
     byId("operations-detail").textContent = error.message;
-    byId("tickets-state").textContent = "Work queues unavailable";
+    byId("tickets-state").textContent = "Tickets are not available right now";
     toast("AI Operations could not be refreshed.", "error");
   } finally {
     [byId("operations-refresh"), byId("tickets-refresh")].forEach((button) => { button.disabled = false; });
@@ -3726,14 +4620,23 @@ function label(value) {
 }
 
 const configurationSectionMeta = Object.freeze({
-  "Web boundary": { category: "security", description: "Authenticated network boundary and request limits." },
-  Memory: { category: "ai", description: "Durable evidence, retention and retrieval behavior." },
-  "Agent authentication": { category: "ai security", description: "Verified execution access for connected agent surfaces." },
-  Providers: { category: "ai", description: "Contained model execution and provider readiness." },
-  Connectors: { category: "integrations", description: "Channels and external service connections." },
-  "Manage AI Operations": { category: "integrations ai", description: "Live tools, tickets and approval-aware control plane." },
-  "Governance & safety": { category: "security", description: "Approval, audit, backup and observation controls." },
-  "Extensions & automation": { category: "ai integrations", description: "MCP, knowledge, skills and automation surfaces." },
+  "Web boundary": { category: "security", description: "Who can reach this page and request limits." },
+  Memory: { category: "ai", description: "How Monique stores and finds what it remembers." },
+  "Agent authentication": { category: "ai security", description: "Whether agents are signed in and ready to work." },
+  Providers: { category: "ai", description: "The AI models Monique uses." },
+  Connectors: { category: "integrations", description: "Slack, Telegram, GitHub and other connections." },
+  "Manage AI Operations": { category: "integrations ai", description: "Tools and tickets from Manage." },
+  "Governance & safety": { category: "security", description: "Approvals, audit log and backups." },
+  "Extensions & automation": { category: "ai integrations", description: "Extra tools, knowledge and automations." },
+});
+const configurationSectionTitles = Object.freeze({
+  "Web boundary": "Web access",
+  "Agent authentication": "Agent sign-in",
+  Providers: "AI providers",
+  Connectors: "Connections",
+  "Manage AI Operations": "Manage",
+  "Governance & safety": "Safety",
+  "Extensions & automation": "Extensions",
 });
 
 function configurePrompt(title) {
@@ -3758,8 +4661,8 @@ function authenticationLabel(status) {
 }
 
 function configurationValue(key, value) {
-  if (typeof value === "boolean") return value ? "CONFIGURED" : "OFF";
-  if (value === null || value === undefined) return "—";
+  if (typeof value === "boolean") return value ? "On" : "Off";
+  if (value === null || value === undefined) return "-";
   if (key.endsWith("_at_ms") && Number.isSafeInteger(value) && value > 0) {
     return new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(value);
   }
@@ -3784,7 +4687,7 @@ function renderConfigSection(title, values) {
   eyebrow.className = "config-eyebrow";
   eyebrow.textContent = metadata.category.includes("integrations") ? "INTEGRATION" : metadata.category === "ai" ? "INTELLIGENCE" : "SYSTEM";
   const heading = document.createElement("h2");
-  heading.textContent = title;
+  heading.textContent = configurationSectionTitles[title] || title;
   const description = document.createElement("p");
   description.textContent = metadata.description;
   headingText.append(eyebrow, heading, description);
@@ -3795,7 +4698,7 @@ function renderConfigSection(title, values) {
     state.textContent = authenticationLabel(values.status);
     state.dataset.state = values.status || "unavailable";
   } else {
-    state.textContent = configuredValues.length === 0 || configuredValues.some(Boolean) ? "ACTIVE" : "OFF";
+    state.textContent = configuredValues.length === 0 || configuredValues.some(Boolean) ? "ON" : "OFF";
   }
   headingWrap.append(headingText, state);
   const list = document.createElement("dl");
@@ -3817,11 +4720,11 @@ function renderConfigSection(title, values) {
   const footer = document.createElement("div");
   footer.className = "config-card-footer";
   const scope = document.createElement("small");
-  scope.textContent = "Effective · secret-safe";
+  scope.textContent = "From the server · no secrets";
   const action = document.createElement("button");
   action.className = "config-inline-action";
   action.type = "button";
-  action.textContent = "Configure with Monique →";
+  action.textContent = "Ask assistant →";
   action.dataset.chatPrompt = configurePrompt(title);
   footer.append(scope, action);
   card.append(headingWrap, list, footer);
@@ -3846,7 +4749,7 @@ function applyConfigurationFilter() {
 function updateConfigurationSummary(config) {
   const connections = Object.values(config.connectors || {}).filter((value) => value === true).length;
   byId("configuration-connections-state").textContent = `${connections} connected`;
-  byId("configuration-manage-state").textContent = config.manage?.configured ? "Connected" : "Not attached";
+  byId("configuration-manage-state").textContent = config.manage?.configured ? "Connected" : "Not connected";
   const authStatus = config.agent_authentication?.status || "unavailable";
   byId("configuration-auth-summary").dataset.state = authStatus;
   byId("configuration-auth-state").textContent = authenticationLabel(authStatus);
@@ -4619,7 +5522,7 @@ async function resolveChatAction(card, decision) {
     const sources = Array.isArray(answer.live_sources) ? answer.live_sources : [];
     appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action, speak: true });
     byId("chat-source-count").textContent = count(sources.length);
-    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : "—";
+    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : "-";
     byId("chat-state").textContent = decision === "approve" ? "Action completed" : "Action denied";
     toast(decision === "approve" ? "The approved action returned a result." : "The action was denied.");
   } catch (error) {
@@ -4984,9 +5887,9 @@ byId("new-chat").addEventListener("click", async () => {
     await api("/api/chat/new", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     byId("chat-thread").replaceChildren(createWelcome("New conversation", "The previous durable conversation was archived. Long-term memory remains available."));
     byId("chat-state").textContent = "New durable session";
-    byId("chat-memory-count").textContent = "—";
+    byId("chat-memory-count").textContent = "-";
     byId("chat-source-count").textContent = "0";
-    byId("chat-latency").textContent = "—";
+    byId("chat-latency").textContent = "-";
     toast("A new durable conversation is ready.");
   } catch (error) {
     byId("chat-state").textContent = `New chat refused · ${error.message}`;
@@ -5082,7 +5985,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 // The operator mints a single-use invite and the phone reads it. Everything
 // here is deliberately local: the symbol is drawn from the vendored encoder in
 // `/assets/qrcode.js` and rendered as inline SVG, because the dashboard's own
-// policy is `default-src 'none'` with `img-src 'self'` — a data: image would be
+// policy is `default-src 'none'` with `img-src 'self'` - a data: image would be
 // refused and a remote generator is both blocked and a place a live credential
 // must never go.
 // ---------------------------------------------------------------------------
@@ -5191,7 +6094,7 @@ async function pairingLoadSessions() {
       const option = document.createElement("option");
       option.value = id;
       option.selected = true;
-      option.textContent = entry.session?.summary ? `${id} — ${entry.session.summary}` : id;
+      option.textContent = entry.session?.summary ? `${id} - ${entry.session.summary}` : id;
       option.setAttribute("data-i18n-skip", "");
       select.append(option);
     }
@@ -5289,3 +6192,308 @@ document.addEventListener("click", (event) => {
 byId("pairing-start-task").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
 
 byId("pairing-manage-work").addEventListener("change", () => { byId("pairing-create").disabled = byId("pairing-sessions").options.length === 0 && !byId("pairing-start-task").checked && !byId("pairing-manage-work").checked; });
+
+// ---------------------------------------------------------------------------
+// Ops console shell: detail drawers, list keyboard navigation, tab badges and
+// the Ctrl+K command palette.
+// ---------------------------------------------------------------------------
+
+document.querySelectorAll("[data-drawer-close]").forEach((button) => button.addEventListener("click", () => consoleCloseDrawer(button.dataset.drawerClose)));
+
+function consoleCloseDrawer(id) {
+  if (id === "task-drawer") {
+    consoleState.taskDrawerDismissed = true;
+    if (platformSelectedSession) detachPlatformSession();
+  } else if (id === "ticket-drawer") {
+    consoleState.ticketId = null;
+    consoleMarkSelected(byId("ticket-list"), "data-ticket-id", null);
+  } else if (id === "ops-drawer") {
+    consoleCloseOps();
+  } else if (id === "memory-drawer") {
+    consoleState.memoryOpen = false;
+    if (memorySnapshot) renderSelectedMemory();
+  }
+  consoleDrawer(id, false);
+  document.querySelector(".view.is-visible .view-main [data-row].is-selected, .view.is-visible .view-main [data-row]")?.focus({ preventScroll: true });
+}
+
+document.querySelector("[data-drawer-pane='workspace']").addEventListener("click", () => consoleShowTaskPane("workspace"));
+document.querySelectorAll("[data-cockpit-surface]").forEach((button) => button.addEventListener("click", () => {
+  const workspaceTab = document.querySelector("[data-drawer-pane='workspace']");
+  byId("drawer-workspace-pane").hidden = true;
+  workspaceTab.classList.remove("is-active");
+  workspaceTab.setAttribute("aria-selected", "false");
+  workspaceTab.tabIndex = -1;
+  consoleSyncTaskDrawerTitle();
+}));
+new MutationObserver(() => {
+  if (byId("platform-session-detail").hidden && consoleTaskPane() === "conversation" && consoleDrawerIsOpen("task-drawer") && !platformSelectedSession) {
+    consoleDrawer("task-drawer", false);
+  }
+  consoleSyncTaskDrawerTitle();
+}).observe(byId("platform-session-detail"), { attributes: true, attributeFilter: ["hidden"] });
+
+// Small inline counters recede when they read zero.
+function consoleSyncStats() {
+  document.querySelectorAll(".stat").forEach((stat) => {
+    const value = stat.querySelector("b")?.textContent.trim();
+    if (value === undefined) return;
+    if (/^[0-9]/.test(value)) stat.dataset.zero = String(value === "0");
+    else delete stat.dataset.zero;
+  });
+  const badges = [
+    ["tab-badge-sessions", "cockpit-needs-you-count", "info"],
+    ["tab-badge-tickets", "tickets-urgent", "danger"],
+    ["tab-badge-operations", "process-failed", "danger"],
+    ["tab-badge-overview", "metric-attention", "danger"],
+  ];
+  badges.forEach(([badgeId, sourceId, tone]) => {
+    const value = byId(sourceId)?.textContent.trim() || "";
+    const badge = byId(badgeId);
+    const show = /^[1-9][0-9]*$/.test(value.replace(/[\s,. ]/g, ""));
+    badge.hidden = !show;
+    badge.textContent = show ? value : "";
+    badge.dataset.tone = tone;
+  });
+}
+let consoleStatsQueued = false;
+new MutationObserver(() => {
+  if (consoleStatsQueued) return;
+  consoleStatsQueued = true;
+  window.requestAnimationFrame(() => {
+    consoleStatsQueued = false;
+    consoleSyncStats();
+  });
+}).observe(byId("workspace"), { subtree: true, childList: true, characterData: true });
+consoleSyncStats();
+
+// Load the counters behind the tab badges once, so they are right before a tab is opened.
+if (!operationsSnapshot) loadOperations();
+if (!processesSnapshot) loadProcesses();
+if (!document.querySelector('[data-panel="sessions"]').classList.contains("is-visible")) loadPlatform();
+
+function consoleVisibleRows() {
+  const view = document.querySelector(".view.is-visible");
+  if (!view) return [];
+  return [...view.querySelectorAll(".view-main [data-row]")].filter((row) => row.offsetParent !== null);
+}
+
+function consoleMoveCursor(step) {
+  const rows = consoleVisibleRows();
+  if (rows.length === 0) return;
+  let index = rows.indexOf(document.activeElement);
+  if (index < 0) index = rows.findIndex((row) => row.classList.contains("is-selected") || row.getAttribute("aria-selected") === "true");
+  const next = index < 0 ? (step > 0 ? 0 : rows.length - 1) : Math.max(0, Math.min(rows.length - 1, index + step));
+  const row = rows[next];
+  row.focus({ preventScroll: true });
+  row.scrollIntoView({ block: "nearest" });
+  const drawerOpen = document.querySelector(".view.is-visible .drawer.is-open");
+  if (drawerOpen && next !== index) row.click();
+}
+
+function consoleEditing(target) {
+  return target.matches?.("input, textarea, select, [contenteditable='true']");
+}
+
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    consolePaletteOpen(byId("command-palette").hidden);
+    return;
+  }
+  if (!byId("command-palette").hidden) return;
+  const editing = consoleEditing(event.target);
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+  const onRow = event.target.closest?.("[data-row]");
+  if (!editing && (event.key === "j" || (onRow && event.key === "ArrowDown"))) {
+    event.preventDefault();
+    consoleMoveCursor(1);
+  } else if (!editing && (event.key === "k" || (onRow && event.key === "ArrowUp"))) {
+    event.preventDefault();
+    consoleMoveCursor(-1);
+  } else if (onRow && !onRow.matches("button") && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    onRow.click();
+  } else if (event.key === "Escape" && byId("appearance-panel").hidden && byId("pairing-panel").hidden) {
+    const drawer = document.querySelector(".view.is-visible .drawer.is-open");
+    if (!drawer || (editing && event.target.value)) return;
+    event.preventDefault();
+    consoleCloseDrawer(drawer.id);
+  } else if (!editing && document.querySelector('[data-panel="sessions"]')?.classList.contains("is-visible") && ["c", "a"].includes(event.key.toLowerCase())) {
+    consoleDrawer("task-drawer", true);
+    consoleShowTaskPane(event.key.toLowerCase() === "c" ? "conversation" : "activity");
+  }
+});
+
+// ------------------------------------------------------------- command palette
+
+let consolePaletteItems = [];
+let consolePaletteIndex = 0;
+let consolePaletteReturnFocus = null;
+
+function consolePaletteOpen(open) {
+  byId("command-palette").hidden = !open;
+  byId("command-backdrop").hidden = !open;
+  byId("command-open").setAttribute("aria-expanded", String(open));
+  if (open) {
+    consolePaletteReturnFocus = document.activeElement;
+    byId("command-input").value = "";
+    consolePaletteRender();
+    byId("command-input").focus();
+  } else if (consolePaletteReturnFocus?.isConnected) {
+    consolePaletteReturnFocus.focus({ preventScroll: true });
+  }
+}
+
+function consoleNextTheme() {
+  const current = document.documentElement.dataset.theme;
+  return current === "light" ? "dark" : current === "dark" ? "system" : "light";
+}
+
+function consoleRefreshAll() {
+  refreshStatus({ announce: true });
+  const view = document.querySelector(".view.is-visible")?.dataset.panel;
+  if (view === "sessions") loadPlatform();
+  if (view === "operations") loadProcesses();
+  if (view === "operations" || view === "tickets") loadOperations(true);
+  if (view === "memory") loadMemory(memoryQuery);
+  if (view === "configuration") loadConfiguration(true);
+}
+
+function consoleCommands(query) {
+  const go = (view, label, hint) => ({ group: "Go to", icon: "→", label, hint, run: () => showView(view) });
+  const themeLabels = { light: "Switch to light theme", dark: "Switch to dark theme", system: "Use the system theme" };
+  const commands = [
+    { group: "Actions", icon: "+", label: "New task", keywords: "create run start", run: () => { showView("sessions"); byId("platform-task-text").focus(); } },
+    { group: "Actions", icon: "↻", label: "Refresh", keywords: "reload update", hint: "R", run: consoleRefreshAll },
+    { group: "Actions", icon: "◐", label: themeLabels[consoleNextTheme()], keywords: "theme dark light colour color appearance", run: () => applyTheme(consoleNextTheme()) },
+    { group: "Actions", icon: "A", label: currentLanguage === "en" ? "Passer en français" : "Switch to English", keywords: "language langue french anglais english français", run: () => applyLanguage(currentLanguage === "en" ? "fr" : "en") },
+    { group: "Actions", icon: "Aa", label: "Appearance settings", keywords: "theme text size density", run: () => appearanceOpen(true) },
+    { group: "Actions", icon: "▢", label: "Pair a phone", keywords: "mobile qr invite", run: () => { showView("overview"); pairingOpen(true); } },
+    { group: "Actions", icon: "?", label: "Ask the assistant", keywords: "chat help question", hint: "/", run: () => { showView("chat"); byId("chat-input").focus(); } },
+    go("sessions", "Tasks", "N"),
+    go("tickets", "Tickets"),
+    go("operations", "Agents"),
+    go("memory", "Memory"),
+    go("overview", "Health"),
+    go("configuration", "Settings"),
+    go("chat", "Assistant"),
+  ];
+  const needle = query.trim().toLocaleLowerCase(localeTag());
+  const matches = (text) => String(text || "").toLocaleLowerCase(localeTag()).includes(needle);
+  const filtered = needle
+    ? commands.filter((command) => matches(translatePhrase(command.label)) || matches(command.label) || matches(command.keywords))
+    : commands;
+  if (!needle) return filtered;
+  const results = [];
+  (operationsSnapshot?.tickets?.items || [])
+    .filter((ticket) => matches(ticket.title) || matches(ticket.id) || matches(ticket.site) || matches(ticket.requester))
+    .slice(0, 5)
+    .forEach((ticket) => results.push({ group: "Tickets", icon: "#", label: ticket.title, raw: true, hint: ticketReferenceLabel(ticket.id), run: () => { showView("tickets"); consoleOpenTicket(ticket.id); } }));
+  (platformSnapshot?.sessions || [])
+    .filter((session) => matches(consoleSessionTitle(session)) || matches(session.session?.resource?.id))
+    .slice(0, 4)
+    .forEach((session) => results.push({ group: "Conversations", icon: "◦", label: consoleSessionTitle(session), raw: true, run: () => { showView("sessions"); consoleOpenSession(session.session.resource.id); } }));
+  (memorySnapshot?.entries || [])
+    .filter((entry) => matches(entry.content) || matches(entry.reference))
+    .slice(0, 3)
+    .forEach((entry) => results.push({ group: "Memory", icon: "◇", label: entry.content, raw: true, hint: entry.reference, run: () => { showView("memory"); consoleOpenMemory(entry.reference); } }));
+  const quoted = query.trim();
+  results.push(
+    { group: "Search", icon: "⌕", label: `Search tickets for “${quoted}”`, run: () => { showView("tickets"); const input = byId("tickets-search"); input.value = quoted; input.dispatchEvent(new Event("input", { bubbles: true })); } },
+    { group: "Search", icon: "⌕", label: `Search memory for “${quoted}”`, run: () => { showView("memory"); byId("memory-query").value = quoted; loadMemory(quoted); } },
+    { group: "Search", icon: "?", label: `Ask the assistant: “${quoted}”`, run: () => seedChatPrompt(quoted) },
+  );
+  return [...filtered, ...results];
+}
+
+function consolePaletteRender() {
+  const query = byId("command-input").value;
+  consolePaletteItems = consoleCommands(query);
+  consolePaletteIndex = 0;
+  const list = byId("command-list");
+  list.replaceChildren();
+  if (consolePaletteItems.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "command-empty";
+    empty.textContent = translatePhrase("No matching command");
+    list.append(empty);
+    return;
+  }
+  let group = null;
+  consolePaletteItems.forEach((command, index) => {
+    if (command.group !== group) {
+      group = command.group;
+      const heading = document.createElement("li");
+      heading.className = "command-group";
+      heading.setAttribute("role", "presentation");
+      heading.textContent = translatePhrase(group);
+      list.append(heading);
+    }
+    const item = document.createElement("li");
+    item.className = "command-item";
+    item.id = `command-item-${index}`;
+    item.setAttribute("role", "option");
+    item.setAttribute("data-i18n-skip", "");
+    const icon = document.createElement("span");
+    icon.className = "command-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = command.icon || "";
+    const label = document.createElement("span");
+    label.className = "command-label";
+    label.textContent = command.raw ? command.label : consoleTranslateCommand(command.label);
+    item.append(icon, label);
+    if (command.hint) {
+      const hint = document.createElement("span");
+      hint.className = "command-hint";
+      hint.textContent = command.hint;
+      item.append(hint);
+    }
+    item.addEventListener("mousemove", () => consolePaletteSelect(index));
+    item.addEventListener("click", () => consolePaletteRun(index));
+    list.append(item);
+  });
+  consolePaletteSelect(0);
+}
+
+function consoleTranslateCommand(label) {
+  const quoted = label.match(/^(Search tickets for|Search memory for|Ask the assistant:) “(.*)”$/);
+  if (quoted && currentLanguage === "fr") return `${translatePhrase(quoted[1])} « ${quoted[2]} »`;
+  return translatePhrase(label);
+}
+
+function consolePaletteSelect(index) {
+  consolePaletteIndex = index;
+  byId("command-list").querySelectorAll(".command-item").forEach((item) => {
+    const active = item.id === `command-item-${index}`;
+    item.setAttribute("aria-selected", String(active));
+    if (active) item.scrollIntoView({ block: "nearest" });
+  });
+  byId("command-input").setAttribute("aria-activedescendant", `command-item-${index}`);
+}
+
+function consolePaletteRun(index) {
+  const command = consolePaletteItems[index];
+  if (!command) return;
+  consolePaletteReturnFocus = null;
+  consolePaletteOpen(false);
+  command.run();
+}
+
+byId("command-open").addEventListener("click", () => consolePaletteOpen(true));
+byId("command-backdrop").addEventListener("click", () => consolePaletteOpen(false));
+byId("command-input").addEventListener("input", consolePaletteRender);
+byId("command-input").addEventListener("keydown", (event) => {
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const total = consolePaletteItems.length;
+    if (total) consolePaletteSelect((consolePaletteIndex + (event.key === "ArrowDown" ? 1 : -1) + total) % total);
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    consolePaletteRun(consolePaletteIndex);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    consolePaletteOpen(false);
+  }
+});
