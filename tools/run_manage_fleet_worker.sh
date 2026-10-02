@@ -887,7 +887,9 @@ log_provider_line() {
         ' <<<"$line" 2>/dev/null) || text=
     elif [[ "$selected_provider" == jcode ]]; then
         text=$(jq -r '
-            if .type == "done" then (.text // empty)
+            if .type == "done" then
+                # The answer and its double-check arrive glued together.
+                ((.text // empty) | gsub("(?<link>#issuecomment-[0-9]+)(?<next>[[:alpha:]])"; "\(.link)\n\n\(.next)"))
             elif .type == "tool_input" then
                 # Each tool call states its purpose; that is what an operator
                 # reading the run wants, not the bare tool name.
@@ -1042,7 +1044,7 @@ run_job() {
                 JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
                 JCODE_SERVER_EXECUTABLE="$selected_binary" \
                 "$selected_binary" --quiet --no-update --no-selfdev run --ndjson \
-                    --disabled-tools browser - \
+                    --disabled-tools browser,swarm - \
                 >"$output" 2>"$error_output" &
     else
         cd -- "$cwd" || {
