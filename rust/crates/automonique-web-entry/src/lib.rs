@@ -2216,6 +2216,8 @@ struct ChatPromptContext<'a> {
     live_sites: Option<&'a LiveSiteContext>,
     live_knowledge: Option<&'a str>,
     live_processes: Option<&'a str>,
+    /// The Manage fleet worker's agent runs, when the turn asks about them.
+    live_agent_runs: Option<&'a str>,
     manage_page: Option<&'a str>,
     manage: &'a ManageIntegration,
 }
@@ -3454,6 +3456,8 @@ impl WebIntegration {
             .is_none()
             .then(|| self.knowledge_context(message))
             .flatten();
+        let agent_runs_context = (direct_answer.is_none() && is_agent_run_question(message))
+            .then(|| render_agent_runs(&self.processes()));
         let process_context = if direct_answer.is_none() && is_pm2_process_question(message) {
             Some(automonique_daemon::pm2_inventory::current().map_or_else(
                 |_| String::from("source=PM2 jlist sanitized read model\nstatus=unavailable"),
@@ -3506,6 +3510,9 @@ impl WebIntegration {
         if process_context.is_some() {
             live_sources.push(String::from("host:pm2"));
         }
+        if agent_runs_context.is_some() {
+            live_sources.push(String::from("manage:agent-runs"));
+        }
         let prompt = compose_chat_prompt(
             message,
             &history,
@@ -3520,6 +3527,7 @@ impl WebIntegration {
                 live_sites: site_context.as_ref(),
                 live_knowledge: knowledge_context.as_deref(),
                 live_processes: process_context.as_deref(),
+                live_agent_runs: agent_runs_context.as_deref(),
                 manage_page,
                 manage: &self.manage,
             },
@@ -5460,6 +5468,7 @@ fn compose_chat_prompt(
             requested(context.live_github_issues, REFERENCED_ISSUES_BUDGET),
             requested(context.live_github.map(|(_, content)| content), 8_000),
             requested(context.live_manage.map(|(_, content)| content), 8_000),
+            requested(context.live_agent_runs, 3_500),
             requested(context.live_processes, 3_000),
             requested(
                 context.live_slack.map(|(_, content)| content),
@@ -5482,6 +5491,7 @@ fn compose_chat_prompt(
         issues_budget,
         github_budget,
         manage_budget,
+        agent_runs_budget,
         processes_budget,
         slack_budget,
         sites_budget,
@@ -5537,6 +5547,11 @@ fn compose_chat_prompt(
         push_bounded(&mut prompt, knowledge, knowledge_budget);
         prompt.push_str("\n[/live_tool]\n");
     }
+    if let Some(runs) = context.live_agent_runs.filter(|_| agent_runs_budget > 0) {
+        prompt.push_str("[live_tool capability=manage_agent_runs freshness=request_time trust=untrusted_data]\n");
+        push_bounded(&mut prompt, runs, agent_runs_budget);
+        prompt.push_str("\n[/live_tool]\n");
+    }
     if let Some(processes) = context.live_processes.filter(|_| processes_budget > 0) {
         prompt.push_str("[live_tool capability=pm2_process_inventory freshness=request_time trust=untrusted_data]\n");
         push_bounded(&mut prompt, processes, processes_budget);
@@ -5554,6 +5569,78 @@ fn compose_chat_prompt(
     prompt.push_str(message);
     prompt.push_str("\n[/user_message]");
     prompt
+}
+
+/// Whether a chat turn asks about agent runs, their approvals or the queue.
+fn is_agent_run_question(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "agent run",
+        "agent runs",
+        "approval",
+        "approve",
+        "pending",
+        "queue",
+        "queued",
+        "job",
+        "jobs",
+        "worker",
+        "running",
+        "failed run",
+        "exécution",
+        "exécutions",
+        "approbation",
+        "approuver",
+        "en attente",
+        "file d",
+        "worker",
+        "tâches en cours",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// A compact, typed projection of the fleet worker's runs for the model:
+/// counts by status, then every run that is not finished, newest first.
+fn render_agent_runs(snapshot: &ProcessSnapshotView) -> String {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for job in &snapshot.jobs {
+        *counts.entry(job.status.as_str()).or_default() += 1;
+    }
+    let mut out = format!(
+        "source=manage_fleet_worker health={} total={} counts={}\n",
+        snapshot.health,
+        snapshot.jobs.len(),
+        counts
+            .iter()
+            .map(|(status, count)| format!("{status}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    out.push_str("pending_approval means the run waits for the operator's approval in Manage before anything executes.\n");
+    let mut open: Vec<&ProcessJobView> = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.status != "done")
+        .collect();
+    open.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    for job in open.iter().take(40) {
+        let issue = job
+            .issue_url
+            .as_deref()
+            .and_then(|url| url.strip_prefix("https://github.com/"))
+            .map(|path| path.replacen("/issues/", "#", 1))
+            .unwrap_or_else(|| String::from("-"));
+        out.push_str(&format!(
+            "run status={} issue={} created={} updated={} approved={}\n",
+            job.status,
+            issue,
+            job.created_at.as_deref().unwrap_or("-"),
+            job.updated_at.as_deref().unwrap_or("-"),
+            job.approved
+        ));
+    }
+    out
 }
 
 /// Characters of live Slack content one chat turn may carry.
@@ -9479,6 +9566,45 @@ mod tests {
     }
 
     #[test]
+    fn agent_run_questions_see_runs_waiting_for_approval() {
+        assert!(is_agent_run_question(
+            "How many agent runs are waiting for my approval right now?"
+        ));
+        assert!(is_agent_run_question(
+            "quelles exécutions sont en attente ?"
+        ));
+        assert!(!is_agent_run_question("what's happening in slack today?"));
+        let fixture = r#"{
+          "schema":"automonique.manage-processes/v1","health":"ready","observed_at_ms":1787066000000,
+          "stats":{"total":3,"queued":0,"running":0,"completed":1,"failed":0},"worker":null,
+          "jobs":[
+            {"id":"job-a","status":"pending_approval","source":"unknown","issue_id":"1",
+             "issue_url":"https://github.com/example/site/issues/7","manage_url":null,"site_id":null,
+             "session_id":null,"parent_id":null,"kind":null,"provider":"unknown","runtime":"unknown",
+             "assigned_to_worker":true,"approved":false,"decision_count":0,
+             "created_at":"2026-08-18T17:11:00Z","updated_at":"2026-08-18T17:11:00Z","output":[]},
+            {"id":"job-b","status":"pending_approval","source":"unknown","issue_id":"2",
+             "issue_url":"https://github.com/example/site/issues/8","manage_url":null,"site_id":null,
+             "session_id":null,"parent_id":null,"kind":null,"provider":"unknown","runtime":"unknown",
+             "assigned_to_worker":true,"approved":false,"decision_count":0,
+             "created_at":"2026-08-18T18:11:00Z","updated_at":"2026-08-18T18:11:00Z","output":[]},
+            {"id":"job-c","status":"done","source":"unknown","issue_id":"3",
+             "issue_url":"https://github.com/example/site/issues/9","manage_url":null,"site_id":null,
+             "session_id":null,"parent_id":null,"kind":null,"provider":"unknown","runtime":"unknown",
+             "assigned_to_worker":true,"approved":true,"decision_count":1,
+             "created_at":"2026-08-18T16:11:00Z","updated_at":"2026-08-18T16:11:00Z","output":[]}
+          ]}"#;
+        let snapshot = process_snapshot(fixture.as_bytes()).expect("fixture");
+        let rendered = render_agent_runs(&snapshot);
+        assert!(rendered.contains("total=3 counts=done:1,pending_approval:2"));
+        // Newest unfinished run first; finished runs are only counted.
+        let newest = rendered.find("issue=example/site#8").expect("run 8");
+        let older = rendered.find("issue=example/site#7").expect("run 7");
+        assert!(newest < older);
+        assert!(!rendered.contains("example/site#9"));
+    }
+
+    #[test]
     fn process_snapshot_is_strict_bounded_and_secret_safe() {
         let valid = r#"{
           "schema":"automonique.manage-processes/v1",
@@ -11804,6 +11930,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -11859,6 +11986,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -12006,6 +12134,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -12080,6 +12209,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: Some(String::from("https://manage.example.test/")),
@@ -12123,6 +12253,7 @@ mod tests {
                 live_sites: Some(&sites),
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -12184,6 +12315,7 @@ mod tests {
                 live_sites: Some(&sites),
                 live_knowledge: Some(&knowledge),
                 live_processes: Some(&processes),
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -12235,6 +12367,7 @@ mod tests {
                 live_sites: Some(&sites),
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -12638,6 +12771,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
@@ -13000,6 +13134,7 @@ mod tests {
                 live_sites: None,
                 live_knowledge: None,
                 live_processes: None,
+                live_agent_runs: None,
                 manage_page: None,
                 manage: &ManageIntegration {
                     console_url: None,
