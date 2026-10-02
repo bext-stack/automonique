@@ -4351,6 +4351,32 @@ function ticketConversationNote(text) {
   return note;
 }
 
+// Plain text with https links made clickable and markdown images shown as a
+// named link. Built node by node; nothing is parsed as HTML.
+function appendLinkedText(root, text) {
+  const pattern = /!\[([^\]\n]{0,120})\]\((https:\/\/[^\s)]+)\)|https:\/\/[^\s<>"')\]]+/g;
+  let last = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > last) root.append(document.createTextNode(text.slice(last, match.index)));
+    const raw = match[2] || match[0].replace(/[.,;:!?]+$/, "");
+    const href = safeTicketLink(raw);
+    if (href) {
+      const link = document.createElement("a");
+      link.href = href;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = match[2] ? `🖼 ${match[1] || "image"}` : raw;
+      root.append(link);
+      const trailing = match[2] ? "" : match[0].slice(raw.length);
+      if (trailing) root.append(document.createTextNode(trailing));
+    } else {
+      root.append(document.createTextNode(match[0]));
+    }
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) root.append(document.createTextNode(text.slice(last)));
+}
+
 function ticketMessageCard(message) {
   const item = document.createElement("li");
   item.className = "ticket-message";
@@ -4380,7 +4406,7 @@ function ticketMessageCard(message) {
   const body = document.createElement("p");
   body.className = "ticket-message-body";
   body.setAttribute("data-i18n-skip", "");
-  body.textContent = typeof message.body === "string" ? message.body : "";
+  appendLinkedText(body, typeof message.body === "string" ? message.body : "");
   item.append(meta, body);
   if (message.body_truncated === true) {
     const cut = document.createElement("span");

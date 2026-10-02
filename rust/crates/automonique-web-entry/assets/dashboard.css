@@ -1510,3 +1510,4 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 #processes-health[data-state="waiting"] { color: var(--muted); background: var(--panel-2); }
 /* The message box stays reachable however long the conversation gets. */
 #chat-form { position: sticky; z-index: 5; bottom: 12px; }
+.ticket-message-body a { color: var(--accent-text); overflow-wrap: anywhere; text-decoration: underline; text-underline-offset: 2px; }
