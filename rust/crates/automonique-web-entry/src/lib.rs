@@ -2120,6 +2120,8 @@ enum SlackReadPlan {
     ReadOnlyRefusal,
     NeedsChannel,
     Channel(String),
+    /// No channel was named and several are configured: read each of them.
+    AllChannels,
 }
 
 #[derive(Serialize)]
@@ -3615,6 +3617,32 @@ impl WebIntegration {
                 )));
             }
             SlackReadPlan::Channel(channel) => channel,
+            SlackReadPlan::AllChannels => {
+                // Only configured channels are ever read, each bounded so the
+                // whole snapshot fits the same prompt budget as one channel.
+                let share = SLACK_SNAPSHOT_BUDGET / labels.len().max(1);
+                let mut content = String::new();
+                for label in &labels {
+                    let Ok(name) = ChannelName::new(label) else {
+                        continue;
+                    };
+                    let Ok(messages) = slack.recent_messages(&name) else {
+                        continue;
+                    };
+                    content.push_str("## #");
+                    content.push_str(label);
+                    content.push('\n');
+                    push_bounded(&mut content, &messages, share);
+                    content.push_str("\n\n");
+                }
+                if content.is_empty() {
+                    return Err("slack_read_unavailable");
+                }
+                return Ok(SlackToolDecision::Snapshot {
+                    channel: labels.join(","),
+                    content,
+                });
+            }
         };
         let channel_name = ChannelName::new(&channel).map_err(|_| "slack_channel_refused")?;
         let content = slack
@@ -5171,7 +5199,7 @@ fn compose_chat_prompt(
         prompt.push_str("[live_tool capability=slack_recent_messages channel=");
         prompt.push_str(channel);
         prompt.push_str(" freshness=request_time trust=untrusted_data]\n");
-        push_bounded(&mut prompt, content, 6_000);
+        push_bounded(&mut prompt, content, SLACK_SNAPSHOT_BUDGET);
         prompt.push_str("\n[/live_tool]\n");
     }
     if let Some((tool, content)) = context.live_github {
@@ -5214,6 +5242,9 @@ fn compose_chat_prompt(
     prompt
 }
 
+/// Characters of live Slack content one chat turn may carry.
+const SLACK_SNAPSHOT_BUDGET: usize = 6_000;
+
 fn slack_read_plan(
     message: &str,
     history: &[automonique_store::agent_memory::ConversationMessage],
@@ -5248,35 +5279,6 @@ fn slack_read_plan(
     if mentions_slack && asks_to_mutate {
         return SlackReadPlan::ReadOnlyRefusal;
     }
-    let asks_for_messages = terms.iter().any(|term| {
-        matches!(
-            term.as_str(),
-            "last"
-                | "latest"
-                | "recent"
-                | "read"
-                | "show"
-                | "summarize"
-                | "said"
-                | "message"
-                | "messages"
-                | "messag"
-                | "dernier"
-                | "derniers"
-                | "dernière"
-                | "dernières"
-                | "récent"
-                | "récents"
-                | "récente"
-                | "récentes"
-                | "lire"
-                | "lis"
-                | "montrer"
-                | "montre"
-                | "résumer"
-                | "résume"
-        )
-    });
     let named = labels
         .iter()
         .find(|label| terms.iter().any(|term| term == &label.to_ascii_lowercase()))
@@ -5288,20 +5290,19 @@ fn slack_read_plan(
                     .iter()
                     .any(|term| term == "slack")
         });
-    if !(follows_slack_question || mentions_slack && asks_for_messages) {
+    // Mentioning Slack without asking to change it is a read: "what's
+    // happening in Slack today?" must not depend on a particular verb.
+    if !(follows_slack_question || mentions_slack) {
         return SlackReadPlan::NotRequested;
     }
     if let Some(channel) = named {
         return SlackReadPlan::Channel(channel);
     }
-    if labels.len() == 1 {
-        return labels
-            .first()
-            .cloned()
-            .map(SlackReadPlan::Channel)
-            .unwrap_or(SlackReadPlan::NeedsChannel);
+    match labels {
+        [] => SlackReadPlan::NeedsChannel,
+        [only] => SlackReadPlan::Channel(only.clone()),
+        _ => SlackReadPlan::AllChannels,
     }
-    SlackReadPlan::NeedsChannel
 }
 
 fn normalized_terms(value: &str) -> Vec<String> {
@@ -11175,7 +11176,23 @@ mod tests {
         let labels = vec![String::from("operations"), String::from("deployments")];
         assert_eq!(
             slack_read_plan("what's the last slack messag?", &history, &labels),
+            SlackReadPlan::AllChannels
+        );
+        assert_eq!(
+            slack_read_plan("what's happening in slack today ?", &history, &labels),
+            SlackReadPlan::AllChannels
+        );
+        assert_eq!(
+            slack_read_plan("quoi de neuf sur Slack ?", &history, &labels),
+            SlackReadPlan::AllChannels
+        );
+        assert_eq!(
+            slack_read_plan("what's new on slack", &history, &[]),
             SlackReadPlan::NeedsChannel
+        );
+        assert_eq!(
+            slack_read_plan("anything in slack?", &history, &labels[..1]),
+            SlackReadPlan::Channel(String::from("operations"))
         );
         assert_eq!(
             slack_read_plan(
@@ -11187,7 +11204,7 @@ mod tests {
         );
         assert_eq!(
             slack_read_plan("résume les derniers messages Slack", &history, &labels),
-            SlackReadPlan::NeedsChannel
+            SlackReadPlan::AllChannels
         );
         assert_eq!(
             slack_read_plan("post this to Slack", &history, &labels),
