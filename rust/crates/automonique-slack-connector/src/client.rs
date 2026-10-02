@@ -2,7 +2,7 @@
 
 //! The synchronous Slack client.
 //!
-//! One origin, twelve methods, one verb. The client is the composition of
+//! One origin, fourteen methods, one verb. The client is the composition of
 //! [`SlackOperation`]'s rendering and the `decode_*` functions around a single
 //! bounded HTTP call — it adds no field to a request and repairs no field in a
 //! response, so everything it can send or accept is already provable without a
@@ -36,16 +36,16 @@ use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::response::{
     decode_ack, decode_auth_test, decode_conversations_history, decode_conversations_info,
-    decode_conversations_list, decode_error_code, decode_post_message, decode_stream_message,
-    decode_users_info,
+    decode_conversations_list, decode_error_code, decode_post_message, decode_reaction_add,
+    decode_reaction_remove, decode_stream_message, decode_users_info,
 };
 use crate::{
     AppendStreamRequest, AuthIdentity, ChannelPage, ConversationsHistoryRequest,
     ConversationsInfoRequest, ConversationsListRequest, MAX_SLACK_RESPONSE_BYTES, MessagePage,
-    OpenViewRequest, PostMessageRequest, PostedMessage, PublishViewRequest,
-    SLACK_REQUEST_TIMEOUT_SECONDS, SlackBase, SlackChannel, SlackFailure, SlackMethod,
-    SlackOperation, SlackOutcome, SlackRejection, SlackToken, SlackUser, StartStreamRequest,
-    StopStreamRequest, StreamMessage, UpdateMessageRequest, UsersInfoRequest,
+    OpenViewRequest, PostMessageRequest, PostedMessage, PublishViewRequest, ReactionChange,
+    ReactionRequest, SLACK_REQUEST_TIMEOUT_SECONDS, SlackBase, SlackChannel, SlackFailure,
+    SlackMethod, SlackOperation, SlackOutcome, SlackRejection, SlackToken, SlackUser,
+    StartStreamRequest, StopStreamRequest, StreamMessage, UpdateMessageRequest, UsersInfoRequest,
 };
 
 /// The media type every request asks for.
@@ -305,6 +305,44 @@ impl SlackClient {
         request: &PublishViewRequest,
     ) -> Result<SlackOutcome<()>, SlackFailure> {
         self.call(&SlackOperation::ViewsPublish(request.clone()), decode_ack)
+    }
+
+    /// Add one closed reaction to one exact message.
+    ///
+    /// A message the app had already reacted to answers
+    /// [`ReactionChange::AlreadyInPlace`] rather than a refusal, so a retry
+    /// after an ambiguous transport result is safe.
+    ///
+    /// # Errors
+    ///
+    /// As [`SlackClient::auth_test`], for this method's contract.
+    pub fn add_reaction(
+        &self,
+        request: &ReactionRequest,
+    ) -> Result<SlackOutcome<ReactionChange>, SlackFailure> {
+        self.call(
+            &SlackOperation::ReactionsAdd(request.clone()),
+            decode_reaction_add,
+        )
+    }
+
+    /// Remove one of this app's own reactions from one exact message.
+    ///
+    /// Slack only ever removes the calling app's own reaction, so a human's
+    /// reaction with the same name is untouched. A reaction that was not there
+    /// answers [`ReactionChange::AlreadyInPlace`].
+    ///
+    /// # Errors
+    ///
+    /// As [`SlackClient::auth_test`], for this method's contract.
+    pub fn remove_reaction(
+        &self,
+        request: &ReactionRequest,
+    ) -> Result<SlackOutcome<ReactionChange>, SlackFailure> {
+        self.call(
+            &SlackOperation::ReactionsRemove(request.clone()),
+            decode_reaction_remove,
+        )
     }
 
     /// Issue one operation and decode its answer.

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! The twelve methods, and the exact path and body each renders.
+//! The fourteen methods, and the exact path and body each renders.
 //!
 //! [`SlackMethod`] is the second half of the target lock (the first is the
-//! origin in `target`). A path is never a caller string: it is one of twelve
+//! origin in `target`). A path is never a caller string: it is one of fourteen
 //! private constants under a private `/api` prefix, and a layer talked into
 //! asking for `chat.delete` or `admin.conversations.archive` cannot spell one,
 //! because no variant exists.
@@ -59,6 +59,8 @@ const CHAT_APPEND_STREAM: &str = "chat.appendStream";
 const CHAT_STOP_STREAM: &str = "chat.stopStream";
 const VIEWS_OPEN: &str = "views.open";
 const VIEWS_PUBLISH: &str = "views.publish";
+const REACTIONS_ADD: &str = "reactions.add";
+const REACTIONS_REMOVE: &str = "reactions.remove";
 
 /// Largest serialized Block Kit document this connector will send.
 pub const MAX_BLOCK_KIT_BYTES: usize = 32 * 1024;
@@ -96,6 +98,10 @@ pub enum SlackMethod {
     ViewsOpen,
     /// `views.publish` — publish one App Home view.
     ViewsPublish,
+    /// `reactions.add` — add one of this app's closed reactions to a message.
+    ReactionsAdd,
+    /// `reactions.remove` — remove one of this app's own reactions.
+    ReactionsRemove,
 }
 
 impl SlackMethod {
@@ -115,6 +121,8 @@ impl SlackMethod {
             Self::ChatStopStream => CHAT_STOP_STREAM,
             Self::ViewsOpen => VIEWS_OPEN,
             Self::ViewsPublish => VIEWS_PUBLISH,
+            Self::ReactionsAdd => REACTIONS_ADD,
+            Self::ReactionsRemove => REACTIONS_REMOVE,
         }
     }
 
@@ -870,6 +878,80 @@ impl StopStreamRequest {
     }
 }
 
+/// The closed set of reactions this connector may add or remove.
+///
+/// Not free text: an emoji name is a statement the bot makes on somebody
+/// else's message, and the product has exactly two to make — work on the
+/// ticket has started, and the ticket is verifiably finished. A layer talked
+/// into reacting with anything else cannot spell it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ReactionName {
+    /// `eyes` — someone has started on the ticket this message posted.
+    Eyes,
+    /// `white_check_mark` — the ticket is verifiably finished.
+    WhiteCheckMark,
+}
+
+impl ReactionName {
+    /// Every reaction, for coverage checks.
+    pub const ALL: [Self; 2] = [Self::Eyes, Self::WhiteCheckMark];
+
+    /// The exact Slack emoji name, without colons.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Eyes => "eyes",
+            Self::WhiteCheckMark => "white_check_mark",
+        }
+    }
+
+    /// Read one wire name back, refusing anything outside the closed set.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reaction| reaction.as_wire() == value)
+    }
+}
+
+/// Add or remove one reaction on one exact message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReactionRequest {
+    channel: ChannelId,
+    timestamp: MessageTs,
+    name: ReactionName,
+}
+
+impl ReactionRequest {
+    /// Bind one message to one closed reaction.
+    #[must_use]
+    pub const fn new(channel: ChannelId, timestamp: MessageTs, name: ReactionName) -> Self {
+        Self {
+            channel,
+            timestamp,
+            name,
+        }
+    }
+
+    /// The conversation.
+    #[must_use]
+    pub const fn channel(&self) -> &ChannelId {
+        &self.channel
+    }
+
+    /// The message the reaction is on — the message's own `ts`, not its thread.
+    #[must_use]
+    pub const fn timestamp(&self) -> &MessageTs {
+        &self.timestamp
+    }
+
+    /// The reaction.
+    #[must_use]
+    pub const fn name(&self) -> ReactionName {
+        self.name
+    }
+}
+
 /// One validated call, ready to be rendered onto the wire.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SlackOperation {
@@ -897,6 +979,10 @@ pub enum SlackOperation {
     ViewsOpen(OpenViewRequest),
     /// `views.publish`
     ViewsPublish(PublishViewRequest),
+    /// `reactions.add`
+    ReactionsAdd(ReactionRequest),
+    /// `reactions.remove`
+    ReactionsRemove(ReactionRequest),
 }
 
 impl SlackOperation {
@@ -916,6 +1002,8 @@ impl SlackOperation {
             Self::ChatStopStream(_) => SlackMethod::ChatStopStream,
             Self::ViewsOpen(_) => SlackMethod::ViewsOpen,
             Self::ViewsPublish(_) => SlackMethod::ViewsPublish,
+            Self::ReactionsAdd(_) => SlackMethod::ReactionsAdd,
+            Self::ReactionsRemove(_) => SlackMethod::ReactionsRemove,
         }
     }
 
@@ -935,6 +1023,8 @@ impl SlackOperation {
                 | Self::ChatStopStream(_)
                 | Self::ViewsOpen(_)
                 | Self::ViewsPublish(_)
+                | Self::ReactionsAdd(_)
+                | Self::ReactionsRemove(_)
         )
     }
 
@@ -1020,6 +1110,11 @@ impl SlackOperation {
                 push_form_field(&mut body, "user_id", request.user_id().as_str());
                 push_form_field(&mut body, "view", request.view().as_str());
             }
+            Self::ReactionsAdd(request) | Self::ReactionsRemove(request) => {
+                push_form_field(&mut body, "channel", request.channel().as_str());
+                push_form_field(&mut body, "timestamp", request.timestamp().as_str());
+                push_form_field(&mut body, "name", request.name().as_wire());
+            }
         }
         body
     }
@@ -1058,6 +1153,8 @@ mod tests {
             (SlackMethod::ChatStopStream, "/api/chat.stopStream"),
             (SlackMethod::ViewsOpen, "/api/views.open"),
             (SlackMethod::ViewsPublish, "/api/views.publish"),
+            (SlackMethod::ReactionsAdd, "/api/reactions.add"),
+            (SlackMethod::ReactionsRemove, "/api/reactions.remove"),
         ] {
             assert_eq!(method.path(), path);
             assert_eq!(format!("{API_PREFIX}/{}", method.as_str()), path);
@@ -1202,6 +1299,36 @@ mod tests {
             home,
         ));
         assert!(publish.body().starts_with("user_id=U0RESERVED&view=%7B"));
+
+        let ts = MessageTs::new("1723542000.000100").expect("ts");
+        let add = SlackOperation::ReactionsAdd(ReactionRequest::new(
+            channel(),
+            ts.clone(),
+            ReactionName::Eyes,
+        ));
+        assert_eq!(
+            add.body(),
+            "channel=C0RESERVED&timestamp=1723542000.000100&name=eyes"
+        );
+        let remove = SlackOperation::ReactionsRemove(ReactionRequest::new(
+            channel(),
+            ts,
+            ReactionName::WhiteCheckMark,
+        ));
+        assert_eq!(
+            remove.body(),
+            "channel=C0RESERVED&timestamp=1723542000.000100&name=white_check_mark"
+        );
+    }
+
+    #[test]
+    fn a_reaction_name_is_closed_and_round_trips() {
+        for reaction in ReactionName::ALL {
+            assert_eq!(ReactionName::parse(reaction.as_wire()), Some(reaction));
+        }
+        for refused in ["", ":eyes:", "EYES", "thumbsup", "white_check_mark "] {
+            assert_eq!(ReactionName::parse(refused), None, "{refused:?}");
+        }
     }
 
     #[test]
@@ -1266,6 +1393,12 @@ mod tests {
                 UserId::new(USER).expect("user"),
                 HomeView::new(r#"{"type":"home","blocks":[]}"#).expect("home"),
             )),
+            SlackOperation::ReactionsAdd(ReactionRequest::new(channel(), ts(), ReactionName::Eyes)),
+            SlackOperation::ReactionsRemove(ReactionRequest::new(
+                channel(),
+                ts(),
+                ReactionName::Eyes,
+            )),
         ];
         for write in &writes {
             assert!(write.is_external_effect(), "{write:?} is an effect");
@@ -1280,7 +1413,11 @@ mod tests {
         methods.sort_unstable();
         let total = methods.len();
         methods.dedup();
-        assert_eq!(methods.len(), total, "twelve operations, twelve methods");
+        assert_eq!(
+            methods.len(),
+            total,
+            "fourteen operations, fourteen methods"
+        );
     }
 
     #[test]

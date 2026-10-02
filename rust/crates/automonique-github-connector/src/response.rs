@@ -20,9 +20,10 @@
 //! answer. Here every field the contract names is required, and its absence is
 //! [`GitHubFailure::MissingField`].
 //!
-//! Two absences are *not* contract breaks and are decoded as the empty value
-//! they mean: an issue `body` may be `null` (GitHub's spelling of "no body")
-//! and `closed_at` is `null` while an issue is open.
+//! Three absences are *not* contract breaks and are decoded as the empty value
+//! they mean: an issue `body` may be `null` (GitHub's spelling of "no body"),
+//! `closed_at` is `null` while an issue is open, and `state_reason` is `null`
+//! (or absent, on older answers) when GitHub recorded no reason.
 //!
 //! Unknown extra fields are tolerated. GitHub adds top-level fields on its own
 //! schedule and refusing them would couple this connector to an API release.
@@ -137,6 +138,11 @@ pub struct GitHubIssue {
     pub updated_at: String,
     /// Close timestamp, when the issue is closed.
     pub closed_at: Option<String>,
+    /// Why the issue is in its state, when GitHub recorded a reason:
+    /// `completed`, `not_planned`, `duplicate` or `reopened` today. Kept as the
+    /// bounded wire word rather than a closed enum, because GitHub has added
+    /// reasons before and a new one must not make an issue unreadable.
+    pub state_reason: Option<String>,
     /// The body. Empty when GitHub reports none.
     pub body: String,
 }
@@ -790,8 +796,29 @@ fn issue(row: &Map<String, Value>) -> Result<GitHubIssue, GitHubFailure> {
         created_at: timestamp(row, "created_at")?,
         updated_at: timestamp(row, "updated_at")?,
         closed_at: optional_timestamp(row, "closed_at")?,
+        state_reason: state_reason(row)?,
         body: optional_text(row, "body", MAX_ISSUE_BODY_BYTES)?,
     })
+}
+
+/// Longest `state_reason` word retained.
+const MAX_STATE_REASON_BYTES: usize = 32;
+
+/// The optional `state_reason`, which must be a short lowercase wire word.
+fn state_reason(row: &Map<String, Value>) -> Result<Option<String>, GitHubFailure> {
+    match row.get("state_reason") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value))
+            if !value.is_empty()
+                && value.len() <= MAX_STATE_REASON_BYTES
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_') =>
+        {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(GitHubFailure::FieldOutOfBounds),
+    }
 }
 
 /// Decode one comment, requiring every field the contract names.
@@ -1162,6 +1189,44 @@ mod tests {
         let issue = decode_issue(row.to_string().as_bytes()).expect("decode");
         assert_eq!(issue.state, IssueState::Closed);
         assert_eq!(issue.closed_at.as_deref(), Some("2026-08-14T08:00:00Z"));
+        assert_eq!(issue.state_reason, None);
+    }
+
+    #[test]
+    fn a_state_reason_is_a_bounded_wire_word_or_nothing() {
+        for (value, expected) in [
+            (Value::Null, None),
+            (
+                Value::String("completed".to_owned()),
+                Some("completed".to_owned()),
+            ),
+            (
+                Value::String("not_planned".to_owned()),
+                Some("not_planned".to_owned()),
+            ),
+        ] {
+            let mut row: Value = serde_json::from_str(&issue_json()).expect("row");
+            row.as_object_mut()
+                .expect("object")
+                .insert("state_reason".to_owned(), value);
+            let issue = decode_issue(row.to_string().as_bytes()).expect("decode");
+            assert_eq!(issue.state_reason, expected);
+        }
+        for refused in [
+            Value::String(String::new()),
+            Value::String("Completed".to_owned()),
+            Value::String("x".repeat(MAX_STATE_REASON_BYTES + 1)),
+            Value::Bool(true),
+        ] {
+            let mut row: Value = serde_json::from_str(&issue_json()).expect("row");
+            row.as_object_mut()
+                .expect("object")
+                .insert("state_reason".to_owned(), refused);
+            assert_eq!(
+                decode_issue(row.to_string().as_bytes()),
+                Err(GitHubFailure::FieldOutOfBounds)
+            );
+        }
     }
 
     #[test]

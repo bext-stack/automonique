@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Bounded, refusing decoders for the twelve bot-token methods and Socket Mode
+//! Bounded, refusing decoders for the fourteen bot-token methods and Socket Mode
 //! bootstrap.
 //!
 //! Each decoder takes the accepted response bytes and returns either the
@@ -440,6 +440,44 @@ pub fn decode_stream_message(bytes: &[u8]) -> Result<SlackOutcome<StreamMessage>
 pub fn decode_ack(bytes: &[u8]) -> Result<SlackOutcome<()>, SlackFailure> {
     Ok(match envelope(bytes)? {
         Envelope::Accepted(_) => SlackOutcome::Accepted(()),
+        Envelope::Rejected(rejection) => SlackOutcome::Rejected(rejection),
+    })
+}
+
+/// What one accepted reaction call changed on the message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReactionChange {
+    /// Slack applied the change this call asked for.
+    Applied,
+    /// The message was already in the asked-for state: the app had already
+    /// reacted (`already_reacted`), or had no such reaction to remove
+    /// (`no_reaction`).
+    ///
+    /// Reported as success rather than as a refusal because the outcome the
+    /// caller wanted is true on the message, and a reaction is idempotent — a
+    /// retry after an ambiguous transport result lands here, not in an error.
+    AlreadyInPlace,
+}
+
+/// Decode `reactions.add`, reading `already_reacted` as the success it is.
+pub fn decode_reaction_add(bytes: &[u8]) -> Result<SlackOutcome<ReactionChange>, SlackFailure> {
+    decode_reaction(bytes, "already_reacted")
+}
+
+/// Decode `reactions.remove`, reading `no_reaction` as the success it is.
+pub fn decode_reaction_remove(bytes: &[u8]) -> Result<SlackOutcome<ReactionChange>, SlackFailure> {
+    decode_reaction(bytes, "no_reaction")
+}
+
+fn decode_reaction(
+    bytes: &[u8],
+    in_place_code: &str,
+) -> Result<SlackOutcome<ReactionChange>, SlackFailure> {
+    Ok(match envelope(bytes)? {
+        Envelope::Accepted(_) => SlackOutcome::Accepted(ReactionChange::Applied),
+        Envelope::Rejected(rejection) if rejection.code().as_str() == in_place_code => {
+            SlackOutcome::Accepted(ReactionChange::AlreadyInPlace)
+        }
         Envelope::Rejected(rejection) => SlackOutcome::Rejected(rejection),
     })
 }
@@ -1337,5 +1375,49 @@ mod tests {
             channel_json()
         );
         assert!(decode_conversations_info(warned.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_reaction_already_in_place_is_success_and_every_other_refusal_is_not() {
+        assert_eq!(
+            decode_reaction_add(br#"{"ok":true}"#).expect("add"),
+            SlackOutcome::Accepted(ReactionChange::Applied)
+        );
+        assert_eq!(
+            decode_reaction_add(br#"{"ok":false,"error":"already_reacted"}"#).expect("add"),
+            SlackOutcome::Accepted(ReactionChange::AlreadyInPlace)
+        );
+        assert_eq!(
+            decode_reaction_remove(br#"{"ok":true}"#).expect("remove"),
+            SlackOutcome::Accepted(ReactionChange::Applied)
+        );
+        assert_eq!(
+            decode_reaction_remove(br#"{"ok":false,"error":"no_reaction"}"#).expect("remove"),
+            SlackOutcome::Accepted(ReactionChange::AlreadyInPlace)
+        );
+        // Each method's in-place code belongs to that method only: a removal
+        // answering `already_reacted` is not a removal that happened.
+        assert!(
+            decode_reaction_remove(br#"{"ok":false,"error":"already_reacted"}"#)
+                .expect("remove")
+                .rejected()
+                .is_some()
+        );
+        assert!(
+            decode_reaction_add(br#"{"ok":false,"error":"no_reaction"}"#)
+                .expect("add")
+                .rejected()
+                .is_some()
+        );
+        let refused =
+            decode_reaction_add(br#"{"ok":false,"error":"message_not_found"}"#).expect("add");
+        assert_eq!(
+            refused.rejected().expect("rejected").code().as_str(),
+            "message_not_found"
+        );
+        assert_eq!(
+            decode_reaction_add(br#"{"error":"already_reacted"}"#),
+            Err(SlackFailure::InvalidResponse)
+        );
     }
 }

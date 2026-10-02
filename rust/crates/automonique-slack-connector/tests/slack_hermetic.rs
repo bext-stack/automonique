@@ -29,9 +29,10 @@ use std::time::{Duration, Instant};
 use automonique_slack_connector::{
     AppendStreamRequest, ChannelId, ConversationTypes, ConversationsHistoryRequest,
     ConversationsInfoRequest, ConversationsListRequest, Cursor, MAX_SLACK_RESPONSE_BYTES,
-    MessageText, MessageTs, PostMessageRequest, SLACK_ACCEPT, SLACK_CONTENT_TYPE, SLACK_USER_AGENT,
-    SlackBase, SlackClient, SlackErrorKind, SlackFailure, SlackToken, StartStreamRequest,
-    StopStreamRequest, StreamChunks, StreamText, UserId, UsersInfoRequest,
+    MessageText, MessageTs, PostMessageRequest, ReactionChange, ReactionName, ReactionRequest,
+    SLACK_ACCEPT, SLACK_CONTENT_TYPE, SLACK_USER_AGENT, SlackBase, SlackClient, SlackErrorKind,
+    SlackFailure, SlackToken, StartStreamRequest, StopStreamRequest, StreamChunks, StreamText,
+    UserId, UsersInfoRequest,
 };
 
 /// Bound on every server-side wait. A test that would otherwise hang fails here.
@@ -628,6 +629,59 @@ fn the_native_stream_methods_send_exact_paths_and_bodies() {
         captured[2].body,
         "channel=C0RESERVED&ts=1723542300.000400&markdown_text=Done"
     );
+}
+
+#[test]
+fn the_reaction_methods_send_exact_requests_and_read_an_idempotent_answer_as_success() {
+    let fake = FakeSlack::spawn(vec![
+        Canned::json("{\"ok\":true}"),
+        Canned::json("{\"ok\":false,\"error\":\"already_reacted\"}"),
+        Canned::json("{\"ok\":false,\"error\":\"no_reaction\"}"),
+        Canned::json("{\"ok\":false,\"error\":\"message_not_found\"}"),
+    ]);
+    let client = slack_client(&fake);
+    let request = |name| {
+        ReactionRequest::new(
+            channel(),
+            MessageTs::new("1723542000.000100").expect("ts"),
+            name,
+        )
+    };
+
+    let first = client
+        .add_reaction(&request(ReactionName::Eyes))
+        .expect("add");
+    assert_eq!(first.accepted(), Some(&ReactionChange::Applied));
+    let again = client
+        .add_reaction(&request(ReactionName::Eyes))
+        .expect("add again");
+    assert_eq!(again.accepted(), Some(&ReactionChange::AlreadyInPlace));
+    let removed = client
+        .remove_reaction(&request(ReactionName::WhiteCheckMark))
+        .expect("remove");
+    assert_eq!(removed.accepted(), Some(&ReactionChange::AlreadyInPlace));
+    let missing = client
+        .add_reaction(&request(ReactionName::WhiteCheckMark))
+        .expect("a refusal is a well-formed answer");
+    assert_eq!(
+        missing.rejected().expect("rejected").code().as_str(),
+        "message_not_found"
+    );
+
+    let captured = fake.captured();
+    assert_eq!(captured.len(), 4);
+    assert_wire_shape(&captured[0], "/api/reactions.add");
+    assert_eq!(
+        captured[0].body,
+        "channel=C0RESERVED&timestamp=1723542000.000100&name=eyes"
+    );
+    assert_wire_shape(&captured[1], "/api/reactions.add");
+    assert_wire_shape(&captured[2], "/api/reactions.remove");
+    assert_eq!(
+        captured[2].body,
+        "channel=C0RESERVED&timestamp=1723542000.000100&name=white_check_mark"
+    );
+    assert_wire_shape(&captured[3], "/api/reactions.add");
 }
 
 #[test]
