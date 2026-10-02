@@ -471,6 +471,7 @@ dependencies = [
  "automonique-github-connector",
  "automonique-platform-client",
  "automonique-protocol",
+ "automonique-slack-connector",
  "automonique-store",
  "automonique-support-connector",
  "automonique-transport-runtime",

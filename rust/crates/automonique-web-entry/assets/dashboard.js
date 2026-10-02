@@ -950,6 +950,16 @@ const frenchUi = Object.freeze({
   "This action can change external state.": "Cette action peut modifier un état externe.",
   "Deny": "Refuser",
   "Approve and run": "Approuver et exécuter",
+  "Approve and post": "Approuver et publier",
+  "Posting the approved message…": "Publication du message approuvé…",
+  "Slack post decided": "Publication Slack décidée",
+  "The Slack post was decided. Read the reply for the outcome.": "La publication Slack a été décidée. Lisez la réponse pour le résultat.",
+  "This action is still awaiting your decision.": "Cette action attend toujours votre décision.",
+  "That action is no longer pending. Nothing was run.": "Cette action n’est plus en attente. Rien n’a été exécuté.",
+  "That Slack post is no longer pending. Nothing was posted.": "Cette publication Slack n’est plus en attente. Rien n’a été publié.",
+  "That Slack draft expired. Nothing was posted. Ask Monique to draft it again.": "Ce brouillon Slack a expiré. Rien n’a été publié. Demandez à Monique de le rédiger à nouveau.",
+  "Too many Slack drafts are awaiting decisions. Resolve one and try again.": "Trop de brouillons Slack attendent une décision. Traitez-en un et réessayez.",
+  "Monique could not hold the Slack draft safely. Nothing was posted.": "Monique n’a pas pu conserver le brouillon Slack en toute sécurité. Rien n’a été publié.",
   "Running approved action…": "Exécution de l’action approuvée…",
   "Recording denial…": "Enregistrement du refus…",
   "Action completed": "Action terminée",
@@ -5923,6 +5933,7 @@ function createActionCard(action) {
   const card = document.createElement("section");
   card.className = "action-card";
   card.dataset.actionId = String(action.id || "");
+  card.dataset.actionKind = String(action.kind || "manage");
   const eyebrow = document.createElement("span");
   eyebrow.textContent = "APPROVAL REQUIRED";
   const title = document.createElement("strong");
@@ -5943,7 +5954,7 @@ function createActionCard(action) {
   const approve = document.createElement("button");
   approve.type = "button";
   approve.className = "action-approve";
-  approve.textContent = "Approve and run";
+  approve.textContent = action.kind === "slack_post" ? "Approve and post" : "Approve and run";
   [deny, approve].forEach((button) => button.addEventListener("click", () => {
     resolveChatAction(card, button === approve ? "approve" : "deny");
   }));
@@ -5958,7 +5969,10 @@ async function resolveChatAction(card, decision) {
   card.dataset.state = "working";
   card.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   const pending = appendPendingMessage();
-  byId("chat-state").textContent = decision === "approve" ? "Running approved action…" : "Recording denial…";
+  const slackPost = card.dataset.actionKind === "slack_post";
+  byId("chat-state").textContent = decision === "approve"
+    ? (slackPost ? "Posting the approved message…" : "Running approved action…")
+    : "Recording denial…";
   try {
     const answer = await api("/api/chat/action", {
       method: "POST",
@@ -5971,8 +5985,12 @@ async function resolveChatAction(card, decision) {
     appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action, speak: true });
     byId("chat-source-count").textContent = count(sources.length);
     byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : "-";
-    byId("chat-state").textContent = decision === "approve" ? "Action completed" : "Action denied";
-    toast(decision === "approve" ? "The approved action returned a result." : "The action was denied.");
+    // A Slack post Slack did not confirm is still a decided card: the reply
+    // says whether it landed, so the toast does not claim it did.
+    byId("chat-state").textContent = decision === "approve" ? (slackPost ? "Slack post decided" : "Action completed") : "Action denied";
+    toast(decision === "approve"
+      ? (slackPost ? "The Slack post was decided. Read the reply for the outcome." : "The approved action returned a result.")
+      : "The action was denied.");
   } catch (error) {
     pending.remove();
     card.removeAttribute("data-state");
@@ -6047,7 +6065,7 @@ async function loadChatHistory() {
       history.messages.forEach((message) => appendMessage(message.role, message.content, message.created_at_ms));
     }
     (history.pending_actions || []).forEach((action) => {
-      appendMessage("assistant", "This Manage action is still awaiting your decision.", Date.now(), { action, localized: true });
+      appendMessage("assistant", "This action is still awaiting your decision.", Date.now(), { action, localized: true });
     });
     thread.dataset.loaded = "true";
   } catch (_error) {
@@ -6064,7 +6082,11 @@ function humanChatError(category) {
     memory_unavailable: "Durable memory is temporarily unavailable.",
     memory_write_refused: "This turn could not be retained safely, so it was not run.",
     manage_tool_unavailable: "Manage AI Operations is temporarily unavailable. No action was run.",
-    manage_action_not_pending: "That Manage action is no longer pending. Nothing was run.",
+    manage_action_not_pending: "That action is no longer pending. Nothing was run.",
+    slack_post_not_pending: "That Slack post is no longer pending. Nothing was posted.",
+    slack_post_expired: "That Slack draft expired. Nothing was posted. Ask Monique to draft it again.",
+    slack_post_capacity: "Too many Slack drafts are awaiting decisions. Resolve one and try again.",
+    slack_post_unavailable: "Monique could not hold the Slack draft safely. Nothing was posted.",
     manage_action_expired: "That Manage action expired. Ask Monique to prepare it again.",
     manage_action_additional_approval_refused: "Manage requested another approval step, so execution stopped.",
     permission_request_not_pending: "That permission request is no longer pending. Nothing was run.",

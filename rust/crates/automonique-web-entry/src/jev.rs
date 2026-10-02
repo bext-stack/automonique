@@ -46,7 +46,7 @@ pub(crate) const SLACK_WRITE_THRESHOLD: f64 = 0.8;
 /// Override the keyword reply language when Jev is at least this confident.
 pub(crate) const LANGUAGE_CONFIDENCE: f64 = 0.7;
 
-/// Question ids, in the order they are logged.
+/// Question ids always asked, in the order they are logged.
 pub(crate) const QUESTION_IDS: [&str; 6] = [
     "read_slack",
     "slack_write",
@@ -175,7 +175,33 @@ pub(crate) struct JevTurn {
     /// Earlier turns, oldest first, as `user: …` / `assistant: …`.
     pub(crate) recent_conversation: Vec<String>,
     pub(crate) sources: JevSources,
+    /// Configured Slack channel labels a post could go to. When any are
+    /// configured, the `post_channel` choice is asked over them.
+    pub(crate) post_channels: Vec<String>,
 }
+
+impl JevTurn {
+    /// Whether the `post_channel` question is asked for this turn.
+    fn asks_post_channel(&self) -> bool {
+        !self.post_channels.is_empty()
+            && self
+                .post_channels
+                .iter()
+                .all(|label| !label.eq_ignore_ascii_case(POST_CHANNEL_UNCLEAR))
+    }
+
+    /// The ids of every question this turn asks.
+    pub(crate) fn question_ids(&self) -> Vec<&'static str> {
+        let mut ids = QUESTION_IDS.to_vec();
+        if self.asks_post_channel() {
+            ids.push("post_channel");
+        }
+        ids
+    }
+}
+
+/// The `post_channel` option meaning no configured channel fits.
+const POST_CHANNEL_UNCLEAR: &str = "unclear";
 
 /// One description per configured source, built from labels and aliases.
 #[derive(Clone, Debug, Default)]
@@ -259,6 +285,11 @@ pub(crate) struct JevAnswers {
     pub(crate) agent_runs: Option<f64>,
     pub(crate) manage_data: Option<f64>,
     pub(crate) reply_language: Option<(JevLanguage, f64)>,
+    /// The configured channel a post would go to, with confidence; `None`
+    /// when not asked, not answered, or answered `unclear`.
+    pub(crate) post_channel: Option<(String, f64)>,
+    /// The ids of the questions asked, for the log line.
+    pub(crate) questions: Vec<&'static str>,
 }
 
 impl JevAnswers {
@@ -276,6 +307,14 @@ impl JevAnswers {
         self.reply_language
             .filter(|(_, confidence)| *confidence >= LANGUAGE_CONFIDENCE)
             .map(|(language, _)| language)
+    }
+
+    /// The post channel when Jev is at least `LANGUAGE_CONFIDENCE` sure.
+    pub(crate) fn confident_post_channel(&self) -> Option<&str> {
+        self.post_channel
+            .as_ref()
+            .filter(|(_, confidence)| *confidence >= LANGUAGE_CONFIDENCE)
+            .map(|(channel, _)| channel.as_str())
     }
 
     /// `id:0.97,…` with two decimals, for the log line.
@@ -299,6 +338,9 @@ impl JevAnswers {
             }
             None => String::from("reply_language:-"),
         });
+        if let Some((_, confidence)) = &self.post_channel {
+            parts.push(format!("post_channel:@{confidence:.2}"));
+        }
         parts.join(",")
     }
 }
@@ -325,12 +367,12 @@ pub(crate) fn request_body(model: &str, turn: &JevTurn) -> Value {
                 "manage": turn.sources.manage,
             },
         },
-        "questions": questions(),
+        "questions": questions(turn),
     })
 }
 
-fn questions() -> Value {
-    json!({
+fn questions(turn: &JevTurn) -> Value {
+    let mut questions = json!({
         "read_slack": {
             "type": "noul",
             "instructions": {
@@ -367,11 +409,38 @@ fn questions() -> Value {
                 "other_or_unclear": "Another language, a mix, or too short to tell (e.g. only an issue number or 'ping')"
             }
         }
-    })
+    });
+    if turn.asks_post_channel()
+        && let Some(object) = questions.as_object_mut()
+    {
+        let mut criteria = serde_json::Map::new();
+        for label in &turn.post_channels {
+            criteria.insert(label.clone(), Value::Null);
+        }
+        criteria.insert(
+            String::from(POST_CHANNEL_UNCLEAR),
+            Value::from(
+                "No configured channel is named or clearly implied, or `message` does not ask to post",
+            ),
+        );
+        object.insert(
+            String::from("post_channel"),
+            json!({
+                "type": "choice",
+                "instructions": "If `message` asks the assistant to post a message to Slack, which configured channel from `sources.slack` (or one named earlier in `recent_conversation`) should receive it?",
+                "criteria": criteria,
+            }),
+        );
+    }
+    questions
 }
 
-/// Parse a 200 response body into typed answers.
-pub(crate) fn parse_answers(body: &[u8]) -> Result<JevAnswers, &'static str> {
+/// Parse a 200 response body into typed answers. `post_channels` are the
+/// labels the `post_channel` choice was asked over (empty when not asked).
+pub(crate) fn parse_answers(
+    body: &[u8],
+    post_channels: &[String],
+) -> Result<JevAnswers, &'static str> {
     let value: Value = serde_json::from_slice(body).map_err(|_| "jev_malformed")?;
     let answers = value
         .get("answers")
@@ -422,6 +491,32 @@ pub(crate) fn parse_answers(body: &[u8]) -> Result<JevAnswers, &'static str> {
             Some((language, confidence))
         }
     };
+    let post_channel = match answers.get("post_channel") {
+        None => None,
+        Some(answer) => {
+            if answer.get("type").and_then(Value::as_str) != Some("choice") {
+                return Err("jev_malformed");
+            }
+            let choice = answer
+                .get("choice")
+                .and_then(Value::as_str)
+                .ok_or("jev_malformed")?;
+            let confidence = answer
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .filter(|value| (0.0..=1.0).contains(value))
+                .ok_or("jev_malformed")?;
+            if choice == POST_CHANNEL_UNCLEAR {
+                None
+            } else {
+                let label = post_channels
+                    .iter()
+                    .find(|label| label.as_str() == choice)
+                    .ok_or("jev_malformed")?;
+                Some((label.clone(), confidence))
+            }
+        }
+    };
     let answers = JevAnswers {
         model,
         read_slack: noul("read_slack")?,
@@ -430,6 +525,8 @@ pub(crate) fn parse_answers(body: &[u8]) -> Result<JevAnswers, &'static str> {
         agent_runs: noul("agent_runs")?,
         manage_data: noul("manage_data")?,
         reply_language,
+        post_channel,
+        questions: QUESTION_IDS.to_vec(),
     };
     if answers.read_slack.is_none()
         && answers.slack_write.is_none()
@@ -489,7 +586,14 @@ pub(crate) fn ask(config: &JevConfig, turn: &JevTurn) -> Result<JevAnswers, &'st
         Err(_) if started.elapsed() >= config.timeout => return Err("jev_timeout"),
         Err(_) => return Err("jev_malformed"),
     }
-    parse_answers(&bytes)
+    let asked: &[String] = if turn.asks_post_channel() {
+        &turn.post_channels
+    } else {
+        &[]
+    };
+    let mut answers = parse_answers(&bytes, asked)?;
+    answers.questions = turn.question_ids();
+    Ok(answers)
 }
 
 /// A one-shot local HTTP server standing in for the service.
@@ -623,7 +727,55 @@ mod tests {
                 Some(&[String::from("activ"), String::from("gamma")]),
                 true,
             ),
+            post_channels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_post_channel_choice_is_asked_over_the_configured_labels() {
+        let mut posting = turn();
+        posting.post_channels = vec![String::from("ops"), String::from("deploys")];
+        let mut body: Value =
+            serde_json::from_str(&fake::answer(0.1, 0.92, 0.0, 0.0, 0.0, "english", 0.9))
+                .expect("answer");
+        body["answers"]["post_channel"] = json!({
+            "type": "choice",
+            "choice": "deploys",
+            "probabilities": {"deploys": 0.88},
+            "confidence": 0.88
+        });
+        let (endpoint, captured) = fake::serve(200, &body.to_string(), Duration::ZERO);
+        let config = JevConfig::for_test(KEY, endpoint, Duration::from_millis(1_500));
+        let answers = ask(&config, &posting).expect("answers");
+        let request = captured.recv().expect("request");
+        let criteria = request.body["questions"]["post_channel"]["criteria"]
+            .as_object()
+            .expect("criteria");
+        let mut options: Vec<&str> = criteria.keys().map(String::as_str).collect();
+        options.sort_unstable();
+        assert_eq!(options, ["deploys", "ops", "unclear"]);
+        assert_eq!(answers.confident_post_channel(), Some("deploys"));
+        assert!(answers.says_slack_write());
+        assert!(answers.questions.contains(&"post_channel"));
+
+        // A channel that was not offered is a malformed answer.
+        body["answers"]["post_channel"]["choice"] = json!("elsewhere");
+        let (endpoint, _captured) = fake::serve(200, &body.to_string(), Duration::ZERO);
+        let config = JevConfig::for_test(KEY, endpoint, Duration::from_millis(1_500));
+        assert_eq!(ask(&config, &posting), Err("jev_malformed"));
+        // Without configured channels the question is not asked.
+        let (endpoint, captured) = fake::serve(
+            200,
+            &fake::answer(0.1, 0.0, 0.0, 0.0, 0.0, "english", 0.9),
+            Duration::ZERO,
+        );
+        let config = JevConfig::for_test(KEY, endpoint, Duration::from_millis(1_500));
+        ask(&config, &turn()).expect("answers");
+        assert!(
+            captured.recv().expect("request").body["questions"]
+                .get("post_channel")
+                .is_none()
+        );
     }
 
     #[test]
