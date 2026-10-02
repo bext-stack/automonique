@@ -172,6 +172,51 @@ host's headless Chromium (a Playwright cache or a system browser, or
 line otherwise; a navigation that produced an empty document is a failure,
 not a blank proof. It never runs past its deadline.
 
+Two more verbs are named by the method. Each is off until the operator writes
+its configuration, a private (`0600`, owner-only, regular) file in the state
+directory, which the verb finds through `AUTOMONIQUE_STATE_DIR` or, failing
+that, `XDG_STATE_HOME/automonique`. An absent file is "not configured", a
+present but wrong one is refused, and neither verb has a default host.
+
+`automonique share <image-file> --issue <github-issue-url> [--ttl-days N]`
+publishes one capture so the recap can show it. It refuses, before any
+request, a file that is a symbolic link, not a regular file, over 5 MiB, or
+not a PNG or JPEG by its content, and an `--issue` that is not a GitHub issue
+or pull-request URL. It prints `MONIQUE_SHARE_OK: <url>` then
+`MONIQUE_SHARE_NOTE: expires <YYYY-MM-DD>` (or `link does not expire` when the
+service applied no expiry), or one `MONIQUE_SHARE_FAIL: <reason>` line. Uploads
+expire after `ttl_days` (1 to 365, default 30). `share/share.conf`:
+
+```text
+schema=automonique.share/v1
+ingest_url=https://share.example.test/api/attachments/ingest
+secret=<the service's ingest secret>
+public_base=https://share.example.test
+ttl_days=30
+end=automonique.share/v1
+```
+
+`automonique purge --site <name>` asks the platform's local invalidate
+endpoint to drop one site's render cache. The endpoint addresses a site by
+name, so a URL is refused. It prints `MONIQUE_PURGE_OK: <name>` and a
+`status:` line, or one `MONIQUE_PURGE_FAIL: <reason>` line; a name the
+platform serves no site for is a failure. `endpoint` must be a plaintext
+loopback URL (`127.0.0.1`, `localhost` or `[::1]`); the three credentials are
+optional and sent only when present. `purge/purge.conf`:
+
+```text
+schema=automonique.purge/v1
+endpoint=http://127.0.0.1/<the platform's site invalidate path>
+app_id=<caller identity, sent as x-bext-app-id>
+sdk_token=<that identity's token, sent as x-bext-sdk-token>
+token=<sent as authorization: Bearer>
+end=automonique.purge/v1
+```
+
+Both files sit in a directory the agent's own user can read, so the agent can
+read what they hold. Give the share secret and the purge credentials only the
+reach these two verbs need.
+
 The worker accepts a job as done only when the provider's final message names
 the completion comment's permalink on the expected issue and, when the comment
 can be read back, that comment carries the per-request shape (a `Demande 1`

@@ -120,6 +120,12 @@ fn main() -> ExitCode {
     if command.as_deref() == Some(std::ffi::OsStr::new("shot")) {
         return shot_command(arguments.collect());
     }
+    if command.as_deref() == Some(std::ffi::OsStr::new("share")) {
+        return share_command(arguments.collect());
+    }
+    if command.as_deref() == Some(std::ffi::OsStr::new("purge")) {
+        return purge_command(arguments.collect());
+    }
     if command.as_deref() == Some(std::ffi::OsStr::new("backup")) {
         return backup_command(arguments.collect());
     }
@@ -664,6 +670,48 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `automonique share <image-file> --issue <github-issue-url> [--ttl-days N]`
+/// uploads one PNG or JPEG to the operator's file-share service and prints
+/// `MONIQUE_SHARE_OK: <url>` then a `MONIQUE_SHARE_NOTE:` line saying when the
+/// link expires, or one `MONIQUE_SHARE_FAIL: <reason>` line. The service is
+/// named only by `share/share.conf` in the state directory.
+fn share_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    use automonique_daemon::share::{MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, run};
+    use automonique_daemon::worker_verb::{LivePost, state_dir_from_environment};
+    let transport = LivePost::https(REQUEST_TIMEOUT, MAX_RESPONSE_BYTES);
+    worker_verb_exit(run(
+        state_dir_from_environment().as_deref(),
+        &values,
+        &transport,
+    ))
+}
+
+/// `automonique purge --site <name>` asks the platform's local invalidate
+/// endpoint to drop one site's render cache and prints
+/// `MONIQUE_PURGE_OK: <name>` + `status: …`, or one
+/// `MONIQUE_PURGE_FAIL: <reason>` line. The endpoint is named only by
+/// `purge/purge.conf` in the state directory and must be loopback.
+fn purge_command(values: Vec<std::ffi::OsString>) -> ExitCode {
+    use automonique_daemon::purge::{MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, run};
+    use automonique_daemon::worker_verb::{LivePost, state_dir_from_environment};
+    let transport = LivePost::loopback(REQUEST_TIMEOUT, MAX_RESPONSE_BYTES);
+    worker_verb_exit(run(
+        state_dir_from_environment().as_deref(),
+        &values,
+        &transport,
+    ))
+}
+
+fn worker_verb_exit(outcome: automonique_daemon::worker_verb::VerbOutcome) -> ExitCode {
+    for line in &outcome.lines {
+        println!("{line}");
+    }
+    if let Some(usage) = outcome.usage {
+        eprintln!("{usage}");
+    }
+    ExitCode::from(outcome.code)
 }
 
 fn ask_usage() -> ExitCode {

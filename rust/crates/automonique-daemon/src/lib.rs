@@ -247,6 +247,7 @@ pub mod progress_hub;
 pub mod provider_health;
 mod provider_route;
 pub mod provider_session_host;
+pub mod purge;
 pub mod release_activation;
 pub mod release_builder;
 pub mod reload;
@@ -255,6 +256,7 @@ pub mod reload_faults;
 pub mod run_lane;
 pub mod shadow;
 pub mod shadow_config;
+pub mod share;
 pub mod shot;
 pub mod shutdown_signal;
 pub mod site_inventory;
@@ -271,6 +273,7 @@ pub mod ticket_reactions;
 pub mod ticket_work;
 pub mod work_brief;
 pub mod work_method;
+pub mod worker_verb;
 
 use attempt_host::DaemonAttemptHost;
 
