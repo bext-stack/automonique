@@ -212,6 +212,7 @@ pub mod egress;
 pub mod execute;
 pub mod github;
 pub mod github_actions;
+pub mod github_references;
 pub mod improvement_github;
 pub mod improvement_publish;
 pub mod improvement_worker;

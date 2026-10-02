@@ -1213,7 +1213,12 @@ impl FakeGitHub {
 
 impl GitHubSurface for FakeGitHub {
     fn configured_repositories(&self) -> Vec<String> {
-        vec![String::from("example/read-repo")]
+        // The reads below serve these repositories; production refuses any other.
+        vec![
+            String::from("example/read-repo"),
+            String::from("example/repo"),
+            String::from("example/company-manager"),
+        ]
     }
 
     fn repository_push_activity(

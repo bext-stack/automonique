@@ -198,6 +198,25 @@ pub trait GitHubSurface: Send {
         detail: IssueFactDetail,
     ) -> Result<String, String>;
 
+    /// Configured `(alias, owner/repo)` pairs, so chat text such as
+    /// `alias#123` can name an allowlisted repository by its local alias.
+    fn configured_repository_aliases(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Read one exact allowlisted issue plus its most recent comments as a
+    /// typed, bounded brief. Read-only.
+    ///
+    /// The default reports the brief as unsupported so injected issue-only
+    /// surfaces keep answering through [`GitHubSurface::issue_facts`].
+    fn issue_brief(
+        &mut self,
+        _locator: &IssueLocator,
+        _recent_comments: usize,
+    ) -> Result<GitHubIssueBrief, String> {
+        Err(String::from(ISSUE_BRIEF_UNSUPPORTED))
+    }
+
     /// Complete an exact inventory-only issue with a deterministic report.
     ///
     /// The default keeps read-only injected surfaces read-only. Production
@@ -225,6 +244,32 @@ pub fn issue_facts_from_url(
     let locator = IssueLocator::parse(issue_url)
         .ok_or_else(|| String::from("status=refused reason=github_issue_url_not_canonical"))?;
     surface.issue_facts(&locator, detail)
+}
+
+/// Refusal a surface without typed issue briefs returns from
+/// [`GitHubSurface::issue_brief`].
+pub const ISSUE_BRIEF_UNSUPPORTED: &str =
+    "status=unavailable reason=github_issue_brief_unsupported";
+
+/// Most comments one [`GitHubIssueBrief`] carries.
+pub const MAX_ISSUE_BRIEF_COMMENTS: usize = 5;
+
+/// One referenced issue's current state and latest comments, untrusted text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHubIssueBrief {
+    /// `owner/repo#number`.
+    pub reference: String,
+    pub url: String,
+    /// `open` or `closed`.
+    pub state: String,
+    pub title: String,
+    pub labels: Vec<String>,
+    pub author: String,
+    pub comment_count: u32,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    /// The latest comments, oldest first.
+    pub recent_comments: Vec<GitHubContextComment>,
 }
 
 /// Bounded issue context supplied to the GitHub drafting worker.
@@ -1253,6 +1298,50 @@ impl GitHubSurface for GitHubWorkspace {
             }
         }
         Ok(facts)
+    }
+
+    fn configured_repository_aliases(&self) -> Vec<(String, String)> {
+        self.aliases
+            .iter()
+            .map(|(alias, target)| (alias.clone(), target.to_string()))
+            .collect()
+    }
+
+    fn issue_brief(
+        &mut self,
+        locator: &IssueLocator,
+        recent_comments: usize,
+    ) -> Result<GitHubIssueBrief, String> {
+        self.require_repository(locator.target())?;
+        let issue = accepted(
+            self.client
+                .get_issue(&GetIssueRequest::new(
+                    locator.target().clone(),
+                    locator.number(),
+                ))
+                .map_err(unavailable)?,
+        )?;
+        let keep = recent_comments.min(MAX_ISSUE_BRIEF_COMMENTS);
+        let comments = self.recent_issue_comments(locator, issue.comment_count, keep)?;
+        Ok(GitHubIssueBrief {
+            reference: format!("{}#{}", issue.target, issue.number),
+            url: issue.url,
+            state: issue.state.as_str().to_owned(),
+            title: issue.title,
+            labels: issue.labels,
+            author: issue.author,
+            comment_count: issue.comment_count,
+            updated_at: issue.updated_at,
+            closed_at: issue.closed_at,
+            recent_comments: comments
+                .into_iter()
+                .map(|comment| GitHubContextComment {
+                    author: comment.author,
+                    body: comment.body,
+                    updated_at: comment.updated_at,
+                })
+                .collect(),
+        })
     }
 
     fn complete_prism_inventory(

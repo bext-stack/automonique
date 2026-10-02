@@ -8515,26 +8515,17 @@ where
             }
         }
 
-        let references = github_issue_references(&reference_text, MAX_LIVE_GITHUB_ISSUES);
-        if !references.is_empty() {
-            let detail = if live.contains("[live_slack_channel]") {
-                IssueFactDetail::Summary
-            } else {
-                IssueFactDetail::Full
-            };
+        let slack_read = live.contains("[live_slack_channel]");
+        if let Some(facts) = live_github_issue_facts(
+            self.github
+                .as_deref_mut()
+                .map(|github| github as &mut dyn crate::github::GitHubSurface),
+            &reference_text,
+            slack_read,
+            MAX_LIVE_GITHUB_ISSUES,
+        ) {
             live.push_str("[live_github_issues]\n");
-            match self.github.as_deref_mut() {
-                None => live.push_str("status=unavailable reason=github_not_configured\n"),
-                Some(github) => {
-                    for locator in &references {
-                        live.push_str("issue=\n");
-                        match github.issue_facts(locator, detail) {
-                            Ok(facts) | Err(facts) => live.push_str(&facts),
-                        }
-                        live.push('\n');
-                    }
-                }
-            }
+            live.push_str(&facts);
             live.push_str("[/live_github_issues]");
         }
         live
@@ -10545,28 +10536,15 @@ fn live_operational_context<'s, 'g>(
     }
 
     if selections.github_issues {
-        let references = github_issue_references(&reference_text, MAX_LIVE_GITHUB_ISSUES);
         live.push_str("[live_github_issues]\n");
-        if references.is_empty() {
-            live.push_str("status=unavailable reason=no_concrete_issue_reference\n");
-        } else {
-            match github.as_mut() {
-                None => live.push_str("status=unavailable reason=github_not_configured\n"),
-                Some(github) => {
-                    let detail = if selections.slack_channel.is_some() {
-                        IssueFactDetail::Summary
-                    } else {
-                        IssueFactDetail::Full
-                    };
-                    for locator in &references {
-                        live.push_str("issue=\n");
-                        match github.issue_facts(locator, detail) {
-                            Ok(facts) | Err(facts) => live.push_str(&facts),
-                        }
-                        live.push('\n');
-                    }
-                }
-            }
+        match live_github_issue_facts(
+            github,
+            &reference_text,
+            selections.slack_channel.is_some(),
+            MAX_LIVE_GITHUB_ISSUES,
+        ) {
+            Some(facts) => live.push_str(&facts),
+            None => live.push_str("status=unavailable reason=no_concrete_issue_reference\n"),
         }
         live.push_str("[/live_github_issues]");
     }
@@ -13218,6 +13196,80 @@ fn deepseek_balance_text(read: crate::deepseek_balance::DeepSeekBalanceRead) -> 
 
 /// Extract exact GitHub issue URLs from untrusted prose, bounded and
 /// deduplicated. Repository authorization is enforced again by GitHubSurface.
+/// Characters the Slack-linked issue briefs may take in a shared-router
+/// context, which is itself bounded to [`MAX_QUESTION_CONTEXT_BYTES`] after
+/// memory and the Slack snapshot.
+const LIVE_GITHUB_ISSUE_BRIEF_BUDGET: usize = 3_000;
+
+/// The body of one `[live_github_issues]` block, or `None` when the text
+/// names no concrete issue.
+///
+/// References resolve against the allowlist in every shape people write them
+/// (`alias#12`, `owner/repo#12`, URLs, and bare numbers the text settles).
+/// When Slack was read, the issues it links are answered with state plus the
+/// latest comments' authors, one bounded line per reference with any failure
+/// named; otherwise each allowlisted issue gets its full typed facts.
+fn live_github_issue_facts(
+    github: Option<&mut (dyn crate::github::GitHubSurface + '_)>,
+    reference_text: &str,
+    slack_read: bool,
+    limit: usize,
+) -> Option<String> {
+    use crate::github_references::{
+        IssueReference, ReferenceSources, RepositoryCatalog, read_referenced_issues,
+        select_issue_references,
+    };
+    let selection = github.as_deref().map(|github| {
+        select_issue_references(
+            &ReferenceSources {
+                message: reference_text,
+                ..ReferenceSources::default()
+            },
+            &RepositoryCatalog::from_surface(github),
+        )
+    });
+    let mut references: Vec<IssueLocator> = selection
+        .iter()
+        .flat_map(|selection| &selection.references)
+        .filter_map(|reference| match reference {
+            IssueReference::Allowlisted(locator) => Some(locator.clone()),
+            _ => None,
+        })
+        .take(limit)
+        .collect();
+    if references.is_empty() {
+        references = github_issue_references(reference_text, limit);
+    }
+    let Some(github) = github else {
+        return (!references.is_empty())
+            .then(|| String::from("status=unavailable reason=github_not_configured\n"));
+    };
+    if slack_read
+        && let Some(selection) = selection.filter(|selection| !selection.references.is_empty())
+    {
+        let mut facts = read_referenced_issues(
+            github,
+            &selection.references,
+            LIVE_GITHUB_ISSUE_BRIEF_BUDGET,
+        )
+        .content;
+        facts.push('\n');
+        return Some(facts);
+    }
+    if references.is_empty() {
+        return None;
+    }
+    let mut facts = String::new();
+    for locator in &references {
+        facts.push_str("issue=\n");
+        match github.issue_facts(locator, IssueFactDetail::Full) {
+            Ok(rendered) | Err(rendered) => facts.push_str(&rendered),
+        }
+        facts.push('\n');
+    }
+    Some(facts)
+}
+
 fn github_issue_references(text: &str, limit: usize) -> Vec<IssueLocator> {
     let mut seen = BTreeSet::new();
     let mut references = Vec::new();
@@ -18742,5 +18794,100 @@ mod cross_transport_gate_tests {
             TicketGateRegistry::open(directory.path().join("ticket-confirmations.v1.json"))
                 .expect("registry reopens after notification delivery");
         assert!(reopened.pending_slack_notifications(8).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod live_github_issue_tests {
+    use super::*;
+    use crate::github::{GitHubContextComment, GitHubIssueBrief, GitHubSurface};
+
+    #[derive(Default)]
+    struct FakeIssues {
+        briefs: Vec<String>,
+        full_reads: Vec<String>,
+    }
+
+    impl GitHubSurface for FakeIssues {
+        fn configured_repositories(&self) -> Vec<String> {
+            vec![
+                String::from("example-org/alpha"),
+                String::from("example-org/beta"),
+            ]
+        }
+
+        fn configured_repository_aliases(&self) -> Vec<(String, String)> {
+            vec![
+                (String::from("alpha"), String::from("example-org/alpha")),
+                (String::from("beta"), String::from("example-org/beta")),
+            ]
+        }
+
+        fn issue_facts(
+            &mut self,
+            locator: &IssueLocator,
+            _detail: IssueFactDetail,
+        ) -> Result<String, String> {
+            let reference = format!("{}#{}", locator.target(), locator.number());
+            self.full_reads.push(reference.clone());
+            Ok(format!("status=available\nreference={reference}"))
+        }
+
+        fn issue_brief(
+            &mut self,
+            locator: &IssueLocator,
+            _recent_comments: usize,
+        ) -> Result<GitHubIssueBrief, String> {
+            let reference = format!("{}#{}", locator.target(), locator.number());
+            self.briefs.push(reference.clone());
+            Ok(GitHubIssueBrief {
+                url: format!(
+                    "https://github.com/{}/issues/{}",
+                    locator.target(),
+                    locator.number()
+                ),
+                reference,
+                state: String::from("open"),
+                title: String::from("Fixture"),
+                labels: Vec::new(),
+                author: String::from("requester"),
+                comment_count: 1,
+                updated_at: String::from("2026-10-02T09:00:00Z"),
+                closed_at: None,
+                recent_comments: vec![GitHubContextComment {
+                    author: String::from("reviewer"),
+                    body: String::from("Deployed to staging"),
+                    updated_at: String::from("2026-10-02T08:00:00Z"),
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn slack_linked_aliases_are_read_with_their_latest_comment_authors() {
+        let mut github = FakeIssues::default();
+        let facts = live_github_issue_facts(
+            Some(&mut github),
+            "are these done?\n10:01 client: alpha#12 and https://github.com/example-org/beta/issues/3",
+            true,
+            12,
+        )
+        .expect("references are answered");
+        assert_eq!(
+            github.briefs,
+            ["example-org/alpha#12", "example-org/beta#3"]
+        );
+        assert!(facts.contains("comment newest_rank=1 author=reviewer"));
+        assert!(github.full_reads.is_empty());
+    }
+
+    #[test]
+    fn a_direct_alias_question_keeps_full_issue_facts() {
+        let mut github = FakeIssues::default();
+        let facts = live_github_issue_facts(Some(&mut github), "what about beta#9?", false, 12)
+            .expect("references are answered");
+        assert_eq!(github.full_reads, ["example-org/beta#9"]);
+        assert!(facts.contains("reference=example-org/beta#9"));
+        assert!(live_github_issue_facts(Some(&mut github), "hello", false, 12).is_none());
     }
 }
