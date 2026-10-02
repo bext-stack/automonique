@@ -132,6 +132,29 @@ describe("canonical HTTPS Platform v1 transport", () => {
     expect(page.terminal_cursor).toBe(from + 2n);
   });
 
+  test("decodes multi-line message text and still refuses other control characters", async () => {
+    const scopedSession: ResourceCoordinate = {...session, authority: "automonique"};
+    const page = (text: string) => clientFor("request-history-lines", "session_history_result", {
+      applied_limit: 1n,
+      from_cursor: 0n,
+      has_more: false,
+      messages: [{at: 10n, cursor: 1n, evidence: "authoritative", role: "assistant", text, truncated: false}],
+      requested_limit: 1n,
+      run_states: [],
+      session: scopedSession,
+      terminal_cursor: 1n,
+      tool_states: [],
+      unknown_events: [],
+    }).sessionHistorySnapshot(scopedSession, 1n);
+    const fenced = "```text\nok\ndone\n```";
+    const decoded = await page(fenced);
+    expect(decoded.events[0]).toMatchObject({kind: "message", text: fenced});
+    const long = `${"x".repeat(8000)}\n${"y".repeat(8000)}`;
+    expect((await page(long)).events[0]).toMatchObject({kind: "message", text: long});
+    await expect(page("a\r\nb")).rejects.toThrow();
+    await expect(page("x".repeat(16385))).rejects.toThrow();
+  });
+
   test("turns retention into a typed resync error without yielding a partial page", async () => {
     const scopedSession: ResourceCoordinate = {...session, authority: "automonique"};
     const client = clientFor("request-history-resync", "session_history_resync", {

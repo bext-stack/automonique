@@ -305,7 +305,7 @@ fn one_retained_session_survives_three_scoped_clients_ambiguity_and_reconnect() 
             SESSION_ID,
             ManagedHistorySource::PlatformV1("acceptance-turn-1"),
             "operator follow-up\0normalized",
-            "bounded sanitized answer",
+            "bounded\nsanitized answer",
             &spool_events,
             110,
         )
@@ -361,11 +361,42 @@ fn one_retained_session_survives_three_scoped_clients_ambiguity_and_reconnect() 
             .windows(2)
             .all(|pair| pair[0].cursor() < pair[1].cursor())
     );
+    // A reader that names no text form gets the flat v1 projection.
     for event in &initial_history.events {
         if let SessionHistoryEvent::Message { text, .. } = event {
             assert!(!text.as_str().chars().any(char::is_control));
         }
     }
+    assert!(initial_history.events.iter().any(|event| matches!(
+        event,
+        SessionHistoryEvent::Message { text, .. } if text.as_str() == "bounded sanitized answer"
+    )));
+    // A reader that asks for multi-line text gets the retained line break.
+    let multiline = history_page(
+        sockets[0]
+            .session_history_snapshot_as(
+                session(),
+                32,
+                automonique_protocol::platform::SessionHistoryTextForm::Multiline,
+            )
+            .expect("multi-line history snapshot"),
+    );
+    assert_eq!(
+        multiline
+            .events
+            .iter()
+            .map(SessionHistoryEvent::cursor)
+            .collect::<Vec<_>>(),
+        initial_history
+            .events
+            .iter()
+            .map(SessionHistoryEvent::cursor)
+            .collect::<Vec<_>>()
+    );
+    assert!(multiline.events.iter().any(|event| matches!(
+        event,
+        SessionHistoryEvent::Message { text, .. } if text.as_str() == "bounded\nsanitized answer"
+    )));
     let (_, history_bytes) = raw_platform(
         &config,
         "acceptance-redaction-audit",

@@ -424,7 +424,7 @@ fn shared_fixture_names_every_required_boundary_and_mixed_version_recovery() {
         generated_platform_v1_schema_digest(),
         (
             "sha256",
-            "1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845".to_owned()
+            "6a318a0d326331946929ae497cf0aed2bde800156f51d482f3b7ab2a28af8550".to_owned()
         )
     );
     let fixture = include_str!("../fixtures/platform-v2-lineage-v1.json");

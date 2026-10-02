@@ -28,6 +28,7 @@ import {
   type ResourceAuthority,
   type ResourceCoordinate,
   type SessionHistoryEvidence,
+  type SessionHistoryMessageText,
   type SessionHistoryRole,
   type SessionHistoryRunState,
   type SessionHistoryText,
@@ -44,7 +45,7 @@ export const PLATFORM_MEDIA_TYPE = "application/vnd.automonique.platform.v1+json
 export type {PlatformRequest};
 
 export type SessionHistoryEvent =
-  | {readonly kind: "message"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly evidence: SessionHistoryEvidence; readonly role: SessionHistoryRole; readonly text: SessionHistoryText; readonly truncated: boolean}
+  | {readonly kind: "message"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly evidence: SessionHistoryEvidence; readonly role: SessionHistoryRole; readonly text: SessionHistoryMessageText; readonly truncated: boolean}
   | {readonly kind: "tool_state"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly evidence: SessionHistoryEvidence; readonly label: SessionHistoryText | null; readonly state: SessionHistoryToolState; readonly truncated: boolean}
   | {readonly kind: "run_state"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly state: SessionHistoryRunState}
   | {readonly kind: "unknown"; readonly at: PlatformEpochMillis; readonly cursor: ReturnType<typeof SessionHistoryCursor>; readonly source: SessionHistoryUnknownSource};

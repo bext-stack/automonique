@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 
 use automonique_protocol::platform::{
     IdempotencyKey, PlatformText, ReceiptOutcome, ResourceId, SessionHistoryEvent,
-    SessionHistoryEvidence, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
-    SessionHistoryToolState, SessionHistoryUnknownSource,
+    SessionHistoryEvidence, SessionHistoryMessageText, SessionHistoryRole, SessionHistoryRunState,
+    SessionHistoryText, SessionHistoryTextForm, SessionHistoryToolState,
+    SessionHistoryUnknownSource, fit_session_history_page,
 };
 use automonique_protocol::primitives::EpochMillis;
 use automonique_protocol::progress_api::ProgressFrame;
@@ -515,8 +516,10 @@ impl ManagedSessionStore {
         if at_ms < 0 {
             return Err(ManagedSessionError::InvalidField("at_ms"));
         }
-        let (user_text, user_truncated) = sanitize_history_text(user_text)?;
-        let (assistant_text, assistant_truncated) = sanitize_history_text(assistant_text)?;
+        let (raw_user_text, raw_assistant_text) = (user_text, assistant_text);
+        let (user_text, user_truncated) = sanitize_history_message_text(raw_user_text)?;
+        let (assistant_text, assistant_truncated) =
+            sanitize_history_message_text(raw_assistant_text)?;
         let projected = project_spool_events(spool_events)?;
         let transaction = self
             .connection
@@ -554,11 +557,36 @@ impl ManagedSessionStore {
             stored_assistant_truncated,
         )) = existing
         {
+            // A turn first recorded by a build that kept only the flat
+            // projection is the same turn when replayed now; anything else is
+            // a conflicting reuse of the source key.
+            let same = |stored: &str,
+                        stored_truncated: i64,
+                        raw: &str,
+                        text: &SessionHistoryMessageText,
+                        truncated: bool|
+             -> Managed<bool> {
+                if stored == text.as_str() && stored_truncated == i64::from(truncated) {
+                    return Ok(true);
+                }
+                let (flat, flat_truncated) = sanitize_history_text(raw)?;
+                Ok(stored == flat.as_str() && stored_truncated == i64::from(flat_truncated))
+            };
             if stored_session != provider_session_id
-                || stored_user != user_text.as_str()
-                || stored_user_truncated != i64::from(user_truncated)
-                || stored_assistant != assistant_text.as_str()
-                || stored_assistant_truncated != i64::from(assistant_truncated)
+                || !same(
+                    &stored_user,
+                    stored_user_truncated,
+                    raw_user_text,
+                    &user_text,
+                    user_truncated,
+                )?
+                || !same(
+                    &stored_assistant,
+                    stored_assistant_truncated,
+                    raw_assistant_text,
+                    &assistant_text,
+                    assistant_truncated,
+                )?
             {
                 return Err(ManagedSessionError::InvalidField("history_replay_conflict"));
             }
@@ -698,6 +726,56 @@ fn sanitize_history_text(value: &str) -> Managed<(SessionHistoryText, bool)> {
     Ok((text, truncated))
 }
 
+/// Shape one retained page for the reader: project message text to the form
+/// it asked for, then end the page early when the events would outgrow the
+/// page byte budget. An early end is reported as `has_more`, so the reader
+/// resumes from the last served cursor and nothing is skipped.
+pub fn serve_history_page(
+    events: Vec<SessionHistoryEvent>,
+    has_more: bool,
+    text_form: SessionHistoryTextForm,
+) -> (Vec<SessionHistoryEvent>, bool) {
+    let mut events: Vec<SessionHistoryEvent> = events
+        .into_iter()
+        .map(|event| event.project(text_form))
+        .collect();
+    let trimmed = fit_session_history_page(&mut events);
+    (events, has_more || trimmed)
+}
+
+/// Retained message text keeps its line structure: a line feed survives, a
+/// carriage return is dropped (so CRLF reads as one break), a tab and every
+/// other control character become a space. The result is cut on a character
+/// boundary at the multi-line bound, and the flag says whether it was cut.
+fn sanitize_history_message_text(value: &str) -> Managed<(SessionHistoryMessageText, bool)> {
+    let mut normalized: String = value
+        .chars()
+        .filter(|ch| *ch != '\r')
+        .map(|ch| {
+            if ch != '\n' && ch.is_control() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    if normalized.is_empty() && !value.is_empty() {
+        // Text made only of carriage returns still names a message.
+        normalized.push(' ');
+    }
+    let mut end = normalized
+        .len()
+        .min(automonique_protocol::platform::MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES);
+    while !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = end < normalized.len();
+    normalized.truncate(end);
+    let text = SessionHistoryMessageText::new(normalized)
+        .map_err(|_| ManagedSessionError::InvalidField("history_text"))?;
+    Ok((text, truncated))
+}
+
 fn project_spool_events(events: &[SpoolEvent]) -> Managed<Vec<PendingHistoryEvent>> {
     events
         .iter()
@@ -793,7 +871,8 @@ fn decode_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionHistoryEve
     if let Some(role) = role {
         let role = SessionHistoryRole::parse(&role).map_err(|_| rusqlite::Error::InvalidQuery)?;
         let text: String = row.get(3)?;
-        let text = SessionHistoryText::new(&text).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let text =
+            SessionHistoryMessageText::new(text).map_err(|_| rusqlite::Error::InvalidQuery)?;
         return Ok(SessionHistoryEvent::Message {
             cursor,
             at,
@@ -1399,6 +1478,135 @@ mod tests {
             text.as_str().len() <= automonique_protocol::platform::MAX_SESSION_HISTORY_TEXT_BYTES
         );
         assert!(!text.as_str().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn message_text_keeps_line_breaks_and_bounds_length() {
+        let (text, truncated) =
+            sanitize_history_message_text("```text\r\nok\ndone\n```\tend\0x").unwrap();
+        assert_eq!(text.as_str(), "```text\nok\ndone\n``` end x");
+        assert!(!truncated);
+
+        let limit = automonique_protocol::platform::MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES;
+        let exact = "a\n".repeat(limit / 2);
+        let (text, truncated) = sanitize_history_message_text(&exact).unwrap();
+        assert_eq!(text.as_str(), exact);
+        assert!(!truncated);
+
+        let input = format!("{}\nsecret", "é".repeat(limit));
+        let (text, truncated) = sanitize_history_message_text(&input).unwrap();
+        assert!(truncated);
+        assert!(text.as_str().len() <= limit && text.as_str().len() > limit - 2);
+        assert!(text.as_str().chars().all(|ch| ch == 'é'));
+
+        assert_eq!(sanitize_history_message_text("\r").unwrap().0.as_str(), " ");
+        assert!(sanitize_history_message_text("").is_err());
+    }
+
+    #[test]
+    fn served_pages_project_for_the_reader_and_fit_the_budget() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        let answer = format!("```text\nok\ndone\n```\n{}", "\"".repeat(15_000));
+        for turn in 0..40 {
+            store
+                .record_completed_turn(
+                    "session-1",
+                    ManagedHistorySource::PlatformV1(&format!("turn-{turn}")),
+                    "show it",
+                    &answer,
+                    &[],
+                    10,
+                )
+                .unwrap();
+        }
+        let ManagedHistoryRead::Page {
+            events, has_more, ..
+        } = store.history("session-1", 0, 64).unwrap()
+        else {
+            panic!("page");
+        };
+        assert!(has_more);
+        assert_eq!(events.len(), 64);
+
+        let (multiline, more) =
+            serve_history_page(events.clone(), has_more, SessionHistoryTextForm::Multiline);
+        assert!(more);
+        assert!(multiline.len() < 64, "budget ends the page early");
+        let SessionHistoryEvent::Message {
+            text, truncated, ..
+        } = &multiline[1]
+        else {
+            panic!("assistant message");
+        };
+        assert!(text.as_str().starts_with("```text\nok\ndone\n```\n"));
+        assert!(!truncated);
+        let budget: usize = multiline
+            .iter()
+            .map(SessionHistoryEvent::canonical_budget_len)
+            .sum();
+        assert!(budget <= automonique_protocol::platform::MAX_SESSION_HISTORY_PAGE_EVENT_BYTES);
+
+        let (flat, _) = serve_history_page(events, has_more, SessionHistoryTextForm::Flat);
+        let SessionHistoryEvent::Message {
+            text, truncated, ..
+        } = &flat[1]
+        else {
+            panic!("assistant message");
+        };
+        assert!(text.as_str().starts_with("```text ok done ``` "));
+        assert!(SessionHistoryText::new(text.as_str()).is_ok());
+        assert!(*truncated);
+    }
+
+    #[test]
+    fn replaying_a_turn_recorded_flat_by_an_older_build_is_not_a_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = ManagedSessionStore::open(root.path().join("managed.sqlite3")).unwrap();
+        let answer = "line one\r\nline two";
+        store
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hi",
+                answer,
+                &[],
+                10,
+            )
+            .unwrap();
+        // Rewrite the row as the previous build stored it.
+        let (flat, flat_truncated) = sanitize_history_text(answer).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE managed_session_history SET text=?1, truncated=?2 WHERE role='assistant'",
+                params![flat.as_str(), flat_truncated],
+            )
+            .unwrap();
+        store
+            .record_completed_turn(
+                "session-1",
+                ManagedHistorySource::PlatformV1("turn-1"),
+                "hi",
+                answer,
+                &[],
+                10,
+            )
+            .unwrap();
+        assert!(
+            store
+                .record_completed_turn(
+                    "session-1",
+                    ManagedHistorySource::PlatformV1("turn-1"),
+                    "hi",
+                    "a different answer",
+                    &[],
+                    10,
+                )
+                .is_err()
+        );
     }
 
     #[test]

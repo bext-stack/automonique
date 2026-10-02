@@ -120,7 +120,7 @@ use automonique_protocol::platform::{
     PlatformAction, PlatformMethod, PlatformRequest, PlatformResponse, PlatformText,
     PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate, ResourceId,
     ResourceKind, ResourceRecord, SessionCommandState, SessionCommandTarget, SessionHistoryPage,
-    SessionHistoryResync, SessionList, SessionRecord, Snapshot,
+    SessionHistoryResync, SessionHistoryTextForm, SessionList, SessionRecord, Snapshot,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformApiError, PlatformRequestMessage,
@@ -5392,12 +5392,18 @@ impl Daemon {
                     }
                 }
             }
-            PlatformRequest::SessionHistorySnapshot(request) => {
-                self.platform_session_history_snapshot(&request.session, request.limit)?
-            }
-            PlatformRequest::SessionHistoryPage(request) => {
-                self.platform_session_history(&request.session, request.after, request.limit)?
-            }
+            PlatformRequest::SessionHistorySnapshot(request) => self
+                .platform_session_history_snapshot(
+                    &request.session,
+                    request.limit,
+                    request.text_form,
+                )?,
+            PlatformRequest::SessionHistoryPage(request) => self.platform_session_history(
+                &request.session,
+                request.after,
+                request.limit,
+                request.text_form,
+            )?,
             PlatformRequest::SessionCommandState(request) => {
                 self.platform_session_command_state(&request.session, now_ms)?
             }
@@ -5577,6 +5583,7 @@ impl Daemon {
         session: &ResourceCoordinate,
         after: u64,
         limit: u16,
+        text_form: SessionHistoryTextForm,
     ) -> Result<PlatformResponse, DaemonError> {
         use managed_sessions::ManagedHistoryRead;
         let read = self
@@ -5589,6 +5596,8 @@ impl Daemon {
                 head: _,
                 has_more,
             } => {
+                let (events, has_more) =
+                    managed_sessions::serve_history_page(events, has_more, text_form);
                 let terminal = events.last().map_or(
                     after,
                     automonique_protocol::platform::SessionHistoryEvent::cursor,
@@ -5895,6 +5904,7 @@ impl Daemon {
         &self,
         session: &ResourceCoordinate,
         limit: u16,
+        text_form: SessionHistoryTextForm,
     ) -> Result<PlatformResponse, DaemonError> {
         use managed_sessions::ManagedHistoryRead;
         let read = self
@@ -5905,6 +5915,8 @@ impl Daemon {
             ManagedHistoryRead::Page {
                 events, has_more, ..
             } => {
+                let (events, has_more) =
+                    managed_sessions::serve_history_page(events, has_more, text_form);
                 let from = events
                     .first()
                     .map_or(0, |event| event.cursor().saturating_sub(1));

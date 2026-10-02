@@ -63,7 +63,8 @@ use automonique_protocol::platform::{
     MAX_SNAPSHOT_RESOURCES, PlatformAction, PlatformCursor, PlatformParameter, PlatformRequest,
     PlatformResponse, PlatformTransport, ReceiptOutcome, ResourceAuthority, ResourceCoordinate,
     ResourceId, ResourceKind, ResourceRecord, SessionCommandState, SessionFollowUpRequest,
-    SessionHistoryEvent, SessionHistoryPage, SessionHistoryResync, SessionRecord, SnapshotRequest,
+    SessionHistoryEvent, SessionHistoryPage, SessionHistoryResync, SessionHistoryTextForm,
+    SessionRecord, SnapshotRequest,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_REQUEST_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -2507,7 +2508,11 @@ impl WebIntegration {
                     None
                 };
                 let history = client
-                    .session_history_snapshot(coordinate.clone(), PLATFORM_SESSION_HISTORY_LIMIT)
+                    .session_history_snapshot_as(
+                        coordinate.clone(),
+                        PLATFORM_SESSION_HISTORY_LIMIT,
+                        SessionHistoryTextForm::Multiline,
+                    )
                     .map(platform_history_view)
                     .map_err(|_| "platform_unavailable")?;
                 let command = client
@@ -2532,7 +2537,12 @@ impl WebIntegration {
                 let coordinate = platform_session_coordinate(session_id)?;
                 let after = parse_platform_decimal(&after, true)?;
                 let history = client
-                    .session_history_page(coordinate.clone(), after, PLATFORM_SESSION_HISTORY_LIMIT)
+                    .session_history_page_as(
+                        coordinate.clone(),
+                        after,
+                        PLATFORM_SESSION_HISTORY_LIMIT,
+                        SessionHistoryTextForm::Multiline,
+                    )
                     .map(platform_history_view)
                     .map_err(|_| "platform_unavailable")?;
                 Ok(PlatformSessionActionView::Page {
@@ -7475,9 +7485,9 @@ mod tests {
         ActionReceipt, Attachment, ControlLease, ControlLeaseId, CursorTopic, Freshness,
         FreshnessState, PlatformAction, PlatformEvent, PlatformText, ReceiptId, ReceiptOutcome,
         ResourceId, ResourceKind, SessionCommandState, SessionCommandTarget, SessionHistoryEvent,
-        SessionHistoryEvidence, SessionHistoryPage, SessionHistoryResync, SessionHistoryRole,
-        SessionHistoryRunState, SessionHistoryText, SessionHistoryToolState,
-        SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
+        SessionHistoryEvidence, SessionHistoryMessageText, SessionHistoryPage,
+        SessionHistoryResync, SessionHistoryRole, SessionHistoryRunState, SessionHistoryText,
+        SessionHistoryToolState, SessionHistoryUnknownSource, SessionList, Snapshot, Subscription,
     };
     use automonique_protocol::primitives::{EpochMillis, Revision};
     use std::collections::VecDeque;
@@ -8334,6 +8344,7 @@ mod tests {
                     (2, PlatformRequest::SessionHistorySnapshot(value)) => {
                         assert_eq!(value.session, session);
                         assert_eq!(value.limit, PLATFORM_SESSION_HISTORY_LIMIT);
+                        assert_eq!(value.text_form, SessionHistoryTextForm::Multiline);
                         PlatformResponse::SessionHistory(
                             SessionHistoryPage::new(
                                 session.clone(),
@@ -8347,7 +8358,10 @@ mod tests {
                                     at: EpochMillis::from_millis(i64::try_from(LARGE + 1).unwrap()),
                                     evidence: SessionHistoryEvidence::Authoritative,
                                     role: SessionHistoryRole::Assistant,
-                                    text: SessionHistoryText::new("safe history").unwrap(),
+                                    text: SessionHistoryMessageText::new(
+                                        "safe history\nsecond line",
+                                    )
+                                    .unwrap(),
                                     truncated: false,
                                 }],
                             )
@@ -8370,6 +8384,7 @@ mod tests {
                     }
                     (4, PlatformRequest::SessionHistoryPage(value)) => {
                         assert_eq!(value.after, LARGE + 1);
+                        assert_eq!(value.text_form, SessionHistoryTextForm::Multiline);
                         PlatformResponse::SessionHistoryResync(
                             SessionHistoryResync::new(session.clone(), LARGE, LARGE + 9).unwrap(),
                         )
@@ -8463,6 +8478,11 @@ mod tests {
         assert_eq!(
             open["history"]["events"][0]["at_ms"],
             (LARGE + 1).to_string()
+        );
+        // The dashboard receives the retained line break intact.
+        assert_eq!(
+            open["history"]["events"][0]["text"],
+            "safe history\nsecond line"
         );
         assert_eq!(open["command"]["session"]["revision"], LARGE.to_string());
         assert_eq!(open["control"]["state"], "not_claimed");
@@ -8991,7 +9011,7 @@ mod tests {
                                             at: EpochMillis::from_millis(10),
                                             evidence: SessionHistoryEvidence::Authoritative,
                                             role: SessionHistoryRole::User,
-                                            text: SessionHistoryText::new("hello").unwrap(),
+                                            text: SessionHistoryMessageText::new("hello").unwrap(),
                                             truncated: false,
                                         },
                                         SessionHistoryEvent::ToolState {

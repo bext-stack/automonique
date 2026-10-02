@@ -155,6 +155,18 @@ export function PlatformText(value: string): PlatformText {
   return value as PlatformText;
 }
 
+/** Bounded string, at most 16384 UTF-8 bytes. */
+export type SessionHistoryMessageText = string & {readonly __brand: "SessionHistoryMessageText"};
+export const SessionHistoryMessageText_MAX_BYTES = 16384;
+export const SessionHistoryMessageText_PATTERN = /^(?:\n|[^\p{Cc}])+$/u;
+export function SessionHistoryMessageText(value: string): SessionHistoryMessageText {
+  if (value.length === 0) throw new ValidationError("SessionHistoryMessageText", "empty");
+  if (!isWellFormedUnicode(value)) throw new ValidationError("SessionHistoryMessageText", "invalid_character");
+  if (byteLength(value) > 16384) throw new ValidationError("SessionHistoryMessageText", "too_long");
+  if (!SessionHistoryMessageText_PATTERN.test(value)) throw new ValidationError("SessionHistoryMessageText", "invalid_character");
+  return value as SessionHistoryMessageText;
+}
+
 /** Bounded string, at most 512 UTF-8 bytes. */
 export type SessionHistoryText = string & {readonly __brand: "SessionHistoryText"};
 export const SessionHistoryText_MAX_BYTES = 512;
@@ -590,7 +602,7 @@ export interface DecodedHistoryMessage {
   readonly cursor: SessionHistoryCursor;
   readonly evidence: SessionHistoryEvidence;
   readonly role: SessionHistoryRole;
-  readonly text: SessionHistoryText;
+  readonly text: SessionHistoryMessageText;
   readonly truncated: boolean;
 }
 
@@ -611,7 +623,7 @@ export function decodeDecodedHistoryMessage(body: JsonValue): DecodedHistoryMess
     cursor: refuse(PLATFORM_COUNTER_OUT_OF_RANGE, () => SessionHistoryCursor(bodyUnsigned(fields, "cursor", PLATFORM_INVALID_BODY))),
     evidence: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryEvidence(bodyString(fields, "evidence", PLATFORM_INVALID_BODY))),
     role: refuse(PLATFORM_VALUE_INVALID, () => decodeSessionHistoryRole(bodyString(fields, "role", PLATFORM_INVALID_BODY))),
-    text: refuse(PLATFORM_VALUE_INVALID, () => SessionHistoryText(bodyString(fields, "text", PLATFORM_INVALID_BODY))),
+    text: refuse(PLATFORM_VALUE_INVALID, () => SessionHistoryMessageText(bodyString(fields, "text", PLATFORM_INVALID_BODY))),
     truncated: bodyBool(fields, "truncated", PLATFORM_INVALID_BODY),
   };
 }

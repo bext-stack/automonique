@@ -27,8 +27,24 @@ pub const MAX_SNAPSHOT_RESOURCES: usize = 512;
 pub const MAX_SUBSCRIPTION_EVENTS: usize = 512;
 /// Largest number of sanitized session-history events returned in one page.
 pub const MAX_SESSION_HISTORY_EVENTS: usize = 512;
-/// Largest display text retained in one mobile-safe history event.
+/// Largest single-line display text in one mobile-safe history event: tool
+/// labels, and every message text of the flat projection served to readers
+/// that did not ask for multi-line text.
 pub const MAX_SESSION_HISTORY_TEXT_BYTES: usize = 512;
+/// Largest message text of the multi-line projection. It matches the bound a
+/// provider answer is already held to, so history does not cut an answer the
+/// provider surface admitted whole.
+pub const MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES: usize = 16 * 1024;
+/// Largest canonical bytes the events of one history page may occupy.
+///
+/// A history response must fit the platform message ceiling whatever event
+/// count was requested. A server ends a page early (with `has_more`) rather
+/// than exceed this budget; the rest of the ceiling covers the page header and
+/// the message envelope.
+pub const MAX_SESSION_HISTORY_PAGE_EVENT_BYTES: usize = 384 * 1024;
+/// Upper bound on the canonical bytes one history event occupies besides its
+/// text value: keys, punctuation, cursor, timestamp, and closed spellings.
+pub const SESSION_HISTORY_EVENT_OVERHEAD_BYTES: usize = 256;
 /// Largest number of pending approvals exposed by one session command-state read.
 pub const MAX_SESSION_COMMAND_APPROVALS: usize = 128;
 /// Largest number of service methods advertised by one endpoint.
@@ -105,6 +121,117 @@ pub type PlatformText = BoundedString<MAX_PLATFORM_FIELD_BYTES>;
 /// Sanitized display text carried by session history. Raw provider payloads,
 /// prompts, tool inputs, and credentials have no representation in this type.
 pub type SessionHistoryText = BoundedString<MAX_SESSION_HISTORY_TEXT_BYTES>;
+
+/// Sanitized message text that may span lines.
+///
+/// It carries the guarantees of [`SessionHistoryText`] except two: a line feed
+/// is admitted (every other control character, carriage return and tab
+/// included, is still refused), and the bound is
+/// [`MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionHistoryMessageText(String);
+
+impl SessionHistoryMessageText {
+    pub const MAX_BYTES: usize = MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES;
+
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ValueError::Empty);
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(ValueError::TooLong {
+                max_bytes: Self::MAX_BYTES,
+                actual_bytes: value.len(),
+            });
+        }
+        if value.chars().any(|ch| ch != '\n' && ch.is_control()) {
+            return Err(ValueError::ControlCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// The version-one flat projection: line feeds become spaces and the text
+    /// is cut on a character boundary at [`MAX_SESSION_HISTORY_TEXT_BYTES`].
+    /// The flag says whether the cut removed anything.
+    #[must_use]
+    pub fn to_flat(&self) -> (SessionHistoryText, bool) {
+        let flat: String = self
+            .0
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let mut end = flat.len().min(MAX_SESSION_HISTORY_TEXT_BYTES);
+        while !flat.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = end < flat.len();
+        let text = SessionHistoryText::new(&flat[..end])
+            .expect("a non-empty, control-free prefix within the flat bound");
+        (text, cut)
+    }
+
+    /// Canonical JSON bytes of this value, quotes included.
+    #[must_use]
+    pub fn canonical_len(&self) -> usize {
+        canonical_text_len(&self.0)
+    }
+}
+
+impl fmt::Display for SessionHistoryMessageText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Canonical JSON bytes of one string, quotes included, for text whose only
+/// possible control character is a line feed.
+fn canonical_text_len(value: &str) -> usize {
+    2 + value.len()
+        + value
+            .bytes()
+            .filter(|byte| matches!(byte, b'"' | b'\\' | b'\n'))
+            .count()
+}
+
+/// Which message-text projection a history reader asked for.
+///
+/// A request naming no form asks for [`Self::Flat`], the version-one
+/// projection every deployed client decodes (no line feed, at most
+/// [`MAX_SESSION_HISTORY_TEXT_BYTES`]). Only a reader that sends
+/// `text_form: "multiline"` receives line breaks and the larger bound.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SessionHistoryTextForm {
+    #[default]
+    Flat,
+    Multiline,
+}
+
+impl SessionHistoryTextForm {
+    pub const ALL: [Self; 2] = [Self::Flat, Self::Multiline];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Multiline => "multiline",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, PlatformError> {
+        parse_closed(&Self::ALL, value, Self::as_str, "session_history_text_form")
+    }
+}
 /// Bounded free-form action input. Identifiers and display text retain the
 /// much smaller [`MAX_PLATFORM_FIELD_BYTES`] limit.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -544,7 +671,7 @@ pub enum SessionHistoryEvent {
         at: EpochMillis,
         evidence: SessionHistoryEvidence,
         role: SessionHistoryRole,
-        text: SessionHistoryText,
+        text: SessionHistoryMessageText,
         truncated: bool,
     },
     ToolState {
@@ -577,12 +704,78 @@ impl SessionHistoryEvent {
             | Self::Unknown { cursor, .. } => *cursor,
         }
     }
+
+    /// Upper bound on the canonical bytes this event adds to a history page.
+    #[must_use]
+    pub fn canonical_budget_len(&self) -> usize {
+        SESSION_HISTORY_EVENT_OVERHEAD_BYTES
+            + match self {
+                Self::Message { text, .. } => text.canonical_len(),
+                Self::ToolState { label, .. } => label
+                    .as_ref()
+                    .map_or(0, |label| canonical_text_len(label.as_str())),
+                Self::RunState { .. } | Self::Unknown { .. } => 0,
+            }
+    }
+
+    /// This event as the requested projection serves it. The multi-line form
+    /// is the retained event itself; the flat form folds line feeds and cuts
+    /// message text to the version-one bound, marking any cut as truncation.
+    #[must_use]
+    pub fn project(self, form: SessionHistoryTextForm) -> Self {
+        match (form, self) {
+            (
+                SessionHistoryTextForm::Flat,
+                Self::Message {
+                    cursor,
+                    at,
+                    evidence,
+                    role,
+                    text,
+                    truncated,
+                },
+            ) => {
+                let (flat, cut) = text.to_flat();
+                Self::Message {
+                    cursor,
+                    at,
+                    evidence,
+                    role,
+                    text: SessionHistoryMessageText(flat.into_inner()),
+                    truncated: truncated || cut,
+                }
+            }
+            (_, event) => event,
+        }
+    }
+}
+
+/// Keep the longest prefix of `events` whose canonical size fits
+/// [`MAX_SESSION_HISTORY_PAGE_EVENT_BYTES`]. The first event is always kept, so
+/// a page still advances; its worst case is far below the budget. Returns
+/// whether any event was left for the next page.
+pub fn fit_session_history_page(events: &mut Vec<SessionHistoryEvent>) -> bool {
+    let mut used = 0_usize;
+    let mut keep = 0_usize;
+    for event in events.iter() {
+        let next = used.saturating_add(event.canonical_budget_len());
+        if keep > 0 && next > MAX_SESSION_HISTORY_PAGE_EVENT_BYTES {
+            break;
+        }
+        used = next;
+        keep += 1;
+    }
+    let trimmed = keep < events.len();
+    events.truncate(keep);
+    trimmed
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionHistorySnapshotRequest {
     pub session: ResourceCoordinate,
     pub limit: u16,
+    /// Message-text projection; absent on the wire means [`SessionHistoryTextForm::Flat`].
+    pub text_form: SessionHistoryTextForm,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -590,6 +783,8 @@ pub struct SessionHistoryPageRequest {
     pub session: ResourceCoordinate,
     pub after: u64,
     pub limit: u16,
+    /// Message-text projection; absent on the wire means [`SessionHistoryTextForm::Flat`].
+    pub text_form: SessionHistoryTextForm,
 }
 
 fn validate_history_request(session: &ResourceCoordinate, limit: u16) -> Result<(), PlatformError> {
@@ -606,7 +801,18 @@ fn validate_history_request(session: &ResourceCoordinate, limit: u16) -> Result<
 impl SessionHistorySnapshotRequest {
     pub fn new(session: ResourceCoordinate, limit: u16) -> Result<Self, PlatformError> {
         validate_history_request(&session, limit)?;
-        Ok(Self { session, limit })
+        Ok(Self {
+            session,
+            limit,
+            text_form: SessionHistoryTextForm::Flat,
+        })
+    }
+
+    /// Ask for the given message-text projection instead of the flat one.
+    #[must_use]
+    pub const fn with_text_form(mut self, text_form: SessionHistoryTextForm) -> Self {
+        self.text_form = text_form;
+        self
     }
 }
 
@@ -617,7 +823,15 @@ impl SessionHistoryPageRequest {
             session,
             after,
             limit,
+            text_form: SessionHistoryTextForm::Flat,
         })
+    }
+
+    /// Ask for the given message-text projection instead of the flat one.
+    #[must_use]
+    pub const fn with_text_form(mut self, text_form: SessionHistoryTextForm) -> Self {
+        self.text_form = text_form;
+        self
     }
 }
 

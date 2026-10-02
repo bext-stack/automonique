@@ -896,7 +896,7 @@ fn canonical_lifecycle_documents_round_trip_and_refuse_drift() {
 fn platform_v1_generated_digest_remains_the_installed_pin() {
     assert_eq!(
         automonique_protocol::codegen::generated_platform_v1_schema_digest().1,
-        "1c3f561d137a14321cee480b8035341dd70b526ca501f2d5efd7f817a6e4b845"
+        "6a318a0d326331946929ae497cf0aed2bde800156f51d482f3b7ab2a28af8550"
     );
 }
 

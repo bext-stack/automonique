@@ -7316,6 +7316,13 @@ fn platform_module() -> GeneratedModule {
                 max_bytes: crate::platform::MAX_SESSION_HISTORY_TEXT_BYTES,
                 pattern: Some("^[^\\u0000]+$".to_owned()),
             },
+            // A line feed is the one control character message text admits;
+            // the grammar mirrors `SessionHistoryMessageText::new` exactly.
+            BoundedString {
+                name: "SessionHistoryMessageText".to_owned(),
+                max_bytes: crate::platform::MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES,
+                pattern: Some("^(?:\\n|[^\\p{Cc}])+$".to_owned()),
+            },
         ],
         bounded_integers: vec![
             BoundedInteger {
@@ -7700,7 +7707,7 @@ fn platform_module() -> GeneratedModule {
                         ),
                         platform_field("evidence", platform_enum("SessionHistoryEvidence")),
                         platform_field("role", platform_enum("SessionHistoryRole")),
-                        platform_field("text", platform_checked("SessionHistoryText")),
+                        platform_field("text", platform_checked("SessionHistoryMessageText")),
                         platform_field("truncated", ResponseValue::Bool),
                     ],
                 ),

@@ -607,7 +607,7 @@ fn every_platform_response_has_one_canonical_round_trip() {
                         at: EpochMillis::from_millis(1),
                         evidence: SessionHistoryEvidence::Authoritative,
                         role: SessionHistoryRole::User,
-                        text: SessionHistoryText::new("hello").unwrap(),
+                        text: SessionHistoryMessageText::new("hello\n```text\nok\n```").unwrap(),
                         truncated: false,
                     },
                     SessionHistoryEvent::ToolState {
@@ -649,4 +649,203 @@ fn every_platform_response_has_one_canonical_round_trip() {
             framed
         );
     }
+}
+
+fn history_message(cursor: u64, text: &str, truncated: bool) -> SessionHistoryEvent {
+    SessionHistoryEvent::Message {
+        cursor,
+        at: EpochMillis::from_millis(1),
+        evidence: SessionHistoryEvidence::Authoritative,
+        role: SessionHistoryRole::Assistant,
+        text: SessionHistoryMessageText::new(text).unwrap(),
+        truncated,
+    }
+}
+
+#[test]
+fn history_message_text_admits_line_feeds_and_nothing_else_controlled() {
+    let fenced = "```text\nok\ndone\n```";
+    assert_eq!(
+        SessionHistoryMessageText::new(fenced).unwrap().as_str(),
+        fenced
+    );
+    for control in ['\r', '\t', '\0', '\u{1b}', '\u{7f}', '\u{85}'] {
+        assert_eq!(
+            SessionHistoryMessageText::new(format!("a{control}b")),
+            Err(ValueError::ControlCharacter),
+            "{control:?} must be refused"
+        );
+    }
+    assert_eq!(SessionHistoryMessageText::new(""), Err(ValueError::Empty));
+    let at_bound = "é".repeat(MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES / 2);
+    assert!(SessionHistoryMessageText::new(at_bound.clone()).is_ok());
+    assert_eq!(
+        SessionHistoryMessageText::new(format!("{at_bound}x")),
+        Err(ValueError::TooLong {
+            max_bytes: MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES,
+            actual_bytes: MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES + 1,
+        })
+    );
+    // Tool labels keep the single-line type.
+    assert_eq!(
+        SessionHistoryText::new("a\nb"),
+        Err(ValueError::ControlCharacter)
+    );
+}
+
+#[test]
+fn history_message_text_round_trips_and_wire_refuses_other_controls() {
+    let session = coordinate(ResourceAuthority::Automonique, ResourceKind::Session);
+    let long = format!("{}\n{}", "x".repeat(8_000), "y".repeat(8_000));
+    let page = SessionHistoryPage::new(
+        session,
+        2,
+        2,
+        0,
+        2,
+        false,
+        vec![
+            history_message(1, "```text\nok\ndone\n```", false),
+            history_message(2, &long, false),
+        ],
+    )
+    .unwrap();
+    let framed = PlatformResponseMessage::new(
+        RequestId::new("multiline-history").unwrap(),
+        PlatformResponse::SessionHistory(page),
+    );
+    let bytes = framed.to_message().unwrap().to_canonical_bytes();
+    assert_eq!(
+        PlatformResponseMessage::from_canonical_bytes(&bytes).unwrap(),
+        framed
+    );
+    // The escaped line feed is the only control that may appear; a carriage
+    // return smuggled into the same field refuses the whole response.
+    let smuggled = String::from_utf8(bytes)
+        .unwrap()
+        .replacen("ok\\ndone", "ok\\r\\ndone", 1);
+    assert!(PlatformResponseMessage::from_canonical_bytes(smuggled.as_bytes()).is_err());
+}
+
+#[test]
+fn history_requests_default_to_the_flat_v1_body_and_opt_into_multiline() {
+    let session = coordinate(ResourceAuthority::Automonique, ResourceKind::Session);
+    let flat = PlatformRequestMessage::new(
+        RequestId::new("history-flat").unwrap(),
+        PlatformRequest::SessionHistorySnapshot(
+            SessionHistorySnapshotRequest::new(session.clone(), 8).unwrap(),
+        ),
+    );
+    let message = flat.to_message().unwrap();
+    let JsonValue::Object(entries) = message.body().clone() else {
+        panic!("request body is an object");
+    };
+    // The same key set every v1 daemon already admits.
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        ["limit", "session"]
+    );
+
+    for request in [
+        PlatformRequest::SessionHistorySnapshot(
+            SessionHistorySnapshotRequest::new(session.clone(), 8)
+                .unwrap()
+                .with_text_form(SessionHistoryTextForm::Multiline),
+        ),
+        PlatformRequest::SessionHistoryPage(
+            SessionHistoryPageRequest::new(session.clone(), 4, 8)
+                .unwrap()
+                .with_text_form(SessionHistoryTextForm::Multiline),
+        ),
+    ] {
+        let framed = PlatformRequestMessage::new(RequestId::new("history-ml").unwrap(), request);
+        let bytes = framed.to_message().unwrap().to_canonical_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"text_form\":\"multiline\""));
+        assert_eq!(
+            PlatformRequestMessage::from_canonical_bytes(&bytes).unwrap(),
+            framed
+        );
+        let unknown = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"multiline\"", "\"html\"");
+        assert!(PlatformRequestMessage::from_canonical_bytes(unknown.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn flat_projection_folds_lines_and_cuts_to_the_v1_bound() {
+    let event = history_message(1, "```text\nok\ndone\n```", false);
+    let SessionHistoryEvent::Message {
+        text, truncated, ..
+    } = event.clone().project(SessionHistoryTextForm::Flat)
+    else {
+        panic!("message");
+    };
+    assert_eq!(text.as_str(), "```text ok done ```");
+    assert!(!truncated);
+    assert_eq!(
+        event.clone().project(SessionHistoryTextForm::Multiline),
+        event
+    );
+
+    let long = history_message(2, &format!("{}\n{}", "é".repeat(300), "z"), false);
+    let SessionHistoryEvent::Message {
+        text, truncated, ..
+    } = long.project(SessionHistoryTextForm::Flat)
+    else {
+        panic!("message");
+    };
+    assert!(truncated);
+    assert!(text.as_str().len() <= MAX_SESSION_HISTORY_TEXT_BYTES);
+    // A flat page decodes under the single-line rules older readers apply.
+    assert!(SessionHistoryText::new(text.as_str()).is_ok());
+}
+
+fn history_response_len(page: SessionHistoryPage) -> usize {
+    PlatformResponseMessage::new(
+        RequestId::new("history-size").unwrap(),
+        PlatformResponse::SessionHistory(page),
+    )
+    .to_message()
+    .unwrap()
+    .to_canonical_bytes()
+    .len()
+}
+
+#[test]
+fn a_budgeted_history_page_always_fits_the_platform_response_ceiling() {
+    use automonique_protocol::platform_api::MAX_PLATFORM_CANONICAL_BYTES;
+
+    let session = coordinate(ResourceAuthority::Automonique, ResourceKind::Session);
+    // Worst case: every event a maximal message made only of characters the
+    // canonical encoder doubles.
+    let worst = "\"".repeat(MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES);
+    let mut events: Vec<_> = (1..=u64::try_from(MAX_SESSION_HISTORY_EVENTS).unwrap())
+        .map(|cursor| history_message(cursor, &worst, false))
+        .collect();
+    assert!(fit_session_history_page(&mut events));
+    assert!(!events.is_empty() && events.len() < MAX_SESSION_HISTORY_EVENTS);
+    let terminal = events.last().unwrap().cursor();
+    let limit = u16::try_from(MAX_SESSION_HISTORY_EVENTS).unwrap();
+    let page =
+        SessionHistoryPage::new(session.clone(), limit, limit, 0, terminal, true, events).unwrap();
+    let length = history_response_len(page);
+    assert!(length <= MAX_PLATFORM_CANONICAL_BYTES, "{length}");
+
+    // The per-event estimate never undercounts a real event.
+    let one = history_message(1, &format!("a\"b\\c\nd{}", "é".repeat(100)), true);
+    let alone =
+        SessionHistoryPage::new(session.clone(), 1, 1, 0, 1, false, vec![one.clone()]).unwrap();
+    let empty = SessionHistoryPage::new(session, 1, 1, 1, 1, false, Vec::new()).unwrap();
+    assert!(
+        history_response_len(alone) - history_response_len(empty) <= one.canonical_budget_len()
+    );
+
+    // A small page is left whole.
+    let mut small = vec![history_message(1, "a\nb", false)];
+    assert!(!fit_session_history_page(&mut small));
+    assert_eq!(small.len(), 1);
 }

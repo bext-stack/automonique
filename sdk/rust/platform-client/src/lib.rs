@@ -26,8 +26,8 @@ use automonique_protocol::platform::{
     PlatformText, ReceiptId, ReceiptOutcome, ReleaseControlRequest, ResourceAuthority,
     ResourceCoordinate, ResourceRecord, SessionCommandState, SessionCommandStateRequest,
     SessionFollowUpRequest, SessionHistoryPage, SessionHistoryPageRequest, SessionHistoryResync,
-    SessionHistorySnapshotRequest, SessionList, Snapshot, SnapshotRequest, SubscribeRequest,
-    Subscription,
+    SessionHistorySnapshotRequest, SessionHistoryTextForm, SessionList, Snapshot, SnapshotRequest,
+    SubscribeRequest, Subscription,
 };
 use automonique_protocol::platform_api::{
     MAX_PLATFORM_CANONICAL_BYTES, PlatformRequestMessage, PlatformResponseMessage,
@@ -805,8 +805,22 @@ impl<T: PlatformTransport> PlatformClient<T> {
         session: ResourceCoordinate,
         limit: u16,
     ) -> Result<SessionHistoryResult, ClientError> {
+        self.session_history_snapshot_as(session, limit, SessionHistoryTextForm::Flat)
+    }
+
+    /// Read a retained-history snapshot with message text in `text_form`.
+    ///
+    /// [`SessionHistoryTextForm::Multiline`] is understood only by daemons
+    /// that know the form; an older daemon refuses the request body.
+    pub fn session_history_snapshot_as(
+        &mut self,
+        session: ResourceCoordinate,
+        limit: u16,
+        text_form: SessionHistoryTextForm,
+    ) -> Result<SessionHistoryResult, ClientError> {
         let request = SessionHistorySnapshotRequest::new(session.clone(), limit)
-            .map_err(|_| ClientError::Protocol)?;
+            .map_err(|_| ClientError::Protocol)?
+            .with_text_form(text_form);
         self.session_history_result(session, PlatformRequest::SessionHistorySnapshot(request))
     }
 
@@ -817,8 +831,20 @@ impl<T: PlatformTransport> PlatformClient<T> {
         after: u64,
         limit: u16,
     ) -> Result<SessionHistoryResult, ClientError> {
+        self.session_history_page_as(session, after, limit, SessionHistoryTextForm::Flat)
+    }
+
+    /// Continue retained history with message text in `text_form`.
+    pub fn session_history_page_as(
+        &mut self,
+        session: ResourceCoordinate,
+        after: u64,
+        limit: u16,
+        text_form: SessionHistoryTextForm,
+    ) -> Result<SessionHistoryResult, ClientError> {
         let request = SessionHistoryPageRequest::new(session.clone(), after, limit)
-            .map_err(|_| ClientError::Protocol)?;
+            .map_err(|_| ClientError::Protocol)?
+            .with_text_form(text_form);
         self.session_history_result(session, PlatformRequest::SessionHistoryPage(request))
     }
 

@@ -24,6 +24,48 @@ pub const MAX_PLATFORM_CANONICAL_BYTES: usize = 512 * 1024;
 /// snapshot can carry many records; no request carries record payloads.
 pub const MAX_PLATFORM_REQUEST_CANONICAL_BYTES: usize = 128 * 1024;
 
+/// A history page at its event budget, plus the largest single event that may
+/// overrun it, plus a page header and envelope, fits the response ceiling.
+const _: () = assert!(
+    MAX_SESSION_HISTORY_PAGE_EVENT_BYTES
+        + 2 * MAX_SESSION_HISTORY_MESSAGE_TEXT_BYTES
+        + 2
+        + SESSION_HISTORY_EVENT_OVERHEAD_BYTES
+        + 16 * 1024
+        <= MAX_PLATFORM_CANONICAL_BYTES,
+    "a budgeted session-history page must fit the platform response ceiling"
+);
+
+/// Request body for one history read: the flat form is the version-one body
+/// with no `text_form` key, so every daemon in the field still admits it.
+fn history_request_fields(
+    mut entries: Vec<(&'static str, JsonValue)>,
+    text_form: SessionHistoryTextForm,
+) -> JsonValue {
+    if text_form != SessionHistoryTextForm::Flat {
+        entries.push((
+            "text_form",
+            JsonValue::String(text_form.as_str().to_owned()),
+        ));
+    }
+    object(entries)
+}
+
+/// Admit either the version-one key set or the same set plus `text_form`.
+fn history_request_text_form(
+    body: &JsonValue,
+    fields: &[&str],
+) -> Result<SessionHistoryTextForm, PlatformApiError> {
+    if body.get("text_form").is_none() {
+        exact_fields(body, fields)?;
+        return Ok(SessionHistoryTextForm::Flat);
+    }
+    let mut with_form = fields.to_vec();
+    with_form.push("text_form");
+    exact_fields(body, &with_form)?;
+    Ok(SessionHistoryTextForm::parse(string(body, "text_form")?)?)
+}
+
 /// Refusal while admitting or assembling a platform frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlatformApiError {
@@ -540,7 +582,8 @@ fn decode_history_events(value: &JsonValue) -> Result<Vec<SessionHistoryEvent>, 
             ),
             evidence: SessionHistoryEvidence::parse(string(item, "evidence")?)?,
             role: SessionHistoryRole::parse(string(item, "role")?)?,
-            text: history_text(string(item, "text")?)?,
+            text: SessionHistoryMessageText::new(string(item, "text")?.to_owned())
+                .map_err(PlatformError::Field)?,
             truncated: boolean(item, "truncated")?,
         });
     }
@@ -719,15 +762,21 @@ fn request_body(request: &PlatformRequest) -> Result<JsonValue, PlatformApiError
             ),
             ("session", coordinate_json(&request.session)),
         ])),
-        PlatformRequest::SessionHistorySnapshot(request) => Ok(object(vec![
-            ("limit", integer(u64::from(request.limit), "limit")?),
-            ("session", coordinate_json(&request.session)),
-        ])),
-        PlatformRequest::SessionHistoryPage(request) => Ok(object(vec![
-            ("after", integer(request.after, "after")?),
-            ("limit", integer(u64::from(request.limit), "limit")?),
-            ("session", coordinate_json(&request.session)),
-        ])),
+        PlatformRequest::SessionHistorySnapshot(request) => Ok(history_request_fields(
+            vec![
+                ("limit", integer(u64::from(request.limit), "limit")?),
+                ("session", coordinate_json(&request.session)),
+            ],
+            request.text_form,
+        )),
+        PlatformRequest::SessionHistoryPage(request) => Ok(history_request_fields(
+            vec![
+                ("after", integer(request.after, "after")?),
+                ("limit", integer(u64::from(request.limit), "limit")?),
+                ("session", coordinate_json(&request.session)),
+            ],
+            request.text_form,
+        )),
         PlatformRequest::SessionCommandState(request) => {
             validate_command_coordinate_value(&request.session, ResourceKind::Session)?;
             Ok(object(vec![("session", coordinate_json(&request.session))]))
@@ -1043,22 +1092,24 @@ fn request_from_message(message: &Message) -> Result<PlatformRequest, PlatformAp
             ))
         }
         "session_history_snapshot" => {
-            exact_fields(body, &["limit", "session"])?;
+            let text_form = history_request_text_form(body, &["limit", "session"])?;
             Ok(PlatformRequest::SessionHistorySnapshot(
                 SessionHistorySnapshotRequest::new(
                     coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
                     history_limit(body, "limit")?,
-                )?,
+                )?
+                .with_text_form(text_form),
             ))
         }
         "session_history_page" => {
-            exact_fields(body, &["after", "limit", "session"])?;
+            let text_form = history_request_text_form(body, &["after", "limit", "session"])?;
             Ok(PlatformRequest::SessionHistoryPage(
                 SessionHistoryPageRequest::new(
                     coordinate(body.get("session").ok_or(PlatformApiError::InvalidBody)?)?,
                     unsigned(body, "after")?,
                     history_limit(body, "limit")?,
-                )?,
+                )?
+                .with_text_form(text_form),
             ))
         }
         _ => Err(PlatformApiError::UnknownKind),

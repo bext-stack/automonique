@@ -364,6 +364,32 @@ test("completed sessions open history and enable only exact revision follow-ups"
   await expect(page.locator("#platform-composer-note")).toContainText("9007199254740995");
 });
 
+test("long multi-line history answers keep their line breaks and code fences", async ({ page }) => {
+  const retained = structuredClone(cockpit);
+  const session = retained.retained_v1.sessions[0];
+  const tail = "end of a long answer";
+  const answer = `Summary line\nsecond line\n\n\`\`\`text\nok\ndone\n\`\`\`\n\n${"word ".repeat(400)}${tail}`;
+  await page.route("**/api/platform/session", async (route) => {
+    const request = route.request().postDataJSON();
+    if (request.action !== "open") return route.fallback();
+    return route.fulfill({ json: {
+      state: "open", session, attachment_cursor: null,
+      history: { state: "page", terminal_cursor: "1", events: [{ kind: "message", role: "assistant", cursor: "1", text: answer, truncated: false }], has_more: false },
+      command: { state: "ready", session: { revision: "9007199254740995" }, pending_approvals: [] },
+      control: { state: "not_claimed", available: false },
+    } });
+  });
+  await page.evaluate((view) => globalThis.renderPlatform(view), retained);
+  await page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" }).click();
+  const message = page.locator("#platform-history .platform-history-text").first();
+  await expect(message.locator("pre code")).toHaveText("ok\ndone");
+  const paragraphs = message.locator("p");
+  await expect(paragraphs).toHaveCount(2);
+  expect(await paragraphs.first().innerText()).toBe("Summary line\nsecond line");
+  await expect(paragraphs.last()).toContainText(tail);
+  await expect(message).not.toContainText("Shortened by the server.");
+});
+
 test("retained session selection and detach never discard the cockpit snapshot", async ({ page }) => {
   await page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" }).click();
   await expect(page.locator(".platform-session-option").filter({ hasText: "Retained cockpit work" })).toBeVisible();
