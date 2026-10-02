@@ -254,7 +254,8 @@ export class MobileSessionClient {
   private requireSession(session: ResourceCoordinate): void {
     this.requireAuthorization();
     requireCoordinate(session, "session");
-    if (!this.authorization.session_scope.some((id) => String(id) === String(session.id))) {
+    if (!this.authorization.actions.includes("all_sessions")
+      && !this.authorization.session_scope.some((id) => String(id) === String(session.id))) {
       throw new MobileSessionError("session_not_authorized");
     }
   }

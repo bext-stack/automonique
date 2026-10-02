@@ -9,6 +9,8 @@
     "test:browser:live": "playwright test --project=live-cockpit --reporter=line"
   },
   "devDependencies": {
-    "@playwright/test": "1.58.0"
+    "@playwright/test": "1.58.0",
+    "jsqr": "1.4.0",
+    "pngjs": "7.0.0"
   }
 }
