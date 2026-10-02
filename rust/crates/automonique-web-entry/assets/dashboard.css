@@ -682,6 +682,7 @@ kbd { display: inline-block; min-width: 18px; padding: 1px 5px; border: 1px soli
 .tab-quiet { margin-left: 6px; color: var(--quiet); }
 .tab-badge { min-width: 18px; padding: 0 5px; border-radius: 999px; color: var(--accent-text); background: var(--accent-soft); font-size: var(--font-2xs); font-weight: 600; line-height: 17px; text-align: center; }
 .tab-badge[data-tone="danger"] { color: var(--red); background: var(--danger-soft); }
+.tab-badge[data-tone="warn"] { color: var(--amber); background: var(--warn-soft); }
 .command-trigger { display: flex; flex: 0 1 260px; min-width: 120px; margin-left: auto; height: 30px; gap: 8px; align-items: center; padding: 0 6px 0 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--quiet); background: var(--field-surface); font-size: var(--font-sm); text-align: left; }
 .command-trigger:hover { border-color: var(--line-bright); color: var(--muted); }
 .command-trigger svg, .search-field svg, .command-input-row svg { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }

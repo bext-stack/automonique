@@ -1242,6 +1242,15 @@ const frenchUi = Object.freeze({
   "Close conversation": "Fermer la conversation",
   "Read only": "Lecture seule",
   "View run": "Voir l’exécution",
+  "Show runs": "Voir les exécutions",
+  "Agent runs": "Exécutions d’agent",
+  "Waiting for approval": "En attente d’approbation",
+  "to approve": "à approuver",
+  "To approve": "À approuver",
+  "can change data": "modifient des données",
+  "Approve in Manage ↗": "Approuver dans Manage ↗",
+  "Waiting for your approval in Manage. Nothing runs until it is approved.": "En attente de votre approbation dans Manage. Rien ne s’exécute avant.",
+  "Nothing runs until you approve in Manage.": "Rien ne s’exécute avant votre approbation dans Manage.",
   "Open the run to see what went wrong.": "Ouvrez l’exécution pour voir ce qui n’a pas marché.",
   "Opening…": "Ouverture…",
   "Opening conversation…": "Ouverture de la conversation…",
@@ -1667,6 +1676,7 @@ function translatePhraseForFrench(value) {
     [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
     [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
+    [/^(\S+) agent runs? waits? for your approval$/, (match) => `${match[1]} exécution${match[1] === "1" ? "" : "s"} d’agent attend${match[1] === "1" ? "" : "ent"} votre approbation`],
     [/^Worked: (.+) · (\d+) steps?$/, (match) => `Travail : ${match[1]} · ${match[2]} étape${match[2] === "1" ? "" : "s"}`],
     [/^Working · (\d+) steps?$/, (match) => `En cours · ${match[1]} étape${match[1] === "1" ? "" : "s"}`],
     [/^Updated (.+)$/, (match) => `Mis à jour ${translatePhraseForFrench(match[1])}`],
@@ -2071,8 +2081,8 @@ function toast(message, kind = "info") {
 
 function attention(status) {
   const items = [];
-  const add = (key, title, detail, href = null, processId = null) => {
-    if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href, processId });
+  const add = (key, title, detail, href = null, processId = null, processFilterName = null) => {
+    if (!items.some((item) => item.key === key)) items.push({ key, title, detail, href, processId, processFilterName });
   };
   if (status.health !== "operational") add("runtime", "Monique is not fully healthy", `Current state: ${status.health || "unavailable"}.`);
   if (status.stale) add("stale", "Status is out of date", "This page has not received a recent status update.");
@@ -2082,6 +2092,17 @@ function attention(status) {
   if (status.accepting_intake === false) add("intake", "Not accepting new work", "Monique is not taking new requests right now.");
   if (processesSnapshot?.health === "stale") add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
   const manageJobs = Array.isArray(processesSnapshot?.jobs) && ["ready", "degraded"].includes(processesSnapshot.health) ? processesSnapshot.jobs : [];
+  const awaitingApproval = manageJobs.filter((job) => job.status === "pending_approval");
+  if (awaitingApproval.length > 0) {
+    add(
+      "manage:approval",
+      `${count(awaitingApproval.length)} agent run${awaitingApproval.length === 1 ? " waits" : "s wait"} for your approval`,
+      "Nothing runs until you approve in Manage.",
+      safeTicketLink(awaitingApproval[0].manage_url),
+      null,
+      "approval",
+    );
+  }
   manageJobs.filter((job) => job.status === "failed").slice(0, 5).forEach((job) => {
     add(
       `manage:${job.id}`,
@@ -2116,6 +2137,17 @@ function renderAttention(status) {
     const detail = document.createElement("span");
     detail.textContent = item.detail;
     row.append(title, detail);
+    if (item.processFilterName) {
+      const show = document.createElement("button");
+      show.type = "button";
+      show.className = "button ghost small";
+      show.textContent = "Show runs";
+      show.addEventListener("click", () => {
+        window.location.hash = "#operations";
+        window.setTimeout(() => setProcessFilter(item.processFilterName), 0);
+      });
+      row.append(show);
+    }
     if (item.processId) {
       // Always reachable in the dashboard, even when Manage gave no link.
       const open = document.createElement("button");
@@ -2696,7 +2728,7 @@ function operationsMessage(health) {
 }
 
 function processStatusLabel(status) {
-  const labels = { pending: "Queued in Manage", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", authenticated: "Signed in" };
+  const labels = { pending: "Queued in Manage", pending_approval: "Waiting for approval", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", authenticated: "Signed in" };
   return labels[status] || operationLabel(status);
 }
 
@@ -2704,6 +2736,7 @@ function processMatches(job, filter) {
   if (filter === "all") return true;
   if (filter === "active") return job.status === "running";
   if (filter === "queued") return job.status === "pending";
+  if (filter === "approval") return job.status === "pending_approval";
   if (filter === "completed") return job.status === "done";
   if (filter === "failed") return job.status === "failed";
   return false;
@@ -2780,7 +2813,7 @@ function renderProcessWorker(worker, health) {
 }
 
 function setProcessFilter(filter) {
-  processFilter = ["all", "active", "queued", "failed", "completed"].includes(filter) ? filter : "all";
+  processFilter = ["all", "active", "queued", "approval", "failed", "completed"].includes(filter) ? filter : "all";
   document.querySelectorAll("[data-process-filter]").forEach((button) => {
     const active = button.dataset.processFilter === processFilter;
     button.classList.toggle("is-active", active);
@@ -2823,6 +2856,7 @@ function renderProcesses(view) {
   byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
   byId("process-running").textContent = count(view.stats?.running);
   byId("process-queued").textContent = count(view.stats?.queued);
+  byId("process-approval").textContent = count(jobs.filter((job) => job.status === "pending_approval").length);
   byId("process-completed").textContent = count(view.stats?.completed);
   byId("process-failed").textContent = count(view.stats?.failed);
   renderProcessWorker(view.worker, health);
@@ -2830,6 +2864,7 @@ function renderProcesses(view) {
     all: jobs.length,
     active: jobs.filter((job) => processMatches(job, "active")).length,
     queued: jobs.filter((job) => processMatches(job, "queued")).length,
+    approval: jobs.filter((job) => processMatches(job, "approval")).length,
     failed: jobs.filter((job) => processMatches(job, "failed")).length,
     completed: jobs.filter((job) => processMatches(job, "completed")).length,
   };
@@ -2862,7 +2897,7 @@ function renderProcesses(view) {
     referenceId.title = job.id;
     main.append(referenceTitle, referenceId);
     const executionName = [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ");
-    const execution = consoleCell(executionName || "Agent", "cell");
+    const execution = consoleCell(executionName || "-", "cell");
     const updated = consoleCell(processTimeLabel(job.updated_at), "cell cell-time");
     if (job.updated_at) updated.title = ticketDateLabel(job.updated_at);
     const status = consoleBadge(processStatusLabel(job.status), processStatusTone(job.status));
@@ -2875,7 +2910,7 @@ function renderProcesses(view) {
 }
 
 function processStatusTone(status) {
-  return { pending: "quiet", running: "info", done: "ok", failed: "danger", cancelled: "quiet" }[status] || "quiet";
+  return { pending: "quiet", pending_approval: "warn", running: "info", done: "ok", failed: "danger", cancelled: "quiet" }[status] || "quiet";
 }
 
 function renderProcessDrawer(job) {
@@ -2897,6 +2932,7 @@ function renderProcessDrawer(job) {
   lede.className = "inline-hint";
   lede.textContent = {
     pending: "Waiting for a free agent to pick it up.",
+    pending_approval: "Waiting for your approval in Manage. Nothing runs until it is approved.",
     running: "An agent is working on this right now.",
     done: "The agent finished this run.",
     failed: "This run failed. Check the output below, then retry from Manage.",
@@ -2916,11 +2952,12 @@ function renderProcessDrawer(job) {
   const manageHref = safeTicketLink(job.manage_url);
   if (manageHref) {
     const manageLink = document.createElement("a");
-    manageLink.className = "button ghost small";
+    const awaitingApproval = job.status === "pending_approval";
+    manageLink.className = awaitingApproval ? "button primary small" : "button ghost small";
     manageLink.href = manageHref;
     manageLink.target = "_blank";
     manageLink.rel = "noreferrer";
-    manageLink.textContent = "Manage ↗";
+    manageLink.textContent = awaitingApproval ? "Approve in Manage ↗" : "Manage ↗";
     actions.append(manageLink);
   }
   summary.append(badges, lede);
@@ -2974,7 +3011,7 @@ function renderProcessDrawer(job) {
   [
     ["Agent", [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ")],
     ["Type", job.kind ? translatePhrase(operationLabel(job.kind)) : null],
-    ["Came from", operationLabel(job.source)],
+    ["Came from", job.source && job.source !== "unknown" ? operationLabel(job.source) : null],
     ["On this worker", translatePhrase(job.assigned_to_worker ? "Yes" : "No")],
     ["Decisions", String(job.decision_count)],
     ["Site", job.site_id],
@@ -6419,6 +6456,15 @@ function consoleSyncStats() {
     badge.textContent = show ? value : "";
     badge.dataset.tone = tone;
   });
+  // Agents: failures first; otherwise runs waiting for approval.
+  const failed = Number((byId("process-failed")?.textContent || "").replace(/[^0-9]/g, "")) || 0;
+  const approval = Number((byId("process-approval")?.textContent || "").replace(/[^0-9]/g, "")) || 0;
+  const agents = byId("tab-badge-operations");
+  if (failed === 0 && approval > 0) {
+    agents.hidden = false;
+    agents.textContent = byId("process-approval").textContent.trim();
+    agents.dataset.tone = "warn";
+  }
 }
 let consoleStatsQueued = false;
 new MutationObserver(() => {
@@ -6558,6 +6604,10 @@ function consoleCommands(query) {
     .filter((session) => matches(consoleSessionTitle(session)) || matches(session.session?.resource?.id))
     .slice(0, 4)
     .forEach((session) => results.push({ group: "Conversations", icon: "◦", label: consoleSessionTitle(session), raw: true, run: () => { showView("sessions"); consoleOpenSession(session.session.resource.id); } }));
+  (processesSnapshot?.jobs || [])
+    .filter((job) => matches(processIssueReference(job).label) || matches(job.id) || matches(job.issue_url))
+    .slice(0, 4)
+    .forEach((job) => results.push({ group: "Agent runs", icon: "▸", label: processIssueReference(job).label, raw: true, hint: translatePhrase(processStatusLabel(job.status)), run: () => { showView("operations"); window.setTimeout(() => consoleOpenProcess(job.id), 0); } }));
   (memorySnapshot?.entries || [])
     .filter((entry) => matches(entry.content) || matches(entry.reference))
     .slice(0, 3)

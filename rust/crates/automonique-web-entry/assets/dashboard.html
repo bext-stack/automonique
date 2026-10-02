@@ -222,12 +222,13 @@
             <div class="stat-strip" aria-label="Agent counts">
               <article class="stat"><b id="process-running">-</b> running</article>
               <article class="stat"><b id="process-queued">-</b> queued</article>
+              <article class="stat stat-warn"><b id="process-approval">-</b> to approve</article>
               <article class="stat"><b id="process-completed">-</b> finished</article>
               <article class="stat stat-danger"><b id="process-failed">-</b> failed</article>
               <span class="stat-sep" aria-hidden="true"></span>
               <article class="stat"><b id="operations-tools">-</b> tools</article>
               <article class="stat"><b id="operations-reads">-</b> read only</article>
-              <article class="stat"><b id="operations-actions">-</b> need approval</article>
+              <article class="stat"><b id="operations-actions">-</b> can change data</article>
               <article class="stat stat-warn"><b id="operations-pending">-</b> waiting for you</article>
             </div>
             <div class="view-actions"><button class="button ghost" id="operations-refresh" type="button">Refresh</button><a class="button ghost" id="operations-manage-link" data-manage-link rel="noreferrer" target="_blank" hidden>Open Manage ↗</a></div>
@@ -245,7 +246,7 @@
                 </div>
                 <div class="process-worker" id="process-worker"><div class="integration-empty">Loading the worker…</div></div>
                 <div class="toolbar">
-                  <div class="chips process-filters" role="group" aria-label="Filter agent runs"><button class="chip is-active" type="button" data-process-filter="all">All <b id="process-filter-all">0</b></button><button class="chip" type="button" data-process-filter="active">Running <b id="process-filter-active">0</b></button><button class="chip" type="button" data-process-filter="queued">Queued <b id="process-filter-queued">0</b></button><button class="chip" type="button" data-process-filter="failed">Failed <b id="process-filter-failed">0</b></button><button class="chip" type="button" data-process-filter="completed">Finished <b id="process-filter-completed">0</b></button></div>
+                  <div class="chips process-filters" role="group" aria-label="Filter agent runs"><button class="chip is-active" type="button" data-process-filter="all">All <b id="process-filter-all">0</b></button><button class="chip" type="button" data-process-filter="active">Running <b id="process-filter-active">0</b></button><button class="chip" type="button" data-process-filter="queued">Queued <b id="process-filter-queued">0</b></button><button class="chip" type="button" data-process-filter="approval">To approve <b id="process-filter-approval">0</b></button><button class="chip" type="button" data-process-filter="failed">Failed <b id="process-filter-failed">0</b></button><button class="chip" type="button" data-process-filter="completed">Finished <b id="process-filter-completed">0</b></button></div>
                   <strong class="toolbar-meta" id="process-result-state" role="status">Connecting…</strong>
                 </div>
                 <p class="process-semantics inline-hint">Queued in Manage means waiting for a worker. Only Running means an agent is executing.</p>
