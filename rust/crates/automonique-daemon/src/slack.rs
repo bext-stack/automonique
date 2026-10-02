@@ -5690,16 +5690,27 @@ fn slack_backoff(stop: &AtomicBool) {
 fn message_line(message: &SlackMessage, authors: &[(UserId, String)]) -> String {
     format!(
         "{} {}: {}",
-        short_ts(message),
+        message_time(message),
         author_label(message, authors),
         preview(&message.text),
     )
 }
 
-/// The seconds half of a message timestamp.
-fn short_ts(message: &SlackMessage) -> &str {
+/// When a message was posted, as an ISO-8601 UTC time to the second.
+///
+/// Slack's `ts` is epoch seconds plus a uniqueness suffix; readers (and the
+/// models that summarize a channel) cannot place a bare epoch in the day. A
+/// `ts` that does not parse is shown as its seconds half, as Slack gave it.
+fn message_time(message: &SlackMessage) -> String {
     let ts = message.ts.as_str();
-    ts.split_once('.').map_or(ts, |(seconds, _)| seconds)
+    let seconds = ts.split_once('.').map_or(ts, |(seconds, _)| seconds);
+    seconds
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .and_then(automonique_core::conversation::utc_rfc3339_from_unix_millis)
+        .and_then(|time| time.strip_suffix(".000Z").map(|time| format!("{time}Z")))
+        .unwrap_or_else(|| seconds.to_owned())
 }
 
 /// Who a reader should understand wrote this message.
@@ -6933,16 +6944,19 @@ mod tests {
             .expect("the page renders");
         assert!(reply.starts_with("#ops, 3 most recent:"), "{reply}");
         assert!(
-            reply.contains("1723542000 amelie: premier message"),
+            reply.contains("2024-08-13T09:40:00Z amelie: premier message"),
             "{reply}"
         );
         // A multi-line message stays one row.
         assert!(
-            reply.contains("1723541000 camille: deuxieme ligne"),
+            reply.contains("2024-08-13T09:23:20Z camille: deuxieme ligne"),
             "{reply}"
         );
         // A message with no text says so rather than rendering an empty row.
-        assert!(reply.contains("1723540000 amelie: (no text)"), "{reply}");
+        assert!(
+            reply.contains("2024-08-13T09:06:40Z amelie: (no text)"),
+            "{reply}"
+        );
         assert_eq!(reply.lines().count(), 4, "one header and three rows");
     }
 

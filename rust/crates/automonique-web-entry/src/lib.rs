@@ -3639,29 +3639,9 @@ impl WebIntegration {
             }
             SlackReadPlan::Channel(channel) => channel,
             SlackReadPlan::AllChannels => {
-                // Only configured channels are ever read, each bounded so the
-                // whole snapshot fits the same prompt budget as one channel.
-                let share = SLACK_SNAPSHOT_BUDGET / labels.len().max(1);
-                let mut content = String::new();
-                for label in &labels {
-                    let Ok(name) = ChannelName::new(label) else {
-                        continue;
-                    };
-                    let Ok(messages) = slack.recent_messages(&name) else {
-                        continue;
-                    };
-                    content.push_str("## #");
-                    content.push_str(label);
-                    content.push('\n');
-                    push_bounded(&mut content, &messages, share);
-                    content.push_str("\n\n");
-                }
-                if content.is_empty() {
-                    return Err("slack_read_unavailable");
-                }
                 return Ok(SlackToolDecision::Snapshot {
                     channel: labels.join(","),
-                    content,
+                    content: all_channels_snapshot(slack, &labels)?,
                 });
             }
         };
@@ -5424,6 +5404,44 @@ fn shared_router_history(
     context
 }
 
+/// Every configured channel's recent messages, as one prompt-bounded snapshot.
+///
+/// Only configured channels are ever read, each bounded so the whole snapshot
+/// fits the same prompt budget as one channel. A channel that could not be
+/// read is named as such with the daemon's operator-facing refusal (which
+/// never carries a credential), so the answer cannot pass a silent gap off as
+/// a quiet channel.
+fn all_channels_snapshot(
+    slack: &mut (dyn SlackSurface + Send),
+    labels: &[String],
+) -> Result<String, &'static str> {
+    let share = SLACK_SNAPSHOT_BUDGET / labels.len().max(1);
+    let mut content = String::new();
+    let mut read_any = false;
+    for label in labels {
+        let Ok(name) = ChannelName::new(label) else {
+            continue;
+        };
+        let messages = match slack.recent_messages(&name) {
+            Ok(messages) => {
+                read_any = true;
+                messages
+            }
+            Err(refusal) => format!("#{label} could not be read: {refusal}"),
+        };
+        content.push_str("## #");
+        content.push_str(label);
+        content.push('\n');
+        push_bounded(&mut content, &messages, share);
+        content.push_str("\n\n");
+    }
+    if read_any {
+        Ok(content)
+    } else {
+        Err("slack_read_unavailable")
+    }
+}
+
 fn push_bounded(target: &mut String, value: &str, characters: usize) {
     target.extend(value.chars().take(characters));
     if value.chars().count() > characters {
@@ -5829,7 +5847,7 @@ fn process_snapshot(bytes: &[u8]) -> Option<ProcessSnapshotView> {
         && (!optional_process_text(worker.name.as_deref(), 120)
             || !process_state(&worker.status)
             || !optional_process_text(worker.status_detail.as_deref(), 240)
-            || !matches!(worker.provider.as_str(), "codex" | "claude")
+            || provider_identity(&worker.provider).is_none()
             || !process_state(&worker.agent)
             || !optional_process_text(worker.model.as_deref(), 120)
             || !process_state(&worker.runtime)
@@ -9116,6 +9134,32 @@ mod tests {
             .is_none()
         );
         assert!(process_snapshot(valid.replace("slack_ticket", "<script>").as_bytes()).is_none());
+
+        // A JCode worker reports the same projection; rejecting its provider
+        // used to blank the whole Agents view.
+        let jcode = valid
+            .replace(
+                "\"provider\":\"codex\",\"agent\":\"codex\"",
+                "\"provider\":\"jcode\",\"agent\":\"jcode\"",
+            )
+            .replace("\"model\":\"gpt-5\"", "\"model\":null")
+            .replace("\"binary\":\"codex\"", "\"binary\":\"jcode\"");
+        let jcode = process_snapshot(jcode.as_bytes()).expect("valid JCode process snapshot");
+        assert_eq!(
+            Some("jcode"),
+            jcode.worker.as_ref().map(|worker| worker.provider.as_str())
+        );
+        assert!(
+            process_snapshot(
+                valid
+                    .replace(
+                        "\"provider\":\"codex\",\"agent\"",
+                        "\"provider\":\"other\",\"agent\""
+                    )
+                    .as_bytes()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -11234,6 +11278,53 @@ mod tests {
         assert_eq!(
             slack_read_plan("how are you?", &history, &labels),
             SlackReadPlan::NotRequested
+        );
+    }
+
+    struct PartlyReadableSlack;
+
+    impl SlackSurface for PartlyReadableSlack {
+        fn channel_labels(&self) -> Vec<String> {
+            vec![String::from("operations"), String::from("private")]
+        }
+
+        fn recent_messages(&mut self, channel: &ChannelName) -> Result<String, String> {
+            if channel.as_str() == "operations" {
+                Ok(String::from(
+                    "#operations, 1 most recent:\n2026-10-02T11:14:38Z ben: ok",
+                ))
+            } else {
+                Err(String::from(
+                    "The bot is not a member of #private. Nothing was read.",
+                ))
+            }
+        }
+
+        fn post_message(&mut self, _: &ChannelName, _: &str) -> Result<String, String> {
+            Err(String::from("read-only fixture"))
+        }
+    }
+
+    #[test]
+    fn an_all_channel_slack_read_names_the_channels_it_could_not_read() {
+        let mut slack = PartlyReadableSlack;
+        let labels = slack.channel_labels();
+        let content = all_channels_snapshot(&mut slack, &labels).expect("one channel read");
+        assert!(
+            content.contains("## #operations\n#operations, 1 most recent:"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "## #private\n#private could not be read: The bot is not a member of #private."
+            ),
+            "{content}"
+        );
+
+        let unreadable = [String::from("private")];
+        assert_eq!(
+            all_channels_snapshot(&mut slack, &unreadable),
+            Err("slack_read_unavailable")
         );
     }
 
