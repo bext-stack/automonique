@@ -1044,7 +1044,7 @@ run_job() {
                 JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
                 JCODE_SERVER_EXECUTABLE="$selected_binary" \
                 "$selected_binary" --quiet --no-update --no-selfdev run --ndjson \
-                    --disabled-tools browser,swarm - \
+                    --disabled-tools browser,swarm,integration_tools - \
                 >"$output" 2>"$error_output" &
     else
         cd -- "$cwd" || {

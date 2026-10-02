@@ -10658,7 +10658,7 @@ mod tests {
         assert!(MANAGE_WORKER.contains("JCODE_SERVER_EXECUTABLE=\"$selected_binary\""));
         assert!(MANAGE_WORKER.contains("--no-selfdev run --ndjson \\"));
         // Tools that cannot work on a headless server are hidden from the run.
-        assert!(MANAGE_WORKER.contains("--disabled-tools browser,swarm - \\"));
+        assert!(MANAGE_WORKER.contains("--disabled-tools browser,swarm,integration_tools - \\"));
         assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .session_id"));
         assert!(MANAGE_WORKER.contains("select(.type == \"done\") | .text"));
         assert!(MANAGE_WORKER.contains("enqueue_platform_commands"));
