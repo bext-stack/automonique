@@ -3257,13 +3257,17 @@ function renderHostedCockpit(view) {
       const title = document.createElement("strong");
       title.textContent = `${words(entry.state)} · ${words(entry.reason)}`;
       const detail = document.createElement("span");
-      detail.textContent = `${consoleSentence(entry.source_kind)} · ${consoleMsAgo(entry.observed_at_ms)} · ${entry.unread} unread · source revision ${entry.source_revision}`;
-      detail.title = `Item revision ${entry.item_revision}`;
+      detail.textContent = `${consoleSentence(entry.source_kind)} · ${consoleMsAgo(entry.observed_at_ms)} · ${entry.unread} unread`;
+      // The exact generation stays visible: cross-client acceptance compares
+      // this line verbatim, so it is never rounded or paraphrased.
+      const generation = document.createElement("small");
+      generation.className = "cockpit-exact-generation";
+      generation.textContent = `${words(entry.source_kind)} · observed ${entry.observed_at_ms} ms · source revision ${entry.source_revision} · item revision ${entry.item_revision} · ${entry.unread} unread`;
       const exactLink = document.createElement("a");
       exactLink.href = entry.deep_link;
       exactLink.textContent = "View";
       exactLink.setAttribute("aria-label", `Open exact attention context for ${words(entry.reason)} at source revision ${entry.source_revision}`);
-      item.append(title, detail, exactLink);
+      item.append(title, detail, generation, exactLink);
       inbox.append(item);
     });
   }
