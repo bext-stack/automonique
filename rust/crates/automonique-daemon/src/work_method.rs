@@ -63,6 +63,7 @@ MÉTHODE MONIQUE — à respecter pour chaque ticket (le client lit ton compte r
    - rendu visuel (page, composant, style, layout) → capture obligatoire, puis OUVRE le PNG et contrôle l'attendu :
      {automonique} shot <url> --out /tmp/monique-<demande>.png [--host <vhost>] [--width 390] [--full]
      Succès = ligne MONIQUE_SHOT_OK: <png> ; échec = MONIQUE_SHOT_FAIL: <raison>. Pour du responsive, capture desktop ET mobile (--width 390). Un curl ne remplace jamais une capture pour une demande visuelle.
+     État qui demande une interaction (modale, onglet, carrousel, survol, section plus bas, contenu tardif) → ajoute, dans l'ordre d'exécution : --click <css>, --hover <css>, --scroll-to <css>, --wait-for <css> ; --selector <css> ne capture que cet élément. N'écris JAMAIS ton propre script de navigateur (puppeteer, playwright…) : shot suffit, et son échec nomme l'action et le sélecteur en cause.
      Capture contrôlée et conforme → publie-la pour le client :
      {automonique} share /tmp/monique-<demande>.png --issue <url du ticket>
      Succès = MONIQUE_SHARE_OK: <lien> ; mets ce lien dans le compte rendu en image : ![Demande 1](<lien>). Le lien expire (ligne MONIQUE_SHARE_NOTE) : l'image est un bonus, le texte doit se suffire. Échec (MONIQUE_SHARE_FAIL) ou partage non configuré → décris ce qu'on voit à l'URL publique, sans image et sans chemin local.
@@ -101,6 +102,17 @@ mod tests {
         assert!(method.starts_with("[work_method trust=operator_policy]\n"));
         assert!(method.contains("/opt/monique/bin/automonique shot <url>"));
         assert!(method.contains("MONIQUE_SHOT_OK"));
+        for flag in [
+            "--click <css>",
+            "--hover <css>",
+            "--scroll-to <css>",
+            "--wait-for <css>",
+            "--selector <css>",
+        ] {
+            assert!(method.contains(flag), "the method names {flag}");
+        }
+        assert!(method.contains("dans l'ordre d'exécution"));
+        assert!(method.contains("N'écris JAMAIS ton propre script de navigateur"));
         assert!(method.contains(
             "/opt/monique/bin/automonique share /tmp/monique-<demande>.png --issue <url du ticket>"
         ));

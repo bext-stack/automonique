@@ -302,6 +302,7 @@ dependencies = [
  "automonique-support-connector",
  "automonique-transport-runtime",
  "automonique-transports",
+ "base64 0.22.1",
  "listenfd",
  "nix 0.29.0",
  "rusqlite",
@@ -311,6 +312,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml_edit",
+ "tungstenite",
  "ureq",
  "zeroize",
 ]

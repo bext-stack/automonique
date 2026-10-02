@@ -9,6 +9,16 @@
 //! back, and reports the page title. It uses the browser's own command-line
 //! screenshot mode, so it needs no driver, no Node, no Python.
 //!
+//! A state that only exists after an interaction (an open modal, a selected
+//! tab, a hovered menu, a section below the fold, content that appears late)
+//! is reached with a short, ordered, declarative action list: `--wait-for`,
+//! `--click`, `--hover` and `--scroll-to`, applied in the order they are
+//! written on the command line, plus `--selector` to capture one element and
+//! `--wait-ms` to settle. Those invocations are driven over the DevTools
+//! protocol by `shot_interact`; an invocation without them stays on the
+//! command-line screenshot path, unchanged. No flag runs a script: a selector
+//! is data handed to the page as an argument.
+//!
 //! The contract is deliberately small and never hangs: success prints
 //! `MONIQUE_SHOT_OK: <png>` then `title: <title>`; any failure prints one
 //! `MONIQUE_SHOT_FAIL: <reason>` line and exits non-zero, with the browser
@@ -31,11 +41,53 @@ pub const FAIL_MARKER: &str = "MONIQUE_SHOT_FAIL:";
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 900;
 const FULL_PAGE_HEIGHT: u32 = 4_000;
-const MAX_DIMENSION: u32 = 8_000;
+pub(crate) const MAX_DIMENSION: u32 = 8_000;
 const DEFAULT_DEADLINE_SECS: u64 = 45;
 const MAX_DEADLINE_SECS: u64 = 180;
 /// Virtual time the page gets to settle before the capture, in ms.
 const SETTLE_BUDGET_MS: u32 = 5_000;
+/// Most ordered actions one invocation may carry.
+pub const MAX_ACTIONS: usize = 12;
+/// Longest selector accepted, in characters.
+pub const MAX_SELECTOR_CHARS: usize = 300;
+const DEFAULT_ACTION_TIMEOUT_MS: u64 = 10_000;
+const MIN_ACTION_TIMEOUT_MS: u64 = 1_000;
+const MAX_ACTION_TIMEOUT_MS: u64 = 60_000;
+const MAX_SETTLE_MS: u64 = 5_000;
+/// Settle delay after the last action when `--wait-ms` is not given.
+pub(crate) const DEFAULT_SETTLE_MS: u64 = 300;
+
+/// What one ordered action does with its selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionKind {
+    /// Wait until the element exists and is visible.
+    WaitFor,
+    /// Wait for the element, bring it into view and click its centre.
+    Click,
+    /// Wait for the element, bring it into view and move the pointer onto it.
+    Hover,
+    /// Wait for the element and scroll it to the top of the viewport.
+    ScrollTo,
+}
+
+impl ActionKind {
+    /// The flag name without its dashes, as failure reasons spell it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaitFor => "wait-for",
+            Self::Click => "click",
+            Self::Hover => "hover",
+            Self::ScrollTo => "scroll-to",
+        }
+    }
+}
+
+/// One step of the ordered action list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShotAction {
+    pub kind: ActionKind,
+    pub selector: String,
+}
 
 /// One parsed invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +101,23 @@ pub struct ShotRequest {
     pub width: u32,
     pub height: u32,
     pub deadline: Duration,
+    /// Ordered actions, in command-line order.
+    pub actions: Vec<ShotAction>,
+    /// Capture only this element's bounding box.
+    pub selector: Option<String>,
+    /// How long each action waits for its selector.
+    pub action_timeout: Duration,
+    /// Explicit settle delay after the last action (`--wait-ms`).
+    pub settle: Option<Duration>,
+}
+
+impl ShotRequest {
+    /// Whether the capture needs the DevTools path. `--timeout-ms` alone does
+    /// not: it only bounds waits that an action, `--selector` or `--wait-ms`
+    /// introduces.
+    pub fn interactive(&self) -> bool {
+        !self.actions.is_empty() || self.selector.is_some() || self.settle.is_some()
+    }
 }
 
 /// What a successful capture established.
@@ -59,7 +128,10 @@ pub struct ShotOutcome {
     pub bytes: u64,
 }
 
-/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S]`.
+/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S]`
+/// and the interaction options `[--wait-for CSS] [--click CSS] [--hover CSS]
+/// [--scroll-to CSS]` (repeatable, kept in the order given), `[--selector CSS]`,
+/// `[--wait-ms N]` and `[--timeout-ms N]`.
 pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, String> {
     let mut url = None;
     let mut out = default_out;
@@ -68,6 +140,10 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
     let mut height = DEFAULT_HEIGHT;
     let mut full = false;
     let mut deadline = Duration::from_secs(DEFAULT_DEADLINE_SECS);
+    let mut actions = Vec::new();
+    let mut selector = None;
+    let mut action_timeout = Duration::from_millis(DEFAULT_ACTION_TIMEOUT_MS);
+    let mut settle = None;
     let mut values = values.iter();
     while let Some(value) = values.next() {
         let text = value
@@ -104,6 +180,40 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
                 }
                 deadline = Duration::from_secs(seconds);
             }
+            "--wait-for" | "--click" | "--hover" | "--scroll-to" => {
+                let kind = match text {
+                    "--wait-for" => ActionKind::WaitFor,
+                    "--click" => ActionKind::Click,
+                    "--hover" => ActionKind::Hover,
+                    _ => ActionKind::ScrollTo,
+                };
+                if actions.len() >= MAX_ACTIONS {
+                    return Err(format!("at most {MAX_ACTIONS} actions are accepted"));
+                }
+                actions.push(ShotAction {
+                    kind,
+                    selector: css_selector(values.next(), text)?,
+                });
+            }
+            "--selector" => {
+                if selector.is_some() {
+                    return Err(String::from("--selector may be given once"));
+                }
+                selector = Some(css_selector(values.next(), text)?);
+            }
+            "--wait-ms" => {
+                let millis = milliseconds(values.next(), text, 0, MAX_SETTLE_MS)?;
+                settle = Some(Duration::from_millis(millis));
+            }
+            "--timeout-ms" => {
+                let millis = milliseconds(
+                    values.next(),
+                    text,
+                    MIN_ACTION_TIMEOUT_MS,
+                    MAX_ACTION_TIMEOUT_MS,
+                )?;
+                action_timeout = Duration::from_millis(millis);
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other if url.is_none() => url = Some(other.to_owned()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -133,7 +243,43 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
         width,
         height,
         deadline,
+        actions,
+        selector,
+        action_timeout,
+        settle,
     })
+}
+
+/// A CSS selector argument: one line of text, bounded, never interpreted here.
+fn css_selector(value: Option<&OsString>, flag: &str) -> Result<String, String> {
+    let selector = value
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("{flag} needs a CSS selector"))?;
+    if selector.trim().is_empty() {
+        return Err(format!("{flag} needs a CSS selector"));
+    }
+    if selector.chars().count() > MAX_SELECTOR_CHARS {
+        return Err(format!(
+            "{flag} selector is longer than {MAX_SELECTOR_CHARS} characters"
+        ));
+    }
+    if selector.chars().any(char::is_control) {
+        return Err(format!(
+            "{flag} selector must not contain control characters"
+        ));
+    }
+    Ok(selector.to_owned())
+}
+
+fn milliseconds(value: Option<&OsString>, flag: &str, min: u64, max: u64) -> Result<u64, String> {
+    let parsed: u64 = value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("{flag} needs whole milliseconds"))?;
+    if parsed < min || parsed > max {
+        return Err(format!("{flag} must be {min}..={max}"));
+    }
+    Ok(parsed)
 }
 
 fn dimension(value: Option<&OsString>, flag: &str) -> Result<u32, String> {
@@ -263,6 +409,14 @@ pub fn capture(request: &ShotRequest, browser: &Path) -> Result<ShotOutcome, Str
         ));
     }
     let _ = std::fs::remove_file(&request.out);
+    if request.interactive() {
+        return crate::shot_interact::capture(
+            request,
+            browser,
+            &navigation,
+            resolver_rule.as_deref(),
+        );
+    }
     let mut command = Command::new(browser);
     command
         .arg("--headless=new")
@@ -463,6 +617,128 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn actions_keep_their_command_line_order_and_are_bounded() {
+        let out = || PathBuf::from("/tmp/d.png");
+        let plain = parse(
+            &args(&["https://x/", "--full", "--timeout-ms", "2000"]),
+            out(),
+        )
+        .expect("parses");
+        assert!(plain.actions.is_empty());
+        assert!(
+            !plain.interactive(),
+            "no action keeps the command-line screenshot path"
+        );
+        assert_eq!(plain.action_timeout, Duration::from_millis(2_000));
+
+        let request = parse(
+            &args(&[
+                "--wait-for",
+                "#app",
+                "https://x/",
+                "--click",
+                ".tab[data-k=\"a\\b\"]",
+                "--width",
+                "390",
+                "--hover",
+                "nav li",
+                "--click",
+                ".next",
+                "--scroll-to",
+                "#prix",
+                "--selector",
+                ".modal",
+                "--wait-ms",
+                "800",
+            ]),
+            out(),
+        )
+        .expect("parses");
+        let order: Vec<(ActionKind, &str)> = request
+            .actions
+            .iter()
+            .map(|action| (action.kind, action.selector.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (ActionKind::WaitFor, "#app"),
+                (ActionKind::Click, ".tab[data-k=\"a\\b\"]"),
+                (ActionKind::Hover, "nav li"),
+                (ActionKind::Click, ".next"),
+                (ActionKind::ScrollTo, "#prix"),
+            ]
+        );
+        assert_eq!(request.selector.as_deref(), Some(".modal"));
+        assert_eq!(request.settle, Some(Duration::from_millis(800)));
+        assert_eq!(request.action_timeout, Duration::from_millis(10_000));
+        assert_eq!(request.width, 390);
+        assert!(request.interactive());
+        for alone in [["--selector", "main"], ["--wait-ms", "0"]] {
+            let request = parse(&args(&["https://x/", alone[0], alone[1]]), out()).expect("parses");
+            assert!(request.interactive());
+        }
+
+        let refused = |extra: &[&str]| {
+            let mut values = vec!["https://x/"];
+            values.extend_from_slice(extra);
+            parse(&args(&values), out()).expect_err("refused")
+        };
+        let mut many = Vec::new();
+        for _ in 0..MAX_ACTIONS {
+            many.extend_from_slice(&["--click", "a"]);
+        }
+        assert_eq!(
+            parse(&args(&[&["https://x/"], many.as_slice()].concat()), out())
+                .expect("twelve fit")
+                .actions
+                .len(),
+            MAX_ACTIONS
+        );
+        many.extend_from_slice(&["--hover", "a"]);
+        assert_eq!(refused(&many), "at most 12 actions are accepted");
+
+        let long = "a".repeat(MAX_SELECTOR_CHARS + 1);
+        assert_eq!(
+            refused(&["--click", &long]),
+            "--click selector is longer than 300 characters"
+        );
+        let accented = "é".repeat(MAX_SELECTOR_CHARS);
+        assert!(parse(&args(&["https://x/", "--wait-for", &accented]), out()).is_ok());
+        assert_eq!(refused(&["--click"]), "--click needs a CSS selector");
+        assert_eq!(
+            refused(&["--scroll-to", "  "]),
+            "--scroll-to needs a CSS selector"
+        );
+        assert_eq!(
+            refused(&["--hover", "a\nb"]),
+            "--hover selector must not contain control characters"
+        );
+        assert_eq!(
+            refused(&["--selector", "a", "--selector", "b"]),
+            "--selector may be given once"
+        );
+        assert_eq!(
+            refused(&["--wait-ms", "5001"]),
+            "--wait-ms must be 0..=5000"
+        );
+        assert_eq!(
+            refused(&["--wait-ms", "soon"]),
+            "--wait-ms needs whole milliseconds"
+        );
+        assert_eq!(
+            refused(&["--timeout-ms", "999"]),
+            "--timeout-ms must be 1000..=60000"
+        );
+        assert_eq!(
+            refused(&["--timeout-ms", "60001"]),
+            "--timeout-ms must be 1000..=60000"
+        );
+        assert_eq!(ActionKind::WaitFor.label(), "wait-for");
+        assert_eq!(ActionKind::ScrollTo.label(), "scroll-to");
     }
 
     #[test]

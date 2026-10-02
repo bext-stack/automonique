@@ -634,6 +634,12 @@ fn ask_command(values: Vec<std::ffi::OsString>) -> ExitCode {
 /// captures one rendered page with the host's headless Chromium and prints
 /// `MONIQUE_SHOT_OK: <png>` + `title: …`, or one `MONIQUE_SHOT_FAIL: <reason>`
 /// line. It never hangs past its deadline and never prints a stack trace.
+///
+/// A state that needs an interaction is reached with `--wait-for`, `--click`,
+/// `--hover` and `--scroll-to` (each takes a CSS selector, is repeatable, and
+/// runs in the order written), then captured whole or as one element with
+/// `--selector`; `--wait-ms` settles after the last action and `--timeout-ms`
+/// bounds each wait. A failed action is named in the failure line.
 fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
     use automonique_daemon::shot::{FAIL_MARKER, OK_MARKER, capture, find_browser, parse};
     let stamp = SystemTime::now()
@@ -647,6 +653,12 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
             println!("{FAIL_MARKER} {reason}");
             eprintln!(
                 "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S]"
+            );
+            eprintln!(
+                "       interactions, applied in the order given: [--wait-for CSS] [--click CSS] [--hover CSS] [--scroll-to CSS]"
+            );
+            eprintln!(
+                "       then: [--selector CSS] (capture that element only) [--wait-ms 0..5000] [--timeout-ms 1000..60000]"
             );
             return ExitCode::from(2);
         }
