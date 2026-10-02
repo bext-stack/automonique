@@ -3703,6 +3703,14 @@ impl TicketGateRegistry {
             .collect()
     }
 
+    /// The retained gate of one exact job, never a prefix match.
+    pub(crate) fn gate_for_job(&self, job_id: &str) -> Option<PendingTicketGate> {
+        self.gates
+            .iter()
+            .find(|gate| gate.job_id == job_id)
+            .cloned()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.gates.len()
     }
@@ -3890,6 +3898,22 @@ impl TicketGateRegistry {
         self.transition_slack_notification(
             notification,
             SlackTicketNotificationState::Ambiguous,
+            SlackTicketNotificationState::Delivered,
+        )
+    }
+
+    /// Settle one pending notification without any Slack effect.
+    ///
+    /// For a terminal state the thread must not be told about: no message is
+    /// sent, so there is no ambiguous window to fence and the row goes
+    /// straight from pending to delivered.
+    pub(crate) fn settle_slack_notification(
+        &mut self,
+        notification: &SlackTicketNotification,
+    ) -> Result<bool, ()> {
+        self.transition_slack_notification(
+            notification,
+            SlackTicketNotificationState::Pending,
             SlackTicketNotificationState::Delivered,
         )
     }

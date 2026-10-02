@@ -32,6 +32,19 @@
 //! Only the bot's own reactions are ever touched, and only by adding: nothing
 //! here removes a reaction, so a human's 👀 or ✅ is never disturbed.
 //!
+//! # A job awaiting approval is a weak claim
+//!
+//! A Monique job in `pending_approval` is a question nobody has answered, not
+//! work under way: it owes no 👀 and it must not keep the ticket away from
+//! GitHub. When stale-approval handling is enabled (a team GitHub login is
+//! configured), a ticket whose jobs are all still waiting for approval is
+//! verified on the ordinary bounded cadence, every
+//! [`UNAPPROVED_VERIFY_INTERVAL_MS`], until [`VERIFY_MAX_AGE_MS`] past its
+//! newest Slack post. A ticket found finished gets its ✅, and the approval it
+//! no longer needs is retired: the reactor sends the ordinary reject decision
+//! for that exact job (see [`StaleApprovalRetirer`]), after re-reading the
+//! job's status, a bounded number of times.
+//!
 //! # The ledger file
 //!
 //! `ticket-work.v1.json` beside the other ticket registries in the daemon's
@@ -71,8 +84,26 @@ pub(crate) const MAX_LEDGER_BYTES: usize = 1024 * 1024;
 pub(crate) const VERIFY_INTERVAL_MS: i64 = 10 * 60 * 1000;
 /// How long a released, unfinished ticket stays queued before it is dropped.
 pub(crate) const VERIFY_MAX_AGE_MS: i64 = 21 * 24 * 60 * 60 * 1000;
+/// How often an unfinished ticket whose jobs all await approval is checked
+/// against GitHub again.
+pub(crate) const UNAPPROVED_VERIFY_INTERVAL_MS: i64 = 30 * 60 * 1000;
 /// Most queued tickets one verification pass checks.
 pub(crate) const VERIFY_PER_PASS: usize = 3;
+/// Most stale approvals one verification pass retires.
+const RETIRES_PER_PASS: usize = 2;
+/// Attempts after which a stale approval is no longer retired.
+pub(crate) const MAX_RETIRE_ATTEMPTS: u8 = 5;
+/// The least time between two attempts to retire one stale approval.
+pub(crate) const RETIRE_RETRY_MS: i64 = 10 * 60 * 1000;
+/// The reason recorded on a job retired because its ticket was finished
+/// elsewhere. Fixed text: Manage stores it as the cancelled job's result, and
+/// the Slack notification poll recognizes a retired job by it.
+pub(crate) const STALE_APPROVAL_REASON: &str =
+    "Superseded: the ticket was finished outside Monique before this run was approved.";
+/// The actor every stale-approval rejection is attributed to.
+pub(crate) const STALE_APPROVAL_ACTOR: &str = "automonique:stale-approval";
+/// Prefix of the decision key a stale-approval rejection carries.
+const STALE_APPROVAL_DECISION_PREFIX: &str = "automonique-stale-approval:";
 /// How often a verification pass runs at all.
 const VERIFY_PASS_INTERVAL_MS: i64 = 60 * 1000;
 /// How often the reactor polls Manage for the jobs it is following.
@@ -318,6 +349,49 @@ struct StoredClaim {
     /// little early costs one status call.
     #[serde(default)]
     polled_ms: i64,
+    /// Set once the ticket was verified finished while this job still awaited
+    /// approval: the approval is stale and is being retired. Absent in
+    /// ledgers written by older releases, which also ignore it on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retire: Option<StaleApproval>,
+}
+
+/// Progress of retiring one approval its ticket no longer needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StaleApproval {
+    /// Attempts that failed so far; at [`MAX_RETIRE_ATTEMPTS`] it is abandoned.
+    attempts: u8,
+    /// When the next attempt may be made.
+    next_ms: i64,
+}
+
+impl StoredClaim {
+    fn new(holder: String, now_ms: i64) -> Self {
+        Self {
+            holder,
+            since_ms: now_ms,
+            job_status: None,
+            read_failures: 0,
+            polled_ms: 0,
+            retire: None,
+        }
+    }
+
+    fn status(&self) -> Option<TicketJobStatus> {
+        self.job_status.as_deref().and_then(parse_job_status)
+    }
+
+    /// Whether this is a Monique job still waiting for a human's approval.
+    fn awaits_approval(&self) -> bool {
+        self.holder.starts_with(MONIQUE_HOLDER_PREFIX)
+            && self.status() == Some(TicketJobStatus::PendingApproval)
+    }
+}
+
+/// When a Slack message was posted, from its `seconds.micros` timestamp.
+fn slack_ts_ms(ts: &str) -> Option<i64> {
+    let seconds: i64 = ts.split('.').next()?.parse().ok()?;
+    seconds.checked_mul(1000)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -385,6 +459,57 @@ impl StoredTicket {
         self.holders()
             .find(|(holder, _)| matches!(holder, ClaimHolder::Claude(_)))
             .map(|(_, claim)| claim.holder.clone())
+    }
+
+    /// Whether a job of this ticket is still waiting for approval.
+    fn awaiting_approval(&self) -> bool {
+        self.claims.iter().any(StoredClaim::awaits_approval)
+    }
+
+    /// When the ticket was last posted in Slack, by the messages' own
+    /// timestamps (a backfilled post was recorded long after it was written).
+    fn newest_post_ms(&self) -> Option<i64> {
+        self.posts
+            .iter()
+            .map(|post| slack_ts_ms(&post.ts).unwrap_or(post.recorded_ms))
+            .max()
+    }
+
+    /// Where the give-up age of a ticket awaiting approval is measured from:
+    /// its newest Slack post, or the newest waiting job when no post is known.
+    fn approval_anchor_ms(&self) -> Option<i64> {
+        self.newest_post_ms().or_else(|| {
+            self.claims
+                .iter()
+                .filter(|claim| claim.awaits_approval())
+                .map(|claim| claim.since_ms)
+                .max()
+        })
+    }
+
+    /// Where a queued verification's give-up age is measured from.
+    ///
+    /// Ordinarily the moment it was first queued. A ticket awaiting approval
+    /// is measured from its newest Slack post instead, so a client posting it
+    /// again keeps it under watch.
+    fn verification_anchor_ms(&self, verification: Verification) -> i64 {
+        if self.awaiting_approval() {
+            self.approval_anchor_ms()
+                .map_or(verification.first_queued_ms, |anchor| {
+                    anchor.max(verification.first_queued_ms)
+                })
+        } else {
+            verification.first_queued_ms
+        }
+    }
+
+    /// How long an unfinished check waits before the next one.
+    fn verify_interval_ms(&self) -> i64 {
+        if self.awaiting_approval() {
+            UNAPPROVED_VERIFY_INTERVAL_MS
+        } else {
+            VERIFY_INTERVAL_MS
+        }
     }
 
     fn queue_verification(&mut self, now_ms: i64) {
@@ -646,13 +771,7 @@ impl TicketWorkLedger {
                 if ticket.claims.len() >= MAX_CLAIMS_PER_TICKET {
                     return false;
                 }
-                ticket.claims.push(StoredClaim {
-                    holder: holder.clone(),
-                    since_ms: now_ms,
-                    job_status: None,
-                    read_failures: 0,
-                    polled_ms: 0,
-                });
+                ticket.claims.push(StoredClaim::new(holder.clone(), now_ms));
                 ticket.updated_ms = now_ms;
                 true
             })?;
@@ -715,11 +834,16 @@ impl TicketWorkLedger {
                             ticket.queue_verification(now_ms);
                         }
                     }
-                    TicketJobStatus::PendingApproval
-                    | TicketJobStatus::Pending
+                    TicketJobStatus::PendingApproval => {
+                        ticket.claims[index].job_status = Some(word.to_owned());
+                    }
+                    TicketJobStatus::Pending
                     | TicketJobStatus::Claimed
                     | TicketJobStatus::Running => {
+                        // Somebody approved it: the approval is no longer
+                        // stale, whatever was planned for it.
                         ticket.claims[index].job_status = Some(word.to_owned());
+                        ticket.claims[index].retire = None;
                     }
                 }
             }
@@ -835,13 +959,7 @@ impl TicketWorkLedger {
                 if ticket.claims.len() >= MAX_CLAIMS_PER_TICKET {
                     return false;
                 }
-                ticket.claims.push(StoredClaim {
-                    holder: holder.clone(),
-                    since_ms: now_ms,
-                    job_status: None,
-                    read_failures: 0,
-                    polled_ms: 0,
-                });
+                ticket.claims.push(StoredClaim::new(holder.clone(), now_ms));
             }
             // A session at work is not a ticket waiting to be checked.
             ticket.verification = None;
@@ -958,16 +1076,155 @@ impl TicketWorkLedger {
     }
 
     /// Mark one ticket verified finished.
-    pub(crate) fn mark_finished(&mut self, key: &TicketKey, now_ms: i64) -> Result<bool, ()> {
+    ///
+    /// With `retire_approvals`, every job of the ticket still waiting for
+    /// approval is marked stale, to be retired by the caller of
+    /// [`Self::due_retirements`].
+    pub(crate) fn mark_finished(
+        &mut self,
+        key: &TicketKey,
+        retire_approvals: bool,
+        now_ms: i64,
+    ) -> Result<bool, ()> {
         let identity = key.identity();
         self.commit(|tickets| {
             let Some(ticket) = tickets.iter_mut().find(|ticket| ticket.key == identity) else {
                 return false;
             };
             ticket.finish(now_ms);
+            if retire_approvals {
+                for claim in &mut ticket.claims {
+                    if claim.awaits_approval() && claim.retire.is_none() {
+                        claim.retire = Some(StaleApproval {
+                            attempts: 0,
+                            next_ms: now_ms,
+                        });
+                    }
+                }
+            }
             ticket.updated_ms = now_ms;
             true
         })
+    }
+
+    /// Queue every ticket whose jobs all still await approval for a check
+    /// against GitHub.
+    ///
+    /// A waiting job is a weak claim: nobody is working the ticket, so nothing
+    /// else would ever queue it. An unfinished ticket is queued as long as its
+    /// newest Slack post is younger than [`VERIFY_MAX_AGE_MS`]. With
+    /// `retire_approvals`, a ticket already recorded finished that still
+    /// carries a waiting job nobody has tried to retire is checked once more,
+    /// so the retirement is decided from a fresh GitHub read.
+    pub(crate) fn queue_unapproved(
+        &mut self,
+        retire_approvals: bool,
+        now_ms: i64,
+    ) -> Result<bool, ()> {
+        let wanted = |ticket: &StoredTicket| {
+            ticket.verification.is_none()
+                && !ticket.actively_claimed()
+                && (ticket.finished_ms.is_none() || retire_approvals)
+                && ticket
+                    .claims
+                    .iter()
+                    .any(|claim| claim.awaits_approval() && claim.retire.is_none())
+                && ticket
+                    .approval_anchor_ms()
+                    .is_some_and(|anchor| anchor.saturating_add(VERIFY_MAX_AGE_MS) > now_ms)
+        };
+        if !self.tickets.iter().any(wanted) {
+            return Ok(false);
+        }
+        self.commit(|tickets| {
+            for ticket in tickets.iter_mut().filter(|ticket| wanted(ticket)) {
+                let first_queued_ms = ticket.approval_anchor_ms().unwrap_or(now_ms);
+                ticket.verification = Some(Verification {
+                    first_queued_ms,
+                    next_due_ms: now_ms,
+                });
+            }
+            true
+        })
+    }
+
+    /// Up to `limit` stale approvals due an attempt, as `(job, ticket URL)`,
+    /// the longest-waiting first.
+    ///
+    /// Only a job last seen awaiting approval, on a ticket still recorded
+    /// finished, is ever returned.
+    pub(crate) fn due_retirements(&self, limit: usize, now_ms: i64) -> Vec<(String, String)> {
+        let mut due: Vec<(i64, String, String)> = Vec::new();
+        for ticket in &self.tickets {
+            if ticket.finished_ms.is_none() {
+                continue;
+            }
+            for (holder, claim) in ticket.holders() {
+                let ClaimHolder::MoniqueJob(job) = holder else {
+                    continue;
+                };
+                let Some(retire) = claim.retire else {
+                    continue;
+                };
+                if claim.awaits_approval()
+                    && retire.attempts < MAX_RETIRE_ATTEMPTS
+                    && retire.next_ms <= now_ms
+                    && !due.iter().any(|(_, seen, _)| seen == &job)
+                {
+                    due.push((retire.next_ms, job, ticket.url.clone()));
+                }
+            }
+        }
+        due.sort_by_key(|(next_ms, _, _)| *next_ms);
+        due.into_iter()
+            .take(limit)
+            .map(|(_, job, url)| (job, url))
+            .collect()
+    }
+
+    /// Note one failed attempt to retire a stale approval.
+    ///
+    /// Returns whether this was the last attempt: the caller reports the
+    /// abandonment once, and the job is never offered again.
+    pub(crate) fn retirement_failed(&mut self, job_id: &str, now_ms: i64) -> Result<bool, ()> {
+        let holder = ClaimHolder::MoniqueJob(job_id.to_owned()).as_string();
+        let mut abandoned = false;
+        self.commit(|tickets| {
+            let mut changed = false;
+            for claim in tickets
+                .iter_mut()
+                .flat_map(|ticket| ticket.claims.iter_mut())
+                .filter(|claim| claim.holder == holder)
+            {
+                let Some(retire) = claim.retire.as_mut() else {
+                    continue;
+                };
+                if retire.attempts >= MAX_RETIRE_ATTEMPTS {
+                    continue;
+                }
+                retire.attempts = retire.attempts.saturating_add(1);
+                retire.next_ms = now_ms.saturating_add(RETIRE_RETRY_MS);
+                abandoned |= retire.attempts >= MAX_RETIRE_ATTEMPTS;
+                changed = true;
+            }
+            changed
+        })?;
+        Ok(abandoned)
+    }
+
+    /// Whether a job is marked as a stale approval still to be retired.
+    #[cfg(test)]
+    pub(crate) fn retirement_pending(&self, job_id: &str) -> bool {
+        let holder = ClaimHolder::MoniqueJob(job_id.to_owned()).as_string();
+        self.tickets
+            .iter()
+            .flat_map(|ticket| ticket.claims.iter())
+            .any(|claim| {
+                claim.holder == holder
+                    && claim
+                        .retire
+                        .is_some_and(|retire| retire.attempts < MAX_RETIRE_ATTEMPTS)
+            })
     }
 
     /// Reschedule one queued ticket whose check did not find it finished.
@@ -988,11 +1245,17 @@ impl TicketWorkLedger {
             };
             if observed_unfinished {
                 ticket.finished_ms = None;
+                // The ticket is open again, so an approval still waiting on
+                // it is a live question once more, not a stale one.
+                for claim in &mut ticket.claims {
+                    claim.retire = None;
+                }
             }
+            let interval_ms = ticket.verify_interval_ms();
             let Some(verification) = ticket.verification.as_mut() else {
                 return observed_unfinished;
             };
-            verification.next_due_ms = now_ms.saturating_add(VERIFY_INTERVAL_MS);
+            verification.next_due_ms = now_ms.saturating_add(interval_ms);
             true
         })?;
         Ok(())
@@ -1002,7 +1265,9 @@ impl TicketWorkLedger {
     /// than [`VERIFY_MAX_AGE_MS`].
     ///
     /// A ticket somebody is working is skipped: its own claim's end will
-    /// queue it again.
+    /// queue it again. The longest-due ticket comes first and a checked one is
+    /// rescheduled behind the rest, so a backlog larger than `limit` rotates:
+    /// every queued ticket is reached before any is checked twice.
     pub(crate) fn due_verifications(
         &mut self,
         limit: usize,
@@ -1010,8 +1275,8 @@ impl TicketWorkLedger {
     ) -> Result<Vec<(TicketKey, TicketKind)>, ()> {
         let expired = |ticket: &StoredTicket| {
             ticket.verification.is_some_and(|verification| {
-                verification
-                    .first_queued_ms
+                ticket
+                    .verification_anchor_ms(verification)
                     .saturating_add(VERIFY_MAX_AGE_MS)
                     <= now_ms
             })
@@ -1181,13 +1446,7 @@ impl TicketWorkLedger {
                 if !ticket.claims.iter().any(|claim| claim.holder == holder)
                     && ticket.claims.len() < MAX_CLAIMS_PER_TICKET
                 {
-                    ticket.claims.push(StoredClaim {
-                        holder,
-                        since_ms: now_ms,
-                        job_status: None,
-                        read_failures: 0,
-                        polled_ms: 0,
-                    });
+                    ticket.claims.push(StoredClaim::new(holder, now_ms));
                     changed = true;
                 }
             }
@@ -1518,6 +1777,107 @@ impl<T: crate::telegram_bridge::TicketActionSurface + Send + ?Sized> TicketJobRe
     }
 }
 
+/// How one attempt to retire a stale approval ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetireOutcome {
+    /// Manage recorded the rejection: the job is cancelled and never ran.
+    Retired,
+    /// The job was no longer awaiting approval when it was read again, so
+    /// nothing was sent. Carries the status it had.
+    NotPending(TicketJobStatus),
+    /// The job could not be read or the decision was not accepted. Carries a
+    /// stable category for the journal.
+    Failed(&'static str),
+}
+
+/// The one mutation the reactor makes outside Slack: rejecting a job whose
+/// ticket was finished before anybody approved it.
+pub(crate) trait StaleApprovalRetirer: Send {
+    /// Reject `job_id`, recorded for `ticket`, if and only if it still awaits
+    /// approval right now.
+    fn retire(&mut self, job_id: &str, ticket: &TicketKey) -> RetireOutcome;
+}
+
+/// The decision key of a job's stale-approval rejection.
+///
+/// Derived from the job alone, so a retry after an unknown transport result
+/// repeats the same decision and Manage answers it as a duplicate.
+pub(crate) fn stale_approval_decision_key(job_id: &str) -> String {
+    format!("{STALE_APPROVAL_DECISION_PREFIX}{job_id}")
+}
+
+/// Retires stale approvals through Manage's ordinary ticket decision.
+///
+/// This is the path an administrator's `reject` takes — the same
+/// [`crate::telegram_bridge::decide_bound_ticket`] call against the same
+/// retained gate coordinates — with a fixed reason, a fixed actor and a
+/// decision key derived from the job.
+pub(crate) struct ManageApprovalRetirer {
+    pub(crate) manage: Box<dyn crate::telegram_bridge::TicketActionSurface + Send>,
+    pub(crate) gates: Arc<Mutex<crate::telegram_bridge::TicketGateRegistry>>,
+}
+
+impl StaleApprovalRetirer for ManageApprovalRetirer {
+    fn retire(&mut self, job_id: &str, ticket: &TicketKey) -> RetireOutcome {
+        // The job's own source coordinate is what Manage binds a decision to;
+        // without the retained gate there is nothing to decide with.
+        let Some(gate) = self
+            .gates
+            .lock()
+            .ok()
+            .and_then(|gates| gates.gate_for_job(job_id))
+        else {
+            return RetireOutcome::Failed("gate_missing");
+        };
+        if TicketKey::parse_url(&gate.issue_url)
+            .is_none_or(|(key, _)| key.identity() != ticket.identity())
+        {
+            return RetireOutcome::Failed("gate_ticket_mismatch");
+        }
+        // Read immediately before deciding: only a job that is still awaiting
+        // approval may be rejected, never one somebody released meanwhile.
+        let status = match self.manage.ticket_status(job_id) {
+            Ok(status) if status.job_id == job_id => status.job_status,
+            Ok(_) => return RetireOutcome::Failed("status_mismatch"),
+            Err(_) => return RetireOutcome::Failed("status_unavailable"),
+        };
+        if status != TicketJobStatus::PendingApproval {
+            return RetireOutcome::NotPending(status);
+        }
+        let Ok(decision) =
+            automonique_support_connector::TicketDecision::reject(STALE_APPROVAL_REASON)
+        else {
+            return RetireOutcome::Failed("reason_refused");
+        };
+        match crate::telegram_bridge::decide_bound_ticket(
+            self.manage.as_mut(),
+            job_id,
+            &gate.issue_url,
+            &gate.source_key,
+            &stale_approval_decision_key(job_id),
+            STALE_APPROVAL_ACTOR,
+            decision,
+        ) {
+            Ok(receipt)
+                if receipt.job_id == job_id
+                    && receipt.decision
+                        == automonique_support_connector::TicketDecisionOutcome::Rejected
+                    && receipt.job_status == TicketJobStatus::Cancelled =>
+            {
+                // Best effort, as after a human's reject: a gate left behind
+                // only names a job Manage no longer lets anybody decide.
+                let _ = self
+                    .gates
+                    .lock()
+                    .map(|mut gates| gates.resolve(job_id).is_ok());
+                RetireOutcome::Retired
+            }
+            Ok(_) => RetireOutcome::Failed("receipt_mismatch"),
+            Err(_) => RetireOutcome::Failed("decision_refused"),
+        }
+    }
+}
+
 /// One claim or release asked for over the local admin socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TicketClaimRequest {
@@ -1581,6 +1941,11 @@ pub(crate) struct TicketReactor {
     pub(crate) jobs: Option<Box<dyn TicketJobReader>>,
     pub(crate) github: Option<Box<dyn TicketDeliveryReader>>,
     pub(crate) team_logins: Vec<String>,
+    /// Whether tickets whose jobs all await approval are verified at all.
+    pub(crate) verify_unapproved: bool,
+    /// Retires the stale approval of a ticket found finished; `None` leaves
+    /// such a job waiting in Manage.
+    pub(crate) retirer: Option<Box<dyn StaleApprovalRetirer>>,
     pub(crate) channels: Vec<ChannelId>,
     pub(crate) requests: Receiver<(TicketClaimRequest, ClaimReply)>,
     pub(crate) last_job_poll_ms: i64,
@@ -1628,6 +1993,10 @@ impl TicketReactor {
         }
         if now_ms.saturating_sub(self.last_verify_pass_ms) >= VERIFY_PASS_INTERVAL_MS {
             self.last_verify_pass_ms = now_ms;
+            if self.verify_unapproved {
+                let retire = self.retirer.is_some();
+                let _ = self.with_ledger(|ledger| ledger.queue_unapproved(retire, now_ms));
+            }
             let due = self
                 .with_ledger(|ledger| ledger.due_verifications(VERIFY_PER_PASS, now_ms))
                 .and_then(Result::ok)
@@ -1635,6 +2004,7 @@ impl TicketReactor {
             for (key, kind) in due {
                 self.verify(&key, kind, now_ms);
             }
+            self.retire_stale_approvals(now_ms);
         }
         if now_ms.saturating_sub(self.last_reaction_pass_ms) >= REACTION_PASS_INTERVAL_MS {
             self.last_reaction_pass_ms = now_ms;
@@ -1671,14 +2041,63 @@ impl TicketReactor {
         let finished = facts
             .as_ref()
             .is_some_and(|facts| delivery_finished(facts, &self.team_logins));
+        let retire = self.retirer.is_some();
         let _ = self.with_ledger(|ledger| {
             if finished {
-                ledger.mark_finished(key, now_ms).map(|_| ())
+                ledger.mark_finished(key, retire, now_ms).map(|_| ())
             } else {
                 ledger.verified_unfinished(key, facts.is_some(), now_ms)
             }
         });
         finished
+    }
+
+    /// Retire a few approvals whose tickets were verified finished.
+    ///
+    /// The ledger only proposes a job it last saw awaiting approval on a
+    /// ticket still recorded finished; the retirer reads the job again before
+    /// it decides. A failure is counted and retried later, and the last one
+    /// is reported once.
+    fn retire_stale_approvals(&mut self, now_ms: i64) {
+        if self.retirer.is_none() {
+            return;
+        }
+        let due = self
+            .with_ledger(|ledger| ledger.due_retirements(RETIRES_PER_PASS, now_ms))
+            .unwrap_or_default();
+        for (job, url) in due {
+            let Some((key, _)) = TicketKey::parse_url(&url) else {
+                continue;
+            };
+            let Some(outcome) = self
+                .retirer
+                .as_mut()
+                .map(|retirer| retirer.retire(&job, &key))
+            else {
+                return;
+            };
+            match outcome {
+                RetireOutcome::Retired => {
+                    let _ = self.with_ledger(|ledger| {
+                        ledger.observe_job_status(&job, TicketJobStatus::Cancelled, now_ms)
+                    });
+                    let _ = crate::structured_log::emit_stale_approval("retired", "rejected");
+                }
+                RetireOutcome::NotPending(status) => {
+                    let _ =
+                        self.with_ledger(|ledger| ledger.observe_job_status(&job, status, now_ms));
+                }
+                RetireOutcome::Failed(category) => {
+                    let abandoned = self
+                        .with_ledger(|ledger| ledger.retirement_failed(&job, now_ms))
+                        .and_then(Result::ok)
+                        .unwrap_or(false);
+                    if abandoned {
+                        let _ = crate::structured_log::emit_stale_approval("abandoned", category);
+                    }
+                }
+            }
+        }
     }
 
     /// Issue up to `limit` owed reactions; returns how many now stand.
@@ -1800,6 +2219,12 @@ mod tests {
     const POST: &str = "1723542000.000100";
     const SECOND_POST: &str = "1723542999.000200";
     const NOW: i64 = 1_800_000_000_000;
+    /// A Slack post written a little before [`NOW`], unlike [`POST`], which
+    /// is far older than the verification give-up age.
+    const RECENT_POST: &str = "1799999000.000100";
+    /// A later post of the same ticket, written after [`NOW`].
+    const REPOST: &str = "1800003600.000200";
+    const MINUTE_MS: i64 = 60 * 1000;
 
     fn key() -> (TicketKey, TicketKind) {
         TicketKey::parse_url(URL).expect("ticket")
@@ -1860,11 +2285,34 @@ mod tests {
         }
     }
 
-    struct FakeGitHub(Arc<Mutex<Option<TicketFacts>>>);
+    struct FakeGitHub {
+        facts: Arc<Mutex<Option<TicketFacts>>>,
+        /// Every ticket read, in order.
+        read: Arc<Mutex<Vec<String>>>,
+    }
 
     impl TicketDeliveryReader for FakeGitHub {
-        fn delivery(&mut self, _key: &TicketKey, _kind: TicketKind) -> Result<TicketFacts, ()> {
-            self.0.lock().expect("facts").clone().ok_or(())
+        fn delivery(&mut self, key: &TicketKey, _kind: TicketKind) -> Result<TicketFacts, ()> {
+            self.read.lock().expect("read").push(key.identity());
+            self.facts.lock().expect("facts").clone().ok_or(())
+        }
+    }
+
+    /// A retirer that records what it was asked and answers from a script;
+    /// once the script is empty every attempt retires the job.
+    struct FakeRetirer {
+        asked: Arc<Mutex<Vec<String>>>,
+        script: Arc<Mutex<std::collections::VecDeque<RetireOutcome>>>,
+    }
+
+    impl StaleApprovalRetirer for FakeRetirer {
+        fn retire(&mut self, job_id: &str, _ticket: &TicketKey) -> RetireOutcome {
+            self.asked.lock().expect("asked").push(job_id.to_owned());
+            self.script
+                .lock()
+                .expect("script")
+                .pop_front()
+                .unwrap_or(RetireOutcome::Retired)
         }
     }
 
@@ -1874,7 +2322,69 @@ mod tests {
         searched: Arc<Mutex<Vec<String>>>,
         jobs: Arc<Mutex<BTreeMap<String, TicketJobStatus>>>,
         facts: Arc<Mutex<Option<TicketFacts>>>,
+        github_reads: Arc<Mutex<Vec<String>>>,
+        retire_asked: Arc<Mutex<Vec<String>>>,
+        retire_script: Arc<Mutex<std::collections::VecDeque<RetireOutcome>>>,
         _handle: TicketClaimHandle,
+    }
+
+    impl Harness {
+        /// Turn on verification of tickets awaiting approval, with or without
+        /// the retirer.
+        fn with_stale_approvals(mut self, retire: bool) -> Self {
+            self.reactor.verify_unapproved = true;
+            self.reactor.retirer = retire.then(|| {
+                Box::new(FakeRetirer {
+                    asked: Arc::clone(&self.retire_asked),
+                    script: Arc::clone(&self.retire_script),
+                }) as Box<dyn StaleApprovalRetirer>
+            });
+            self
+        }
+
+        /// Run one full pass at `now_ms`, whatever ran just before.
+        fn pass(&mut self, now_ms: i64) {
+            self.reactor.last_job_poll_ms = 0;
+            self.reactor.last_verify_pass_ms = 0;
+            self.reactor.last_reaction_pass_ms = 0;
+            self.reactor.tick(now_ms);
+        }
+
+        fn ledger(&self) -> std::sync::MutexGuard<'_, TicketWorkLedger> {
+            self.reactor.ledger.lock().expect("ledger")
+        }
+
+        fn github_reads(&self) -> usize {
+            self.github_reads.lock().expect("reads").len()
+        }
+
+        fn retire_asked(&self) -> Vec<String> {
+            self.retire_asked.lock().expect("asked").clone()
+        }
+
+        /// Record a ticket posted at [`RECENT_POST`] with one job awaiting
+        /// approval, and make Manage report that job the same way.
+        fn awaiting_approval(&self, url: &str, job_id: &str) -> TicketKey {
+            let (ticket, kind) = TicketKey::parse_url(url).expect("ticket");
+            let mut ledger = self.ledger();
+            ledger
+                .record_post(&ticket, kind, CHANNEL, RECENT_POST, NOW)
+                .expect("post");
+            ledger
+                .record_job(
+                    &ticket,
+                    kind,
+                    job_id,
+                    Some(TicketJobStatus::PendingApproval),
+                    NOW,
+                )
+                .expect("job");
+            self.jobs
+                .lock()
+                .expect("jobs")
+                .insert(job_id.to_owned(), TicketJobStatus::PendingApproval);
+            ticket
+        }
     }
 
     fn harness(history: BTreeMap<String, Vec<(String, String)>>) -> Harness {
@@ -1886,14 +2396,20 @@ mod tests {
         let searched = Arc::clone(&slack.searched);
         let jobs = Arc::new(Mutex::new(BTreeMap::new()));
         let facts = Arc::new(Mutex::new(None));
+        let github_reads = Arc::new(Mutex::new(Vec::new()));
         let (handle, requests) = claim_queue();
         Harness {
             reactor: TicketReactor {
                 ledger: Arc::new(Mutex::new(TicketWorkLedger::in_memory())),
                 slack: Box::new(slack),
                 jobs: Some(Box::new(FakeJobs(Arc::clone(&jobs)))),
-                github: Some(Box::new(FakeGitHub(Arc::clone(&facts)))),
+                github: Some(Box::new(FakeGitHub {
+                    facts: Arc::clone(&facts),
+                    read: Arc::clone(&github_reads),
+                })),
                 team_logins: vec![String::from("team-member")],
+                verify_unapproved: false,
+                retirer: None,
                 channels: vec![
                     ChannelId::new(CHANNEL).expect("channel"),
                     ChannelId::new(OTHER_CHANNEL).expect("channel"),
@@ -1907,6 +2423,9 @@ mod tests {
             searched,
             jobs,
             facts,
+            github_reads,
+            retire_asked: Arc::new(Mutex::new(Vec::new())),
+            retire_script: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             _handle: handle,
         }
     }
@@ -2324,7 +2843,9 @@ mod tests {
             ledger
                 .release(&ticket, kind, &claude("one"), NOW)
                 .expect("release");
-            ledger.mark_finished(&ticket, NOW + 1).expect("finished");
+            ledger
+                .mark_finished(&ticket, false, NOW + 1)
+                .expect("finished");
             // Another session claims while the ticket is finished: still no
             // 👀 is owed on anything.
             ledger
@@ -2537,5 +3058,785 @@ mod tests {
             Some("ticket_holder_invalid")
         );
         assert!(harness.searched.lock().expect("searched").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Jobs awaiting approval: weak claims, verification, and retirement.
+    // -----------------------------------------------------------------------
+
+    fn delivered() -> TicketFacts {
+        open_issue_with_comment("team-member", "Corrigé et déployé en production.")
+    }
+
+    fn reopened() -> TicketFacts {
+        open_issue_with_comment("client-login", "toujours cassé")
+    }
+
+    #[test]
+    fn a_ticket_whose_only_claim_awaits_approval_is_verified_and_owes_no_eyes() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(reopened());
+
+        harness.pass(NOW);
+        assert_eq!(harness.github_reads(), 1, "the waiting job did not hide it");
+        assert!(harness.reactions.lock().expect("reactions").is_empty());
+        assert!(harness.ledger().pending_reactions(None, 8).is_empty());
+        assert!(!harness.ledger().actively_claimed(&ticket));
+        assert!(!harness.ledger().is_finished(&ticket));
+        assert!(harness.ledger().is_queued(&ticket));
+        assert!(
+            harness.retire_asked().is_empty(),
+            "unfinished: nothing retired"
+        );
+
+        // An unfinished ticket awaiting approval is read again no more often
+        // than every thirty minutes, however many passes run in between.
+        harness.pass(NOW + VERIFY_INTERVAL_MS);
+        harness.pass(NOW + UNAPPROVED_VERIFY_INTERVAL_MS - 1);
+        assert_eq!(harness.github_reads(), 1);
+        harness.pass(NOW + UNAPPROVED_VERIFY_INTERVAL_MS);
+        assert_eq!(harness.github_reads(), 2);
+    }
+
+    #[test]
+    fn without_stale_approval_handling_a_waiting_ticket_is_left_exactly_as_before() {
+        let mut harness = harness(BTreeMap::new());
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        harness.pass(NOW);
+        harness.pass(NOW + UNAPPROVED_VERIFY_INTERVAL_MS);
+        assert_eq!(harness.github_reads(), 0);
+        assert!(!harness.ledger().is_queued(&ticket));
+        assert!(!harness.ledger().is_finished(&ticket));
+        assert!(harness.reactions.lock().expect("reactions").is_empty());
+    }
+
+    #[test]
+    fn a_finished_ticket_gets_its_check_mark_and_its_stale_approval_is_retired_once() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+
+        harness.pass(NOW);
+        assert!(harness.ledger().is_finished(&ticket));
+        assert_eq!(
+            *harness.reactions.lock().expect("reactions"),
+            vec![(
+                CHANNEL.to_owned(),
+                RECENT_POST.to_owned(),
+                ReactionName::WhiteCheckMark
+            )],
+            "✅ and never 👀"
+        );
+        assert_eq!(harness.retire_asked(), vec![String::from("job-1")]);
+        // The retired job is no longer a claim on the ticket.
+        assert!(harness.ledger().ticket_jobs(&ticket).is_empty());
+        assert!(!harness.ledger().retirement_pending("job-1"));
+
+        // Nothing is asked twice, and the settled ticket is not read again.
+        for later in [
+            MINUTE_MS,
+            UNAPPROVED_VERIFY_INTERVAL_MS,
+            VERIFY_MAX_AGE_MS / 2,
+        ] {
+            harness.pass(NOW + later);
+        }
+        assert_eq!(harness.retire_asked().len(), 1);
+        assert_eq!(harness.github_reads(), 1);
+        assert_eq!(harness.reactions.lock().expect("reactions").len(), 1);
+    }
+
+    #[test]
+    fn a_failed_retirement_is_retried_at_its_cadence_and_then_abandoned() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        let bound = usize::from(MAX_RETIRE_ATTEMPTS);
+        harness
+            .retire_script
+            .lock()
+            .expect("script")
+            .extend(std::iter::repeat_n(
+                RetireOutcome::Failed("decision_refused"),
+                bound,
+            ));
+
+        harness.pass(NOW);
+        assert_eq!(harness.retire_asked().len(), 1);
+        // The ticket is finished whatever Manage answered: the ✅ stands, and
+        // the ledger still remembers the approval it owes a retirement.
+        assert!(harness.ledger().is_finished(&ticket));
+        assert!(harness.ledger().retirement_pending("job-1"));
+        assert_eq!(harness.reactions.lock().expect("reactions").len(), 1);
+
+        // Not before the retry interval…
+        harness.pass(NOW + RETIRE_RETRY_MS - 1);
+        assert_eq!(harness.retire_asked().len(), 1);
+        // …then once per interval, up to the bound.
+        for attempt in 1..MAX_RETIRE_ATTEMPTS {
+            harness.pass(NOW + i64::from(attempt) * RETIRE_RETRY_MS);
+            assert_eq!(harness.retire_asked().len(), usize::from(attempt) + 1);
+        }
+        assert!(!harness.ledger().retirement_pending("job-1"), "abandoned");
+
+        // Abandoned for good: the scripted failures are spent, so another
+        // attempt would have retired the job and shown up here.
+        for later in [
+            i64::from(MAX_RETIRE_ATTEMPTS) * RETIRE_RETRY_MS,
+            VERIFY_MAX_AGE_MS / 2,
+        ] {
+            harness.pass(NOW + later);
+        }
+        assert_eq!(harness.retire_asked().len(), bound, "bounded");
+        assert_eq!(harness.github_reads(), 1, "and not verified in a loop");
+        assert_eq!(
+            harness.ledger().ticket_jobs(&ticket),
+            vec![String::from("job-1")]
+        );
+    }
+
+    #[test]
+    fn a_retirement_that_fails_once_succeeds_on_the_retry() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        harness
+            .retire_script
+            .lock()
+            .expect("script")
+            .push_back(RetireOutcome::Failed("status_unavailable"));
+        harness.pass(NOW);
+        assert!(harness.ledger().retirement_pending("job-1"));
+        harness.pass(NOW + RETIRE_RETRY_MS);
+        assert_eq!(harness.retire_asked().len(), 2);
+        assert!(harness.ledger().ticket_jobs(&ticket).is_empty());
+    }
+
+    #[test]
+    fn opting_out_of_retirement_still_verifies_and_leaves_the_job_waiting() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(false);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        for later in [
+            0,
+            UNAPPROVED_VERIFY_INTERVAL_MS,
+            4 * UNAPPROVED_VERIFY_INTERVAL_MS,
+        ] {
+            harness.pass(NOW + later);
+        }
+        assert!(harness.ledger().is_finished(&ticket));
+        assert_eq!(harness.reactions.lock().expect("reactions").len(), 1);
+        assert!(harness.retire_asked().is_empty());
+        assert!(!harness.ledger().retirement_pending("job-1"));
+        assert!(
+            harness
+                .ledger()
+                .due_retirements(8, NOW + MINUTE_MS)
+                .is_empty()
+        );
+        assert_eq!(
+            harness.ledger().ticket_jobs(&ticket),
+            vec![String::from("job-1")]
+        );
+        assert_eq!(
+            harness.github_reads(),
+            1,
+            "a finished ticket is not re-read"
+        );
+    }
+
+    #[test]
+    fn a_ticket_finished_before_this_release_is_checked_once_more_before_its_job_is_retired() {
+        // Recorded finished by a release that did not retire anything.
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        harness
+            .ledger()
+            .mark_finished(&ticket, false, NOW)
+            .expect("finished");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        harness.pass(NOW + MINUTE_MS);
+        assert_eq!(harness.github_reads(), 1);
+        assert_eq!(harness.retire_asked(), vec![String::from("job-1")]);
+
+        // The same ledger state, but GitHub now shows the client reopened it:
+        // the finish is withdrawn and the approval is left alone.
+        let mut harness = self::harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        harness
+            .ledger()
+            .mark_finished(&ticket, false, NOW)
+            .expect("finished");
+        *harness.facts.lock().expect("facts") = Some(reopened());
+        harness.pass(NOW + MINUTE_MS);
+        assert!(!harness.ledger().is_finished(&ticket));
+        assert!(harness.retire_asked().is_empty());
+        assert!(
+            harness
+                .ledger()
+                .due_retirements(8, NOW + VERIFY_MAX_AGE_MS)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_reopened_ticket_keeps_its_new_approval_until_it_is_finished_again() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        harness.pass(NOW);
+        assert_eq!(harness.retire_asked(), vec![String::from("job-1")]);
+
+        // The client comments and posts the ticket again; intake records the
+        // post and the fresh job Manage opened for it.
+        let reposted = NOW + 2 * 60 * MINUTE_MS;
+        {
+            let mut ledger = harness.ledger();
+            ledger
+                .record_post(&ticket, TicketKind::Issue, CHANNEL, REPOST, reposted)
+                .expect("post");
+            ledger
+                .record_job(
+                    &ticket,
+                    TicketKind::Issue,
+                    "job-2",
+                    Some(TicketJobStatus::PendingApproval),
+                    reposted,
+                )
+                .expect("job");
+        }
+        harness
+            .jobs
+            .lock()
+            .expect("jobs")
+            .insert(String::from("job-2"), TicketJobStatus::PendingApproval);
+        *harness.facts.lock().expect("facts") = Some(reopened());
+
+        harness.pass(reposted);
+        assert!(!harness.ledger().is_finished(&ticket), "finish withdrawn");
+        assert_eq!(harness.retire_asked().len(), 1, "the new approval stands");
+        assert!(!harness.ledger().retirement_pending("job-2"));
+        assert_eq!(
+            harness.ledger().ticket_jobs(&ticket),
+            vec![String::from("job-2")]
+        );
+        // The new post owes nothing: no 👀 for a waiting job, no stale ✅.
+        assert!(harness.ledger().pending_reactions(None, 8).is_empty());
+        assert_eq!(harness.reactions.lock().expect("reactions").len(), 1);
+        assert!(harness.ledger().is_queued(&ticket));
+
+        // Still watched at the thirty-minute cadence, and retired in turn
+        // once the team delivers again.
+        harness.pass(reposted + UNAPPROVED_VERIFY_INTERVAL_MS - 1);
+        assert_eq!(harness.github_reads(), 2);
+        *harness.facts.lock().expect("facts") = Some(delivered());
+        harness.pass(reposted + UNAPPROVED_VERIFY_INTERVAL_MS);
+        assert!(harness.ledger().is_finished(&ticket));
+        assert_eq!(
+            harness.retire_asked(),
+            vec![String::from("job-1"), String::from("job-2")]
+        );
+        assert!(harness.reactions.lock().expect("reactions").contains(&(
+            CHANNEL.to_owned(),
+            REPOST.to_owned(),
+            ReactionName::WhiteCheckMark
+        )));
+    }
+
+    #[test]
+    fn thirty_waiting_tickets_rotate_through_the_per_pass_bound_before_any_is_read_twice() {
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        for number in 100..130 {
+            harness.awaiting_approval(
+                &format!("https://github.com/example/project/issues/{number}"),
+                &format!("job-{number}"),
+            );
+        }
+        *harness.facts.lock().expect("facts") = Some(reopened());
+
+        for (pass, minute) in (0..10_i64).enumerate() {
+            harness.pass(NOW + minute * MINUTE_MS);
+            assert_eq!(
+                harness.github_reads(),
+                VERIFY_PER_PASS * (pass + 1),
+                "exactly the bound, pass {pass}"
+            );
+        }
+        let reads = harness.github_reads.lock().expect("reads").clone();
+        let distinct: BTreeSet<&String> = reads.iter().collect();
+        assert_eq!(distinct.len(), 30, "every ticket reached once");
+
+        // Everything has been read and nothing is due: quiet passes.
+        harness.pass(NOW + 10 * MINUTE_MS);
+        harness.pass(NOW + UNAPPROVED_VERIFY_INTERVAL_MS - 1);
+        assert_eq!(harness.github_reads(), 30);
+
+        // The second round starts with the tickets read first, in order.
+        harness.pass(NOW + UNAPPROVED_VERIFY_INTERVAL_MS);
+        let reads = harness.github_reads.lock().expect("reads").clone();
+        assert_eq!(reads.len(), 33);
+        assert_eq!(reads[30..], reads[..3]);
+        assert!(harness.reactions.lock().expect("reactions").is_empty());
+        assert!(harness.retire_asked().is_empty());
+    }
+
+    #[test]
+    fn a_waiting_ticket_is_given_up_twenty_one_days_after_its_newest_post() {
+        let mut ledger = TicketWorkLedger::in_memory();
+        let (old, kind) = key();
+        ledger
+            .record_post(&old, kind, CHANNEL, POST, NOW)
+            .expect("post");
+        ledger
+            .record_job(
+                &old,
+                kind,
+                "job-old",
+                Some(TicketJobStatus::PendingApproval),
+                NOW,
+            )
+            .expect("job");
+        // Recorded now, but posted long ago: the age is the post's own.
+        assert!(!ledger.queue_unapproved(true, NOW).expect("queue"));
+        assert!(!ledger.is_queued(&old));
+
+        let (recent, kind) =
+            TicketKey::parse_url("https://github.com/example/project/issues/43").expect("ticket");
+        ledger
+            .record_post(&recent, kind, CHANNEL, RECENT_POST, NOW)
+            .expect("post");
+        ledger
+            .record_job(
+                &recent,
+                kind,
+                "job-new",
+                Some(TicketJobStatus::PendingApproval),
+                NOW,
+            )
+            .expect("job");
+        assert!(ledger.queue_unapproved(true, NOW).expect("queue"));
+        assert!(ledger.is_queued(&recent));
+
+        let posted_ms = slack_ts_ms(RECENT_POST).expect("ts");
+        let give_up = posted_ms + VERIFY_MAX_AGE_MS;
+        assert_eq!(
+            ledger
+                .due_verifications(VERIFY_PER_PASS, give_up - 1)
+                .expect("due")
+                .len(),
+            1
+        );
+        assert!(
+            ledger
+                .due_verifications(VERIFY_PER_PASS, give_up)
+                .expect("due")
+                .is_empty()
+        );
+        assert!(!ledger.is_queued(&recent));
+        assert!(!ledger.queue_unapproved(true, give_up).expect("queue"));
+
+        // A newer post puts the ticket under watch again.
+        ledger
+            .record_post(&recent, kind, CHANNEL, REPOST, give_up)
+            .expect("post");
+        assert!(ledger.queue_unapproved(true, give_up).expect("queue"));
+        assert!(ledger.is_queued(&recent));
+    }
+
+    #[test]
+    fn an_approval_granted_meanwhile_is_no_longer_stale() {
+        let mut ledger = TicketWorkLedger::in_memory();
+        let (ticket, kind) = key();
+        ledger
+            .record_post(&ticket, kind, CHANNEL, RECENT_POST, NOW)
+            .expect("post");
+        ledger
+            .record_job(
+                &ticket,
+                kind,
+                "job-1",
+                Some(TicketJobStatus::PendingApproval),
+                NOW,
+            )
+            .expect("job");
+        ledger.mark_finished(&ticket, true, NOW).expect("finished");
+        assert_eq!(
+            ledger.due_retirements(8, NOW),
+            vec![(String::from("job-1"), String::from(URL))]
+        );
+        for status in [
+            TicketJobStatus::Pending,
+            TicketJobStatus::Claimed,
+            TicketJobStatus::Running,
+        ] {
+            ledger
+                .observe_job_status("job-1", status, NOW + 1)
+                .expect("status");
+            assert!(
+                ledger
+                    .due_retirements(8, NOW + VERIFY_MAX_AGE_MS)
+                    .is_empty()
+            );
+            assert!(!ledger.retirement_pending("job-1"), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_planned_retirement_survives_a_ledger_reopen() {
+        let directory = tempfile::tempdir().expect("directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private");
+        let path = directory.path().join(TICKET_WORK_FILE);
+        let (ticket, kind) = key();
+        {
+            let mut ledger = TicketWorkLedger::open(path.clone()).expect("open");
+            ledger
+                .record_post(&ticket, kind, CHANNEL, RECENT_POST, NOW)
+                .expect("post");
+            ledger
+                .record_job(
+                    &ticket,
+                    kind,
+                    "job-1",
+                    Some(TicketJobStatus::PendingApproval),
+                    NOW,
+                )
+                .expect("job");
+            ledger.mark_finished(&ticket, true, NOW).expect("finished");
+            assert!(!ledger.retirement_failed("job-1", NOW).expect("failed"));
+        }
+        let reopened = TicketWorkLedger::open(path).expect("reopen");
+        assert!(reopened.retirement_pending("job-1"));
+        assert!(
+            reopened
+                .due_retirements(8, NOW + RETIRE_RETRY_MS - 1)
+                .is_empty()
+        );
+        assert_eq!(reopened.due_retirements(8, NOW + RETIRE_RETRY_MS).len(), 1);
+    }
+
+    // The production retirer, against a fake Manage.
+
+    type Decision = (
+        String,
+        String,
+        String,
+        String,
+        automonique_support_connector::TicketDecision,
+    );
+
+    #[derive(Default)]
+    struct FakeManage {
+        /// The status the job is read with; `None` makes the read fail.
+        status: Option<TicketJobStatus>,
+        decide_error: Option<&'static str>,
+        status_reads: Arc<Mutex<Vec<String>>>,
+        decisions: Arc<Mutex<Vec<Decision>>>,
+        dispatches: Arc<Mutex<u32>>,
+    }
+
+    impl crate::telegram_bridge::TicketActionSurface for FakeManage {
+        fn dispatch_ticket(
+            &mut self,
+            _issue_url: &str,
+            _source_key: &str,
+        ) -> Result<automonique_support_connector::TicketDispatchReceipt, String> {
+            *self.dispatches.lock().expect("dispatches") += 1;
+            Err(String::from("issue_closed"))
+        }
+
+        fn confirm_ticket(
+            &mut self,
+            _issue_url: &str,
+            _source_key: &str,
+        ) -> Result<automonique_support_connector::TicketDispatchReceipt, String> {
+            panic!("a retirement never confirms anything")
+        }
+
+        fn decide_ticket(
+            &mut self,
+            job_id: &str,
+            source_key: &str,
+            decision_key: &str,
+            actor_key: &str,
+            decision: automonique_support_connector::TicketDecision,
+        ) -> Result<automonique_support_connector::TicketDecisionReceipt, String> {
+            self.decisions.lock().expect("decisions").push((
+                job_id.to_owned(),
+                source_key.to_owned(),
+                decision_key.to_owned(),
+                actor_key.to_owned(),
+                decision,
+            ));
+            if let Some(reason) = self.decide_error {
+                return Err(reason.to_owned());
+            }
+            Ok(automonique_support_connector::TicketDecisionReceipt {
+                job_id: job_id.to_owned(),
+                job_status: TicketJobStatus::Cancelled,
+                decision: automonique_support_connector::TicketDecisionOutcome::Rejected,
+                duplicate: false,
+            })
+        }
+
+        fn ticket_status(
+            &mut self,
+            job_id: &str,
+        ) -> Result<automonique_support_connector::TicketStatus, String> {
+            self.status_reads
+                .lock()
+                .expect("status reads")
+                .push(job_id.to_owned());
+            let job_status = self
+                .status
+                .ok_or_else(|| String::from("manage_unavailable"))?;
+            Ok(automonique_support_connector::TicketStatus {
+                issue_id: String::from("issue-fixture"),
+                issue_url: String::from(URL),
+                issue_title: String::from("Repair the form"),
+                job_id: job_id.to_owned(),
+                job_status,
+                result: String::new(),
+                created_at: String::from("2026-08-17T20:42:00Z"),
+                updated_at: String::from("2026-08-17T21:02:00Z"),
+            })
+        }
+    }
+
+    const GATE_SOURCE: &str = "slack:T0RESERVED:event:EvOriginal";
+
+    struct RetirerFixture {
+        retirer: ManageApprovalRetirer,
+        gates: Arc<Mutex<crate::telegram_bridge::TicketGateRegistry>>,
+        status_reads: Arc<Mutex<Vec<String>>>,
+        decisions: Arc<Mutex<Vec<Decision>>>,
+        dispatches: Arc<Mutex<u32>>,
+    }
+
+    /// A retirer over a registry that retains `job-1`'s gate for [`URL`].
+    fn retirer(manage: FakeManage) -> RetirerFixture {
+        let gates = Arc::new(Mutex::new(
+            crate::telegram_bridge::TicketGateRegistry::default(),
+        ));
+        gates
+            .lock()
+            .expect("gates")
+            .register(crate::telegram_bridge::PendingTicketGate {
+                job_id: String::from("job-1"),
+                issue_url: String::from(URL),
+                source_key: String::from(GATE_SOURCE),
+            })
+            .expect("gate");
+        RetirerFixture {
+            status_reads: Arc::clone(&manage.status_reads),
+            decisions: Arc::clone(&manage.decisions),
+            dispatches: Arc::clone(&manage.dispatches),
+            retirer: ManageApprovalRetirer {
+                manage: Box::new(manage),
+                gates: Arc::clone(&gates),
+            },
+            gates,
+        }
+    }
+
+    #[test]
+    fn a_retirement_sends_one_reject_with_the_jobs_own_coordinates() {
+        let mut fixture = retirer(FakeManage {
+            status: Some(TicketJobStatus::PendingApproval),
+            ..FakeManage::default()
+        });
+        let (ticket, _) = key();
+        assert_eq!(
+            fixture.retirer.retire("job-1", &ticket),
+            RetireOutcome::Retired
+        );
+        assert_eq!(
+            *fixture.status_reads.lock().expect("status reads"),
+            vec![String::from("job-1")],
+            "read immediately before deciding"
+        );
+        let decisions = fixture.decisions.lock().expect("decisions");
+        assert_eq!(decisions.len(), 1);
+        let (job, source, decision_key, actor, decision) = &decisions[0];
+        assert_eq!(job, "job-1");
+        assert_eq!(source, GATE_SOURCE, "the job's original source key");
+        assert_eq!(decision_key, "automonique-stale-approval:job-1");
+        assert_eq!(actor, "automonique:stale-approval");
+        assert_eq!(
+            decision.reason(),
+            Some(
+                "Superseded: the ticket was finished outside Monique before this run was approved."
+            )
+        );
+        assert_eq!(*fixture.dispatches.lock().expect("dispatches"), 0);
+        // Rejected like a human's reject: the gate is no longer decidable.
+        assert!(
+            fixture
+                .gates
+                .lock()
+                .expect("gates")
+                .gate_for_job("job-1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_retirement_decision_is_one_manage_accepts_and_repeats_identically() {
+        // What Manage validates: bounded keys in its key alphabet, and a
+        // required reason of at most 500 bytes with no control characters.
+        let job = "0123abcd-4567-89ab-cdef-0123456789ab";
+        let key = stale_approval_decision_key(job);
+        assert_eq!(key, stale_approval_decision_key(job), "deterministic");
+        assert_ne!(key, stale_approval_decision_key("another-job"));
+        let request = automonique_support_connector::TicketDecisionRequest::new(
+            job,
+            GATE_SOURCE,
+            &key,
+            STALE_APPROVAL_ACTOR,
+            automonique_support_connector::TicketDecision::reject(STALE_APPROVAL_REASON)
+                .expect("reason"),
+        )
+        .expect("a request the connector accepts");
+        assert_eq!(request.decision().reason(), Some(STALE_APPROVAL_REASON));
+        assert!(STALE_APPROVAL_REASON.len() <= 500);
+        assert!(STALE_APPROVAL_REASON.is_ascii());
+        assert!(!STALE_APPROVAL_REASON.chars().any(char::is_control));
+        // The longest job id the ledger admits still yields a valid key.
+        let longest = stale_approval_decision_key(&"j".repeat(128));
+        assert!(longest.len() <= automonique_support_connector::MAX_TICKET_SOURCE_KEY_BYTES);
+    }
+
+    #[test]
+    fn a_job_that_is_not_awaiting_approval_is_never_rejected() {
+        let (ticket, _) = key();
+        for status in [
+            TicketJobStatus::Pending,
+            TicketJobStatus::Claimed,
+            TicketJobStatus::Running,
+            TicketJobStatus::Done,
+            TicketJobStatus::Failed,
+            TicketJobStatus::Cancelled,
+        ] {
+            let mut fixture = retirer(FakeManage {
+                status: Some(status),
+                ..FakeManage::default()
+            });
+            assert_eq!(
+                fixture.retirer.retire("job-1", &ticket),
+                RetireOutcome::NotPending(status)
+            );
+            assert!(
+                fixture.decisions.lock().expect("decisions").is_empty(),
+                "{status:?}"
+            );
+            assert!(
+                fixture
+                    .gates
+                    .lock()
+                    .expect("gates")
+                    .gate_for_job("job-1")
+                    .is_some(),
+                "its gate is left for whoever decides it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retirement_fails_closed_without_a_status_a_gate_or_an_accepted_decision() {
+        let (ticket, _) = key();
+
+        // The status cannot be read: nothing is decided blind.
+        let mut fixture = retirer(FakeManage::default());
+        assert_eq!(
+            fixture.retirer.retire("job-1", &ticket),
+            RetireOutcome::Failed("status_unavailable")
+        );
+        assert!(fixture.decisions.lock().expect("decisions").is_empty());
+
+        // No retained gate for the job (a prefix of another job's id is not
+        // one): Manage is not even asked.
+        let mut fixture = retirer(FakeManage {
+            status: Some(TicketJobStatus::PendingApproval),
+            ..FakeManage::default()
+        });
+        assert_eq!(
+            fixture.retirer.retire("job", &ticket),
+            RetireOutcome::Failed("gate_missing")
+        );
+        assert!(
+            fixture
+                .status_reads
+                .lock()
+                .expect("status reads")
+                .is_empty()
+        );
+
+        // A gate retained for a different ticket is not this ticket's job.
+        let (other, _) =
+            TicketKey::parse_url("https://github.com/example/project/issues/43").expect("other");
+        assert_eq!(
+            fixture.retirer.retire("job-1", &other),
+            RetireOutcome::Failed("gate_ticket_mismatch")
+        );
+        assert!(fixture.decisions.lock().expect("decisions").is_empty());
+
+        // Manage refuses the decision: reported as a failure, gate retained
+        // so the next attempt can repeat the same decision.
+        let mut fixture = retirer(FakeManage {
+            status: Some(TicketJobStatus::PendingApproval),
+            decide_error: Some("manage_unavailable"),
+            ..FakeManage::default()
+        });
+        assert_eq!(
+            fixture.retirer.retire("job-1", &ticket),
+            RetireOutcome::Failed("decision_refused")
+        );
+        assert_eq!(fixture.decisions.lock().expect("decisions").len(), 1);
+        assert!(
+            fixture
+                .gates
+                .lock()
+                .expect("gates")
+                .gate_for_job("job-1")
+                .is_some()
+        );
+        assert_eq!(
+            fixture.retirer.retire("job-1", &ticket),
+            RetireOutcome::Failed("decision_refused")
+        );
+        let decisions = fixture.decisions.lock().expect("decisions");
+        assert_eq!(decisions[0], decisions[1], "the retry is the same decision");
+    }
+
+    #[test]
+    fn a_job_released_after_the_ledger_last_saw_it_is_left_running() {
+        // The ledger still believes the job awaits approval; Manage knows it
+        // was approved and is running.
+        let mut harness = harness(BTreeMap::new()).with_stale_approvals(true);
+        let ticket = harness.awaiting_approval(URL, "job-1");
+        let fixture = retirer(FakeManage {
+            status: Some(TicketJobStatus::Running),
+            ..FakeManage::default()
+        });
+        let decisions = Arc::clone(&fixture.decisions);
+        let status_reads = Arc::clone(&fixture.status_reads);
+        harness.reactor.retirer = Some(Box::new(fixture.retirer));
+        *harness.facts.lock().expect("facts") = Some(delivered());
+
+        for later in [0, RETIRE_RETRY_MS, UNAPPROVED_VERIFY_INTERVAL_MS] {
+            harness.pass(NOW + later);
+        }
+        assert!(decisions.lock().expect("decisions").is_empty());
+        assert_eq!(status_reads.lock().expect("status reads").len(), 1);
+        assert!(!harness.ledger().retirement_pending("job-1"));
+        assert_eq!(
+            harness
+                .ledger()
+                .conflicts(&ticket, &claude("observer"))
+                .first()
+                .map(|conflict| conflict.status.clone()),
+            Some(String::from("running"))
+        );
     }
 }
