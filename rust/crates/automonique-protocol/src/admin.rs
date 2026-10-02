@@ -9,8 +9,9 @@
 //! shutdown request, a local no-effect synthetic intake, explicit fenced
 //! reconciliation paths for ambiguous synthetic runs and expired outbox
 //! effects, a durable-custody submission of one canonical RunSpec document,
-//! and a read-only report of the host enforcement features the daemon's
-//! execution lane negotiates documents against.
+//! a read-only report of the host enforcement features the daemon's
+//! execution lane negotiates documents against, and a local session's claim
+//! or release of one GitHub ticket.
 //!
 //! # The RunSpec document is opaque here
 //!
@@ -171,6 +172,31 @@ const _: () = assert!(
     "a maximal host_features_result must fit one admin frame"
 );
 
+/// Longest GitHub ticket URL a claim or release carries.
+pub const MAX_TICKET_URL_BYTES: usize = 512;
+
+/// Longest claim holder: the `claude:` prefix and a 128-byte session.
+pub const MAX_TICKET_HOLDER_BYTES: usize = 7 + 128;
+
+/// Most competing claims one `ticket_claim_result` reports.
+///
+/// The daemon keeps at most eight claims per ticket, so this is headroom; a
+/// longer list is refused at encode and at decode rather than truncated.
+pub const MAX_TICKET_CONFLICTS: usize = 16;
+
+/// Worst-case canonical bytes of one conflict entry: a maximal holder, the
+/// longest status word, both keys and the punctuation.
+const TICKET_CONFLICT_ENTRY_BYTES: usize = MAX_TICKET_HOLDER_BYTES + 32 + 64;
+
+/// Envelope, keys, two counters and array punctuation around the entries.
+const TICKET_CLAIM_RESPONSE_OVERHEAD_BYTES: usize = 216 + 128;
+
+const _: () = assert!(
+    MAX_TICKET_CONFLICTS * TICKET_CONFLICT_ENTRY_BYTES + TICKET_CLAIM_RESPONSE_OVERHEAD_BYTES
+        <= MAX_ADMIN_CANONICAL_BYTES,
+    "a maximal ticket_claim_result must fit one admin frame"
+);
+
 /// Largest canonical request accepted by the local multi-protocol dispatch.
 pub const MAX_LOCAL_REQUEST_CANONICAL_BYTES: usize = MAX_PLATFORM_V2_REQUEST_CANONICAL_BYTES;
 
@@ -279,7 +305,11 @@ const _: () = assert!(
 /// - **11** — added the read-only `automonique.admin/host_features` endpoint,
 ///   so a client that composes documents in another process negotiates against
 ///   the features the daemon's execution lane offers rather than its own.
-pub const ADMIN_CAPABILITY: u32 = 11;
+/// - **12** — added `automonique.admin/ticket_claim` and
+///   `automonique.admin/ticket_release`, so a local Claude Code session claims
+///   and releases a GitHub ticket through the daemon that owns its Slack
+///   status reactions instead of reacting itself.
+pub const ADMIN_CAPABILITY: u32 = 12;
 
 /// How much of a promise an endpoint is.
 ///
@@ -428,6 +458,8 @@ pub const ENDPOINT_MATURITY: &[(&str, Maturity)] = &[
         Maturity::Experimental,
     ),
     ("automonique.admin/host_features", Maturity::Experimental),
+    ("automonique.admin/ticket_claim", Maturity::Experimental),
+    ("automonique.admin/ticket_release", Maturity::Experimental),
 ];
 
 /// A refusal while constructing or decoding an administration message.
@@ -718,6 +750,14 @@ pub enum AdminCommand {
     /// itself would negotiate against its own confinement, which under a
     /// hardened service manager is no enforcement at all.
     HostFeatures,
+    /// Claim one GitHub ticket for a local Claude Code session.
+    ///
+    /// The daemon records the claim, marks the Slack posts that cited the
+    /// ticket as started, and reports every competing claim. It never starts
+    /// work: the session is already doing it.
+    TicketClaim,
+    /// Release a session's claim and have the daemon verify the ticket.
+    TicketRelease,
 }
 
 impl AdminCommand {
@@ -726,7 +766,7 @@ impl AdminCommand {
     /// Published so [`ENDPOINT_MATURITY`] can be held exhaustive over this lane
     /// by a test rather than by inspection: a command added here without a row
     /// there is a surface the daemon serves and never declared.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Status,
         Self::Metrics,
         Self::Generations,
@@ -743,6 +783,8 @@ impl AdminCommand {
         Self::ResumeIntake,
         Self::Shutdown,
         Self::HostFeatures,
+        Self::TicketClaim,
+        Self::TicketRelease,
     ];
 
     /// Stable wire spelling of this command's message kind.
@@ -765,7 +807,129 @@ impl AdminCommand {
             Self::ResumeIntake => "resume_intake",
             Self::Shutdown => "shutdown",
             Self::HostFeatures => "host_features",
+            Self::TicketClaim => "ticket_claim",
+            Self::TicketRelease => "ticket_release",
         }
+    }
+}
+
+/// One GitHub ticket and the local session claiming or releasing it.
+///
+/// The holder is a `claude:<session>` coordinate: Monique's own jobs hold
+/// tickets inside the daemon and are never named by a client. Neither field
+/// is authenticated beyond the local peer check, and neither needs to be: a
+/// claim marks work as started and releases nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketClaim {
+    issue_url: String,
+    holder: String,
+}
+
+impl TicketClaim {
+    /// Validate a claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for a URL that is not a bounded
+    /// `https://github.com/` URL, or a holder that is not `claude:` followed by
+    /// 1–128 ASCII letters, digits, `.`, `_`, `-` or `:`.
+    pub fn new(
+        issue_url: impl Into<String>,
+        holder: impl Into<String>,
+    ) -> Result<Self, AdminError> {
+        let issue_url = issue_url.into();
+        let holder = holder.into();
+        if !valid_ticket_url(&issue_url) || !valid_ticket_holder(&holder) {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self { issue_url, holder })
+    }
+
+    #[must_use]
+    pub fn issue_url(&self) -> &str {
+        &self.issue_url
+    }
+
+    #[must_use]
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+
+    fn to_body(&self) -> JsonValue {
+        JsonValue::Object(vec![
+            ("holder".to_owned(), JsonValue::String(self.holder.clone())),
+            (
+                "issue_url".to_owned(),
+                JsonValue::String(self.issue_url.clone()),
+            ),
+        ])
+    }
+
+    fn from_body(body: &JsonValue) -> Result<Self, AdminError> {
+        exact_fields(body, &["holder", "issue_url"])?;
+        Self::new(
+            required_body_string(body, "issue_url")?,
+            required_body_string(body, "holder")?,
+        )
+    }
+}
+
+fn valid_ticket_url(value: &str) -> bool {
+    value.len() <= MAX_TICKET_URL_BYTES
+        && value.starts_with("https://github.com/")
+        && value.len() > "https://github.com/".len()
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn valid_ticket_holder(value: &str) -> bool {
+    value.len() <= MAX_TICKET_HOLDER_BYTES
+        && value.strip_prefix("claude:").is_some_and(|session| {
+            !session.is_empty()
+                && session.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+                })
+        })
+}
+
+/// One claim competing with a session's claim on the same ticket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketClaimConflict {
+    holder: String,
+    status: String,
+}
+
+impl TicketClaimConflict {
+    /// The status words a conflict may carry: a session's `claimed`, or a
+    /// Monique job's non-terminal state.
+    pub const STATUSES: [&'static str; 4] = ["claimed", "pending_approval", "pending", "running"];
+
+    /// Validate one conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminError::InvalidBody`] for an empty, overlong or
+    /// non-ASCII holder, or a status outside [`Self::STATUSES`].
+    pub fn new(holder: impl Into<String>, status: impl Into<String>) -> Result<Self, AdminError> {
+        let holder = holder.into();
+        let status = status.into();
+        if holder.is_empty()
+            || holder.len() > MAX_TICKET_HOLDER_BYTES
+            || !holder.bytes().all(|byte| byte.is_ascii_graphic())
+            || !Self::STATUSES.contains(&status.as_str())
+        {
+            return Err(AdminError::InvalidBody);
+        }
+        Ok(Self { holder, status })
+    }
+
+    #[must_use]
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.status
     }
 }
 
@@ -1428,6 +1592,7 @@ pub struct AdminRequest {
     run_submission: Option<SubmittedRunSpec>,
     intake_pause: Option<IntakePause>,
     intake_resume: Option<IntakeResume>,
+    ticket_claim: Option<TicketClaim>,
 }
 
 impl AdminRequest {
@@ -1446,6 +1611,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1470,6 +1636,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         })
     }
 
@@ -1494,6 +1661,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         })
     }
 
@@ -1512,6 +1680,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1533,6 +1702,7 @@ impl AdminRequest {
             run_submission: Some(run_submission),
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1553,6 +1723,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         })
     }
 
@@ -1574,6 +1745,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1593,6 +1765,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         })
     }
 
@@ -1613,6 +1786,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1631,6 +1805,7 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: Some(intake_pause),
             intake_resume: None,
+            ticket_claim: None,
         }
     }
 
@@ -1649,6 +1824,30 @@ impl AdminRequest {
             run_submission: None,
             intake_pause: None,
             intake_resume: Some(intake_resume),
+            ticket_claim: None,
+        }
+    }
+
+    /// Construct a ticket claim, or with `release` a ticket release.
+    #[must_use]
+    pub const fn ticket_claim(request_id: RequestId, claim: TicketClaim, release: bool) -> Self {
+        Self {
+            request_id,
+            command: if release {
+                AdminCommand::TicketRelease
+            } else {
+                AdminCommand::TicketClaim
+            },
+            reload_id: None,
+            submission: None,
+            reconciliation_run_id: None,
+            reconciliation_failure: None,
+            outbox_id: None,
+            outbox_reconciliation: None,
+            run_submission: None,
+            intake_pause: None,
+            intake_resume: None,
+            ticket_claim: Some(claim),
         }
     }
 
@@ -1724,6 +1923,13 @@ impl AdminRequest {
         self.intake_resume.as_ref()
     }
 
+    /// Ticket body, present only for [`AdminCommand::TicketClaim`] and
+    /// [`AdminCommand::TicketRelease`].
+    #[must_use]
+    pub const fn ticket(&self) -> Option<&TicketClaim> {
+        self.ticket_claim.as_ref()
+    }
+
     /// Encode this request as a canonical local-protocol message.
     ///
     /// # Errors
@@ -1731,6 +1937,21 @@ impl AdminRequest {
     /// Returns a shared codec error only if a compile-time protocol literal no
     /// longer satisfies the shared envelope grammar.
     pub fn to_message(&self) -> Result<Message, AdminError> {
+        // The ticket commands carry one body of their own; every other field
+        // is unset by construction, which the constructors guarantee.
+        if matches!(
+            self.command,
+            AdminCommand::TicketClaim | AdminCommand::TicketRelease
+        ) {
+            let claim = self.ticket_claim.as_ref().ok_or(AdminError::InvalidBody)?;
+            return Ok(Message::new(
+                envelope(self.request_id.clone(), self.command.kind())?,
+                claim.to_body(),
+            ));
+        }
+        if self.ticket_claim.is_some() {
+            return Err(AdminError::InvalidBody);
+        }
         let body = match (
             self.command,
             &self.reload_id,
@@ -1943,6 +2164,11 @@ impl AdminRequest {
             "resume_intake" => Ok(Self::resume_intake(
                 message.envelope().request_id().clone(),
                 IntakeResume::from_body(message.body())?,
+            )),
+            kind @ ("ticket_claim" | "ticket_release") => Ok(Self::ticket_claim(
+                message.envelope().request_id().clone(),
+                TicketClaim::from_body(message.body())?,
+                kind == "ticket_release",
             )),
             "reload_status" => {
                 exact_fields(message.body(), &["reload_id"])?;
@@ -4393,6 +4619,18 @@ pub enum AdminResponse {
         /// The offered features, in the order the daemon measured them.
         features: Vec<HostFeature>,
     },
+    /// What a ticket claim or release found and did.
+    TicketClaimed {
+        /// Correlation identifier from the request.
+        request_id: RequestId,
+        /// Slack posts the daemon knows to have cited the ticket.
+        posts_found: u32,
+        /// Posts this call reacted to: 👀 for a claim, ✅ for a release the
+        /// daemon verified finished.
+        reacted: u32,
+        /// Every other claim still competing for the ticket.
+        conflicts: Vec<TicketClaimConflict>,
+    },
 }
 
 impl AdminResponse {
@@ -4418,6 +4656,7 @@ impl AdminResponse {
             | Self::IntakeResumed { request_id, .. }
             | Self::Refused { request_id, .. }
             | Self::HostFeatures { request_id, .. }
+            | Self::TicketClaimed { request_id, .. }
             | Self::ShutdownAccepted { request_id } => request_id,
         }
     }
@@ -4648,6 +4887,49 @@ impl AdminResponse {
                 envelope(request_id.clone(), "host_features_result")?,
                 host_features_body(features)?,
             )),
+            Self::TicketClaimed {
+                request_id,
+                posts_found,
+                reacted,
+                conflicts,
+            } => {
+                if conflicts.len() > MAX_TICKET_CONFLICTS {
+                    return Err(AdminError::InvalidBody);
+                }
+                Ok(Message::new(
+                    envelope(request_id.clone(), "ticket_claim_result")?,
+                    JsonValue::Object(vec![
+                        (
+                            "conflicts".to_owned(),
+                            JsonValue::Array(
+                                conflicts
+                                    .iter()
+                                    .map(|conflict| {
+                                        JsonValue::Object(vec![
+                                            (
+                                                "holder".to_owned(),
+                                                JsonValue::String(conflict.holder.clone()),
+                                            ),
+                                            (
+                                                "status".to_owned(),
+                                                JsonValue::String(conflict.status.clone()),
+                                            ),
+                                        ])
+                                    })
+                                    .collect(),
+                            ),
+                        ),
+                        (
+                            "posts_found".to_owned(),
+                            integer("posts_found", u64::from(*posts_found))?,
+                        ),
+                        (
+                            "reacted".to_owned(),
+                            integer("reacted", u64::from(*reacted))?,
+                        ),
+                    ]),
+                ))
+            }
         }
     }
 
@@ -4843,6 +5125,36 @@ impl AdminResponse {
                 request_id,
                 features: host_features_from_body(message.body())?,
             }),
+            "ticket_claim_result" => {
+                let body = message.body();
+                exact_fields(body, &["conflicts", "posts_found", "reacted"])?;
+                let Some(JsonValue::Array(entries)) = body.get("conflicts") else {
+                    return Err(AdminError::InvalidBody);
+                };
+                if entries.len() > MAX_TICKET_CONFLICTS {
+                    return Err(AdminError::InvalidBody);
+                }
+                let conflicts = entries
+                    .iter()
+                    .map(|entry| {
+                        exact_fields(entry, &["holder", "status"])?;
+                        TicketClaimConflict::new(
+                            required_body_string(entry, "holder")?,
+                            required_body_string(entry, "status")?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let counter = |field| {
+                    unsigned(body, field)
+                        .and_then(|value| u32::try_from(value).map_err(|_| AdminError::InvalidBody))
+                };
+                Ok(Self::TicketClaimed {
+                    request_id,
+                    posts_found: counter("posts_found")?,
+                    reacted: counter("reacted")?,
+                    conflicts,
+                })
+            }
             _ => Err(AdminError::UnknownKind),
         }
     }

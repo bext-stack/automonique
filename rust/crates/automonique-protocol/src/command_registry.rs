@@ -53,7 +53,7 @@
 //!
 //! # Where the seeded registry comes from
 //!
-//! [`admin_command_registry`] describes the sixteen commands
+//! [`admin_command_registry`] describes the eighteen commands
 //! [`crate::admin::AdminCommand`] actually admits, with the field names those
 //! bodies actually encode and the byte bounds `crate::admin` actually enforces
 //! — imported from that module rather than restated here, so a widened bound
@@ -1325,7 +1325,7 @@ impl CommandRegistry {
 
 /// The registry describing the local administration commands this build ships.
 ///
-/// Sixteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
+/// Eighteen commands, matching [`crate::admin::AdminCommand`]'s variants, with
 /// the field names and byte bounds `crate::admin` actually encodes and
 /// enforces.
 ///
@@ -1356,7 +1356,56 @@ pub fn admin_command_registry() -> Result<CommandRegistry, CommandRegistryError>
         resume_intake_spec()?,
         shutdown_spec()?,
         host_features_spec()?,
+        ticket_claim_spec()?,
+        ticket_release_spec()?,
     ])
+}
+
+fn ticket_fields() -> Result<Vec<FieldDescriptor>, CommandRegistryError> {
+    Ok(vec![
+        required(
+            "holder",
+            FieldType::bounded_string(crate::admin::MAX_TICKET_HOLDER_BYTES)?,
+            "The local session holding the ticket, spelled claude:<session>.",
+        )?,
+        required(
+            "issue_url",
+            FieldType::bounded_string(crate::admin::MAX_TICKET_URL_BYTES)?,
+            "The GitHub issue or pull-request URL being worked.",
+        )?,
+    ])
+}
+
+fn ticket_claim_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("ticket_claim")?,
+        aliases: Vec::new(),
+        summary: help(
+            "Claim a GitHub ticket for a local session and mark its Slack posts started.",
+        )?,
+        fields: ticket_fields()?,
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: unkeyed(
+            "A claim is set per holder rather than appended, so a repeated claim renews the same fact.",
+        )?,
+    })
+}
+
+fn ticket_release_spec() -> Result<CommandSpec, CommandRegistryError> {
+    CommandSpec::new(CommandSpecParts {
+        id: CommandId::new("ticket_release")?,
+        aliases: Vec::new(),
+        summary: help("Release a session's ticket claim and have the daemon verify the ticket.")?,
+        fields: ticket_fields()?,
+        authorization: AuthorizationRequirement::LocalPeer,
+        approval: ApprovalPolicy::None,
+        dry_run: DryRun::Unsupported,
+        mutation: unkeyed(
+            "Releasing removes the holder's claim, so a repeated release is the same fact.",
+        )?,
+    })
 }
 
 fn help(value: &str) -> Result<HelpText, CommandRegistryError> {

@@ -267,6 +267,7 @@ mod telegram;
 pub mod telegram_bridge;
 pub mod ticket_intake;
 mod ticket_presentation;
+pub mod ticket_reactions;
 pub mod ticket_work;
 pub mod work_brief;
 pub mod work_method;
@@ -5255,6 +5256,10 @@ impl Daemon {
                     features: execution.offered_host_features().to_vec(),
                 }
             }
+            automonique_protocol::admin::AdminCommand::TicketClaim
+            | automonique_protocol::admin::AdminCommand::TicketRelease => {
+                return self.handle_ticket_claim(stream, request);
+            }
         };
         self.write_admin_response(stream, &response)?;
         if matches!(
@@ -5271,15 +5276,67 @@ impl Daemon {
         stream: &mut UnixStream,
         response: &AdminResponse,
     ) -> Result<(), DaemonError> {
-        let response = response
-            .to_message()
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
-            .to_canonical_bytes();
-        let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
-        encode_frame(&response, &mut frame)
-            .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
-        stream.write_all(&frame)?;
-        stream.flush()?;
+        write_admin_frame(stream, response)
+    }
+
+    /// Queue one local session's ticket claim or release for the Slack
+    /// reaction worker, and answer it from a short-lived thread.
+    ///
+    /// The worker may need Slack and Manage round trips before it can answer
+    /// (a history search for an unrecorded post, a GitHub check on release),
+    /// and the serve loop must not wait on either: it renews this generation's
+    /// lease. So the request is queued, the connection is handed to a thread
+    /// that waits a bounded time for the answer, and the loop returns at once.
+    /// At most [`MAX_TICKET_CLAIM_WAITERS`] such threads exist at a time.
+    fn handle_ticket_claim(
+        &mut self,
+        stream: &mut UnixStream,
+        request: &AdminRequest,
+    ) -> Result<(), DaemonError> {
+        let Some(ticket) = request.ticket() else {
+            return self.write_refusal(stream, request.request_id(), "ticket_claim_invalid");
+        };
+        let Some(claims) = self.slack_tickets.ticket_claims() else {
+            return self.write_refusal(stream, request.request_id(), "slack_tickets_unavailable");
+        };
+        if TICKET_CLAIM_WAITERS.fetch_add(1, Ordering::AcqRel) >= MAX_TICKET_CLAIM_WAITERS {
+            TICKET_CLAIM_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            return self.write_refusal(stream, request.request_id(), "ticket_claims_busy");
+        }
+        let answer = match claims.submit(ticket_reactions::TicketClaimRequest {
+            issue_url: ticket.issue_url().to_owned(),
+            holder: ticket.holder().to_owned(),
+            release: request.command() == automonique_protocol::admin::AdminCommand::TicketRelease,
+        }) {
+            Ok(answer) => answer,
+            Err(category) => {
+                TICKET_CLAIM_WAITERS.fetch_sub(1, Ordering::AcqRel);
+                return self.write_refusal(stream, request.request_id(), category);
+            }
+        };
+        let mut detached = match stream.try_clone() {
+            Ok(detached) => detached,
+            Err(error) => {
+                TICKET_CLAIM_WAITERS.fetch_sub(1, Ordering::AcqRel);
+                return Err(DaemonError::Io(error));
+            }
+        };
+        let request_id = request.request_id().clone();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("automonique-ticket-claim"))
+            .spawn(move || {
+                let response = ticket_claim_response(
+                    request_id,
+                    answer.recv_timeout(TICKET_CLAIM_REPLY_TIMEOUT),
+                );
+                let _ = detached.set_write_timeout(Some(IO_TIMEOUT));
+                let _ = write_admin_frame(&mut detached, &response);
+                TICKET_CLAIM_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            });
+        if let Err(error) = spawned {
+            TICKET_CLAIM_WAITERS.fetch_sub(1, Ordering::AcqRel);
+            return Err(DaemonError::Io(error));
+        }
         Ok(())
     }
 
@@ -10458,6 +10515,79 @@ fn ensure_private_dir(path: &Path, kind: &'static str) -> Result<(), DaemonError
     }
 }
 
+/// How long a queued ticket claim's answer is awaited before the client is
+/// told it timed out. Shorter than the CLI's own read deadline for the two
+/// ticket commands, so the client always receives a typed answer.
+const TICKET_CLAIM_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Most ticket claim answers awaited at once.
+const MAX_TICKET_CLAIM_WAITERS: usize = 4;
+
+/// Ticket claim answers being awaited right now.
+static TICKET_CLAIM_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Encode one admin response and write it as one frame.
+fn write_admin_frame(stream: &mut UnixStream, response: &AdminResponse) -> Result<(), DaemonError> {
+    let response = response
+        .to_message()
+        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?
+        .to_canonical_bytes();
+    let mut frame = Vec::with_capacity(LENGTH_PREFIX_BYTES + response.len());
+    encode_frame(&response, &mut frame)
+        .map_err(|error| DaemonError::ProtocolRefused(error.category()))?;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Render the reactor's answer to one claim as the admin response.
+fn ticket_claim_response(
+    request_id: automonique_protocol::codec::RequestId,
+    answer: Result<
+        Result<ticket_reactions::TicketClaimOutcome, String>,
+        std::sync::mpsc::RecvTimeoutError,
+    >,
+) -> AdminResponse {
+    let refused = |category: &str| AdminResponse::Refused {
+        request_id: request_id.clone(),
+        category: AdminRefusalCategory::new(category).unwrap_or_else(|_| {
+            AdminRefusalCategory::new("ticket_claim_refused").expect("a valid literal category")
+        }),
+    };
+    match answer {
+        Ok(Ok(outcome)) => {
+            let conflicts: Result<Vec<_>, _> = outcome
+                .conflicts
+                .iter()
+                .take(automonique_protocol::admin::MAX_TICKET_CONFLICTS)
+                .map(|(holder, status)| {
+                    automonique_protocol::admin::TicketClaimConflict::new(
+                        holder.clone(),
+                        status.clone(),
+                    )
+                })
+                .collect();
+            match conflicts {
+                Ok(conflicts) => AdminResponse::TicketClaimed {
+                    request_id,
+                    posts_found: outcome.posts_found,
+                    reacted: outcome.reacted,
+                    conflicts,
+                },
+                Err(_) => refused("ticket_claim_unrepresentable"),
+            }
+        }
+        Ok(Err(category)) => refused(&category),
+        // The request stays queued: the reactor may still apply it after the
+        // client stopped waiting, and a claim is idempotent if repeated.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => refused("ticket_claim_timeout"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            refused("ticket_claims_unavailable")
+        }
+    }
+}
+
 fn unix_millis() -> Result<i64, DaemonError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -11394,6 +11524,84 @@ mod tests {
         assert_eq!(
             durable_count::<Unreadable>(Ok(usize::MAX)),
             OperationalMetric::Unavailable
+        );
+    }
+}
+
+#[cfg(test)]
+mod ticket_claim_response_tests {
+    use super::*;
+    use automonique_protocol::codec::RequestId;
+
+    fn id() -> RequestId {
+        RequestId::new("req-ticket-1").expect("request id")
+    }
+
+    fn category(response: &AdminResponse) -> Option<&str> {
+        match response {
+            AdminResponse::Refused { category, .. } => Some(category.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_reactor_answer_becomes_the_typed_claim_result() {
+        let response = ticket_claim_response(
+            id(),
+            Ok(Ok(ticket_reactions::TicketClaimOutcome {
+                posts_found: 2,
+                reacted: 1,
+                conflicts: vec![(String::from("monique-job:job-1"), String::from("running"))],
+            })),
+        );
+        let AdminResponse::TicketClaimed {
+            posts_found,
+            reacted,
+            conflicts,
+            ..
+        } = response
+        else {
+            panic!("a claim result");
+        };
+        assert_eq!((posts_found, reacted), (2, 1));
+        assert_eq!(conflicts[0].holder(), "monique-job:job-1");
+        assert_eq!(conflicts[0].status(), "running");
+    }
+
+    #[test]
+    fn a_refusal_a_timeout_and_a_stopped_reactor_are_typed_refusals() {
+        assert_eq!(
+            category(&ticket_claim_response(
+                id(),
+                Ok(Err(String::from("ticket_url_invalid")))
+            )),
+            Some("ticket_url_invalid")
+        );
+        assert_eq!(
+            category(&ticket_claim_response(
+                id(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )),
+            Some("ticket_claim_timeout")
+        );
+        assert_eq!(
+            category(&ticket_claim_response(
+                id(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            )),
+            Some("ticket_claims_unavailable")
+        );
+        // A status word the wire does not carry is refused, never forwarded.
+        assert_eq!(
+            category(&ticket_claim_response(
+                id(),
+                Ok(Ok(ticket_reactions::TicketClaimOutcome {
+                    posts_found: 0,
+                    reacted: 0,
+                    conflicts: vec![(String::from("claude:x"), String::from("done"))],
+                }))
+            )),
+            Some("ticket_claim_unrepresentable")
         );
     }
 }

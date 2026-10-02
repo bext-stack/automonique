@@ -3079,6 +3079,76 @@ fn actions_unavailable() -> String {
     String::from("status=refused reason=github_actions_unavailable")
 }
 
+/// The delivery facts the ticket reactor verifies against.
+///
+/// Read-only, and only for an allowlisted repository, like every other read
+/// here. An issue is one `GET` plus, while it is open, one page of comments —
+/// the last one, located from the issue's comment count, since only the latest
+/// comment decides. A `/issues/N` read that answers with a pull request is
+/// re-read as that pull request.
+impl crate::ticket_reactions::TicketDeliveryReader for GitHubWorkspace {
+    fn delivery(
+        &mut self,
+        key: &crate::ticket_reactions::TicketKey,
+        kind: crate::ticket_reactions::TicketKind,
+    ) -> Result<crate::ticket_reactions::TicketFacts, ()> {
+        use crate::ticket_reactions::{TicketFacts, TicketKind};
+        let locator = key.locator();
+        let target = locator.target().to_string();
+        let Some(configured) = self
+            .repositories
+            .iter()
+            .find(|configured| configured.to_string().eq_ignore_ascii_case(&target))
+            .cloned()
+        else {
+            return Err(());
+        };
+        let pull_request = |client: &GitHubClient| {
+            client
+                .get_pull_request(&automonique_github_connector::GetPullRequestRequest::new(
+                    configured.clone(),
+                    locator.number(),
+                ))
+                .map_err(|_| ())
+                .and_then(|reply| accepted(reply).map_err(|_| ()))
+                .map(|pull| TicketFacts::Pull {
+                    merged: pull.merged,
+                })
+        };
+        if kind == TicketKind::Pull {
+            return pull_request(&self.client);
+        }
+        let issue = match self
+            .client
+            .get_issue(&GetIssueRequest::new(configured.clone(), locator.number()))
+        {
+            Ok(reply) => accepted(reply).map_err(|_| ())?,
+            Err(automonique_github_connector::GitHubFailure::NotAnIssue) => {
+                return pull_request(&self.client);
+            }
+            Err(_) => return Err(()),
+        };
+        let closed = issue.state == IssueState::Closed;
+        let latest_comment = if closed {
+            None
+        } else {
+            self.recent_issue_comments(
+                &IssueLocator::new(configured, locator.number()),
+                issue.comment_count,
+                1,
+            )
+            .map_err(|_| ())?
+            .pop()
+            .map(|comment| (comment.author, comment.body))
+        };
+        Ok(TicketFacts::Issue {
+            closed,
+            state_reason: issue.state_reason,
+            latest_comment,
+        })
+    }
+}
+
 fn unavailable(failure: automonique_github_connector::GitHubFailure) -> String {
     format!("status=unavailable reason={}", failure.category())
 }

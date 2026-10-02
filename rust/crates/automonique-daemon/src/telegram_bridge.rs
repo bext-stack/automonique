@@ -3543,6 +3543,18 @@ pub(crate) struct SlackTicketJobBinding {
     pub(crate) issue_url: String,
 }
 
+impl SlackTicketJobBinding {
+    /// The configured channel the binding's thread lives in.
+    pub(crate) fn channel(&self) -> &str {
+        &self.channel
+    }
+
+    /// The thread parent the ticket was requested under.
+    pub(crate) fn thread_ts(&self) -> &str {
+        &self.thread_ts
+    }
+}
+
 /// One durable terminal-status notification owed to a Slack ticket requester.
 ///
 /// This is deliberately separate from `slack-ticket-jobs.v1.json`. Older
@@ -3598,6 +3610,13 @@ pub(crate) struct TicketGateRegistry {
     slack_jobs_path: Option<PathBuf>,
     slack_notifications: Vec<SlackTicketNotification>,
     slack_notifications_path: Option<PathBuf>,
+    /// Where the next bounded notification poll starts.
+    ///
+    /// In memory only: the poll rotates through every pending row so a block
+    /// of jobs that never leave approval cannot starve one that finished
+    /// behind them. A restart beginning again at the front is harmless,
+    /// because every row is still reached within one full rotation.
+    slack_notification_cursor: usize,
 }
 
 impl TicketGateRegistry {
@@ -3656,6 +3675,7 @@ impl TicketGateRegistry {
             slack_jobs_path: Some(slack_jobs_path),
             slack_notifications,
             slack_notifications_path: Some(slack_notifications_path),
+            slack_notification_cursor: 0,
         })
     }
 
@@ -3786,12 +3806,47 @@ impl TicketGateRegistry {
             .collect()
     }
 
-    pub(crate) fn pending_slack_notifications(&self, limit: usize) -> Vec<SlackTicketNotification> {
-        self.slack_notifications
+    /// Every durable thread-to-job binding, oldest first.
+    pub(crate) fn slack_job_bindings(&self) -> Vec<SlackTicketJobBinding> {
+        self.slack_jobs.clone()
+    }
+
+    /// The next bounded window of pending notifications.
+    ///
+    /// The window rotates: each call starts after the last row the previous
+    /// window returned and wraps at the end, so every pending row is polled
+    /// within `ceil(pending / limit)` calls however many rows ahead of it never
+    /// leave approval. Returning the first `limit` rows in file order instead
+    /// let a block of never-approved jobs hide a finished one indefinitely.
+    pub(crate) fn pending_slack_notifications(
+        &mut self,
+        limit: usize,
+    ) -> Vec<SlackTicketNotification> {
+        let pending: Vec<usize> = self
+            .slack_notifications
             .iter()
-            .filter(|notification| notification.state == SlackTicketNotificationState::Pending)
-            .take(limit)
-            .cloned()
+            .enumerate()
+            .filter(|(_, notification)| notification.state == SlackTicketNotificationState::Pending)
+            .map(|(index, _)| index)
+            .collect();
+        if pending.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let start = pending
+            .iter()
+            .position(|index| *index >= self.slack_notification_cursor)
+            .unwrap_or(0);
+        let window: Vec<usize> = pending
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(limit.min(pending.len()))
+            .copied()
+            .collect();
+        self.slack_notification_cursor = window.last().map_or(0, |last| last + 1);
+        window
+            .into_iter()
+            .map(|index| self.slack_notifications[index].clone())
             .collect()
     }
 
@@ -3800,25 +3855,40 @@ impl TicketGateRegistry {
     /// The durable state moves to `ambiguous` first. Only an explicit Slack
     /// rejection moves it back to pending; a transport error remains
     /// ambiguous because Slack may already have accepted the message.
-    pub(crate) fn claim_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+    ///
+    /// Every transition names the row by its whole key — team, channel,
+    /// thread and job — because one job can be bound to more than one thread
+    /// when Manage deduplicates a ticket posted twice. Keying by job alone
+    /// moved the first such row every time and left the others pending
+    /// forever.
+    pub(crate) fn claim_slack_notification(
+        &mut self,
+        notification: &SlackTicketNotification,
+    ) -> Result<bool, ()> {
         self.transition_slack_notification(
-            job_id,
+            notification,
             SlackTicketNotificationState::Pending,
             SlackTicketNotificationState::Ambiguous,
         )
     }
 
-    pub(crate) fn retry_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+    pub(crate) fn retry_slack_notification(
+        &mut self,
+        notification: &SlackTicketNotification,
+    ) -> Result<bool, ()> {
         self.transition_slack_notification(
-            job_id,
+            notification,
             SlackTicketNotificationState::Ambiguous,
             SlackTicketNotificationState::Pending,
         )
     }
 
-    pub(crate) fn complete_slack_notification(&mut self, job_id: &str) -> Result<bool, ()> {
+    pub(crate) fn complete_slack_notification(
+        &mut self,
+        notification: &SlackTicketNotification,
+    ) -> Result<bool, ()> {
         self.transition_slack_notification(
-            job_id,
+            notification,
             SlackTicketNotificationState::Ambiguous,
             SlackTicketNotificationState::Delivered,
         )
@@ -3826,15 +3896,17 @@ impl TicketGateRegistry {
 
     fn transition_slack_notification(
         &mut self,
-        job_id: &str,
+        key: &SlackTicketNotification,
         expected: SlackTicketNotificationState,
         next: SlackTicketNotificationState,
     ) -> Result<bool, ()> {
         let mut notifications = self.slack_notifications.clone();
-        let Some(notification) = notifications
-            .iter_mut()
-            .find(|notification| notification.job_id == job_id)
-        else {
+        let Some(notification) = notifications.iter_mut().find(|notification| {
+            notification.team_id == key.team_id
+                && notification.channel == key.channel
+                && notification.thread_ts == key.thread_ts
+                && notification.job_id == key.job_id
+        }) else {
             return Ok(false);
         };
         if notification.state != expected {
@@ -18875,24 +18947,98 @@ mod cross_transport_gate_tests {
             bindings[0].issue_url,
             "https://github.com/example/project/issues/42"
         );
+        let mut reopened = reopened;
         let pending = reopened.pending_slack_notifications(8);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].requester_user, "U0REQUEST01");
-        let mut reopened = reopened;
         assert!(
             reopened
-                .claim_slack_notification("job-running-123")
+                .claim_slack_notification(&pending[0])
                 .expect("notification claims")
         );
         assert!(
             reopened
-                .complete_slack_notification("job-running-123")
+                .complete_slack_notification(&pending[0])
                 .expect("notification completes")
         );
-        let reopened =
+        let mut reopened =
             TicketGateRegistry::open(directory.path().join("ticket-confirmations.v1.json"))
                 .expect("registry reopens after notification delivery");
         assert!(reopened.pending_slack_notifications(8).is_empty());
+    }
+
+    fn private_registry() -> (tempfile::TempDir, TicketGateRegistry) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let registry =
+            TicketGateRegistry::open(directory.path().join("ticket-confirmations.v1.json"))
+                .expect("registry opens");
+        (directory, registry)
+    }
+
+    #[test]
+    fn pending_notifications_rotate_so_a_finished_job_behind_a_blocked_block_is_polled() {
+        let (_directory, mut registry) = private_registry();
+        for index in 0..20 {
+            registry
+                .register_slack_job(
+                    "T0RESERVED",
+                    "C0RESERVED01",
+                    &format!("1723542000.{index:06}"),
+                    "U0REQUEST01",
+                    &format!("job-{index:02}"),
+                    "https://github.com/example/project/issues/42",
+                )
+                .expect("binding persists");
+        }
+        // Eight rows per poll, twenty pending: the last row is reached on the
+        // third poll, and every row has been offered after three.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            for row in registry.pending_slack_notifications(8) {
+                seen.insert(row.job_id);
+            }
+        }
+        assert_eq!(seen.len(), 20, "every pending row is eventually polled");
+        // The window keeps rotating rather than restarting at the front.
+        let first = registry.pending_slack_notifications(8);
+        let second = registry.pending_slack_notifications(8);
+        assert_ne!(first[0].job_id, second[0].job_id);
+    }
+
+    #[test]
+    fn a_job_bound_to_two_threads_delivers_each_thread_once() {
+        let (_directory, mut registry) = private_registry();
+        for thread in ["1723542000.000100", "1723542999.000200"] {
+            registry
+                .register_slack_job(
+                    "T0RESERVED",
+                    "C0RESERVED01",
+                    thread,
+                    "U0REQUEST01",
+                    "job-shared-123",
+                    "https://github.com/example/project/issues/42",
+                )
+                .expect("binding persists");
+        }
+        let pending = registry.pending_slack_notifications(8);
+        assert_eq!(pending.len(), 2);
+        for row in &pending {
+            assert!(registry.claim_slack_notification(row).expect("claims"));
+            assert!(
+                registry
+                    .complete_slack_notification(row)
+                    .expect("completes")
+            );
+        }
+        assert!(registry.pending_slack_notifications(8).is_empty());
+        // A row already delivered is not claimed again.
+        assert!(
+            !registry
+                .claim_slack_notification(&pending[0])
+                .expect("read")
+        );
     }
 }
 

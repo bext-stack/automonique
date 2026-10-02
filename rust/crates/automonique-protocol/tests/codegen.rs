@@ -2806,7 +2806,25 @@ mod command_surface {
                 IntakePause::new("ops", "why").expect("a pause"),
             ),
             AdminRequest::resume_intake(id.clone(), IntakeResume::new("ops").expect("a resume")),
-            AdminRequest::new(id, AdminCommand::HostFeatures),
+            AdminRequest::new(id.clone(), AdminCommand::HostFeatures),
+            AdminRequest::ticket_claim(
+                id.clone(),
+                automonique_protocol::admin::TicketClaim::new(
+                    "https://github.com/example/project/issues/42",
+                    "claude:session-1",
+                )
+                .expect("a claim"),
+                false,
+            ),
+            AdminRequest::ticket_claim(
+                id,
+                automonique_protocol::admin::TicketClaim::new(
+                    "https://github.com/example/project/issues/42",
+                    "claude:session-1",
+                )
+                .expect("a release"),
+                true,
+            ),
         ];
         // Every variant of the command enum is represented above. The match is
         // the point: a command added to `AdminCommand` fails to compile here.
@@ -2828,6 +2846,8 @@ mod command_surface {
             AdminCommand::ResumeIntake,
             AdminCommand::Shutdown,
             AdminCommand::HostFeatures,
+            AdminCommand::TicketClaim,
+            AdminCommand::TicketRelease,
         ] {
             match command {
                 AdminCommand::Status
@@ -2845,7 +2865,9 @@ mod command_surface {
                 | AdminCommand::PauseIntake
                 | AdminCommand::ResumeIntake
                 | AdminCommand::Shutdown
-                | AdminCommand::HostFeatures => {}
+                | AdminCommand::HostFeatures
+                | AdminCommand::TicketClaim
+                | AdminCommand::TicketRelease => {}
             }
             declared.insert(format!("{command:?}"));
         }
@@ -3039,6 +3061,18 @@ mod command_surface {
                     .expect("a feature"),
                 ],
             },
+            AdminResponse::TicketClaimed {
+                request_id: id.clone(),
+                posts_found: 1,
+                reacted: 1,
+                conflicts: vec![
+                    automonique_protocol::admin::TicketClaimConflict::new(
+                        "monique-job:job-1",
+                        "running",
+                    )
+                    .expect("a conflict"),
+                ],
+            },
             AdminResponse::ShutdownAccepted { request_id: id },
         ];
         // The match is the point: a variant added to `AdminResponse` fails to
@@ -3063,6 +3097,7 @@ mod command_surface {
                 | AdminResponse::IntakeResumed { .. }
                 | AdminResponse::Refused { .. }
                 | AdminResponse::HostFeatures { .. }
+                | AdminResponse::TicketClaimed { .. }
                 | AdminResponse::ShutdownAccepted { .. } => {}
             }
         }

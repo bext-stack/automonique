@@ -22,7 +22,7 @@ use std::time::Duration;
 use automonique_policy::peer::{PeerCredential, PeerPolicy};
 use automonique_protocol::admin::{
     AdminCommand, AdminRequest, AdminResponse, MAX_ADMIN_CANONICAL_BYTES, OutboxReconciliation,
-    ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission,
+    ReconciliationFailure, SubmittedRunSpec, SyntheticSubmission, TicketClaim,
 };
 use automonique_protocol::approval_api::{ApprovalRequest, ApprovalResponse};
 use automonique_protocol::automation_api::{AutomationRequest, AutomationResponse};
@@ -36,6 +36,11 @@ use nix::unistd::geteuid;
 const MAX_ADMIN_PAYLOAD_BYTES: usize = MAX_ADMIN_CANONICAL_BYTES;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// A ticket claim is answered after the daemon's reaction worker has looked
+/// for the ticket's Slack posts (and, on release, checked GitHub). The daemon
+/// gives up at 20 s and says so; this waits a little longer than that so the
+/// typed answer, not a socket timeout, is what the caller sees.
+const TICKET_CLAIM_TIMEOUT: Duration = Duration::from_secs(25);
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -53,6 +58,7 @@ pub(crate) enum Operation {
     InspectOutbox(u64),
     ReconcileOutbox(OutboxReconciliation),
     Shutdown,
+    TicketClaim { claim: TicketClaim, release: bool },
 }
 
 #[derive(Debug)]
@@ -94,6 +100,8 @@ pub(crate) fn request(
         Operation::InspectOutbox(_) => "outbox-inspect",
         Operation::ReconcileOutbox(_) => "outbox-reconcile",
         Operation::Shutdown => "shutdown",
+        Operation::TicketClaim { release: false, .. } => "ticket-claim",
+        Operation::TicketClaim { release: true, .. } => "ticket-release",
     };
     let request_id = correlation(operation_name)?;
     let request = match operation {
@@ -124,19 +132,19 @@ pub(crate) fn request(
         Operation::ReloadStatus(reload_id) => AdminRequest::reload_status(request_id, reload_id)
             .map_err(|error| ClientError::Protocol(error.category()))?,
         Operation::Shutdown => AdminRequest::new(request_id, AdminCommand::Shutdown),
+        Operation::TicketClaim { claim, release } => {
+            AdminRequest::ticket_claim(request_id, claim, release)
+        }
     };
     let request_id = request.request_id().as_str().to_owned();
     let payload = request
         .to_message()
         .map_err(|error| ClientError::Protocol(error.category()))?
         .to_canonical_bytes();
-    let timeout = if matches!(
-        request.command(),
-        AdminCommand::Reload | AdminCommand::Rollback
-    ) {
-        RELOAD_TIMEOUT
-    } else {
-        IO_TIMEOUT
+    let timeout = match request.command() {
+        AdminCommand::Reload | AdminCommand::Rollback => RELOAD_TIMEOUT,
+        AdminCommand::TicketClaim | AdminCommand::TicketRelease => TICKET_CLAIM_TIMEOUT,
+        _ => IO_TIMEOUT,
     };
     let payload = exchange_with_timeout(runtime, &payload, timeout)?;
     let response = AdminResponse::from_canonical_bytes(&payload)

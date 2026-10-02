@@ -31,6 +31,16 @@
 //! both be present or both be absent, so a half-configured approval surface
 //! cannot silently start.
 //!
+//! Two optional repeatable keys are admitted in both schema versions:
+//!
+//! - `auto_confirm=U…` names a Slack user whose ticket posts in a configured
+//!   channel are confirmed through the ordinary confirm path, so the worker
+//!   starts without an approval card. Off unless listed; never applied while a
+//!   Claude Code session holds the ticket.
+//! - `team_github_login=<login>` names a GitHub login whose latest comment on
+//!   an issue can mark it delivered (see
+//!   [`crate::ticket_reactions::delivery_finished`]).
+//!
 //! # Why an operator types a name and never an id
 //!
 //! [`ChannelId`] admits `C…`, `G…` and `D…` — every conversation the token can
@@ -153,6 +163,10 @@ pub const MAX_CONFIGURED_CHANNELS: usize = 32;
 pub const MAX_CONFIGURED_ADMINS: usize = 32;
 /// Most Slack identities admitted to read-only Monique conversations.
 pub const MAX_CONFIGURED_MEMBERS: usize = 256;
+/// Most Slack identities whose ticket posts are confirmed automatically.
+pub const MAX_AUTO_CONFIRM_USERS: usize = 32;
+/// Most GitHub logins counted as the delivery team.
+pub const MAX_TEAM_GITHUB_LOGINS: usize = 32;
 /// Most conversational tool approvals retained by one Slack worker.
 const MAX_PENDING_SLACK_TOOL_APPROVALS: usize = 64;
 /// Maximum channel-history pages one in-thread ticket audit may inspect.
@@ -399,6 +413,12 @@ pub enum SlackConfigError {
     MemberInvalid,
     /// A v2 feature is unknown or repeated.
     FeatureInvalid,
+    /// An `auto_confirm` entry is invalid, duplicated, or over capacity.
+    AutoConfirmInvalid,
+    /// A `team_github_login` entry is invalid, duplicated, or over capacity.
+    TeamLoginInvalid,
+    /// The ticket work ledger beside the ticket registries would not open.
+    TicketLedgerUnavailable,
     /// File exchange was enabled without a tenant artifact policy.
     ArtifactPolicyRequired,
     /// Socket Mode ticket intake was enabled without Manage's typed ticket
@@ -443,6 +463,15 @@ impl fmt::Display for SlackConfigError {
                 formatter.write_str("slack member allowlist configuration is invalid")
             }
             Self::FeatureInvalid => formatter.write_str("slack feature configuration is invalid"),
+            Self::AutoConfirmInvalid => {
+                formatter.write_str("slack auto-confirm configuration is invalid")
+            }
+            Self::TeamLoginInvalid => {
+                formatter.write_str("slack team GitHub login configuration is invalid")
+            }
+            Self::TicketLedgerUnavailable => {
+                formatter.write_str("slack ticket work ledger is unavailable")
+            }
             Self::ArtifactPolicyRequired => {
                 formatter.write_str("slack files require an explicit tenant artifact policy")
             }
@@ -478,6 +507,9 @@ impl SlackConfigError {
             Self::AdminInvalid => "slack_config_admin",
             Self::MemberInvalid => "slack_config_member",
             Self::FeatureInvalid => "slack_config_feature",
+            Self::AutoConfirmInvalid => "slack_config_auto_confirm",
+            Self::TeamLoginInvalid => "slack_config_team_github_login",
+            Self::TicketLedgerUnavailable => "slack_ticket_ledger_unavailable",
             Self::ArtifactPolicyRequired => "slack_artifact_policy_required",
             Self::TicketActionsUnavailable => "slack_ticket_actions_unavailable",
             Self::GitHubActionsUnavailable => "slack_github_actions_unavailable",
@@ -542,6 +574,8 @@ pub struct SlackConfig {
     members: Vec<UserId>,
     features: Vec<SlackFeature>,
     interactive_decisions: bool,
+    auto_confirm: Vec<UserId>,
+    team_github_logins: Vec<String>,
 }
 
 impl fmt::Debug for SlackConfig {
@@ -558,8 +592,23 @@ impl fmt::Debug for SlackConfig {
             .field("member_count", &self.members.len())
             .field("features", &self.features)
             .field("interactive_decisions", &self.interactive_decisions)
+            .field("auto_confirm_count", &self.auto_confirm.len())
+            .field("team_github_login_count", &self.team_github_logins.len())
             .finish()
     }
+}
+
+/// Whether a value is a GitHub login: 1–39 ASCII letters, digits and inner
+/// single hyphens.
+fn is_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 impl SlackConfig {
@@ -621,6 +670,8 @@ impl SlackConfig {
         let mut admins: Vec<UserId> = Vec::new();
         let mut members: Vec<UserId> = Vec::new();
         let mut features: Vec<SlackFeature> = Vec::new();
+        let mut auto_confirm: Vec<UserId> = Vec::new();
+        let mut team_github_logins: Vec<String> = Vec::new();
         let mut terminated = false;
         for line in lines {
             if terminated {
@@ -656,6 +707,16 @@ impl SlackConfig {
                 }
                 "feature" if v2 => features
                     .push(SlackFeature::parse(value).ok_or(SlackConfigError::FeatureInvalid)?),
+                // Repeatable, and admitted in v1 as well: an old file gains
+                // the behavior by adding lines, never by changing its schema.
+                "auto_confirm" => auto_confirm
+                    .push(UserId::new(value).map_err(|_| SlackConfigError::AutoConfirmInvalid)?),
+                "team_github_login" => {
+                    if !is_github_login(value) {
+                        return Err(SlackConfigError::TeamLoginInvalid);
+                    }
+                    team_github_logins.push(value.to_owned());
+                }
                 _ => return Err(SlackConfigError::Malformed),
             }
         }
@@ -713,6 +774,23 @@ impl SlackConfig {
         if features.contains(&SlackFeature::Files) {
             return Err(SlackConfigError::ArtifactPolicyRequired);
         }
+        if auto_confirm.len() > MAX_AUTO_CONFIRM_USERS
+            || auto_confirm
+                .iter()
+                .enumerate()
+                .any(|(index, user)| auto_confirm[..index].contains(user))
+        {
+            return Err(SlackConfigError::AutoConfirmInvalid);
+        }
+        if team_github_logins.len() > MAX_TEAM_GITHUB_LOGINS
+            || team_github_logins.iter().enumerate().any(|(index, login)| {
+                team_github_logins[..index]
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(login))
+            })
+        {
+            return Err(SlackConfigError::TeamLoginInvalid);
+        }
         // V1 already requires a Socket Mode app token and an explicit
         // administrator list. Those are the same authority gates the V2
         // interactive flag represents, so legacy live configurations can
@@ -726,6 +804,8 @@ impl SlackConfig {
             members,
             features,
             interactive_decisions,
+            auto_confirm,
+            team_github_logins,
         }))
     }
 
@@ -1000,6 +1080,9 @@ struct SlackTicketEvent {
     user: UserId,
     text: String,
     parent: MessageTs,
+    /// The message's own timestamp — what a reaction on it names. Equal to
+    /// `parent` for a top-level post, and the reply's `ts` inside a thread.
+    ts: MessageTs,
     source_key: String,
     app_mention: bool,
     in_thread: bool,
@@ -1060,6 +1143,7 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
     let thread_ts = event.get("thread_ts").and_then(serde_json::Value::as_str);
     let parent = thread_ts.unwrap_or(ts);
     let parent = MessageTs::new(parent).ok()?;
+    let ts = MessageTs::new(ts).ok()?;
     if !team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
         || !event_id
             .bytes()
@@ -1084,6 +1168,7 @@ fn slack_ticket_event(text: &str) -> Option<SlackTicketEvent> {
         user,
         text: text.to_owned(),
         parent,
+        ts,
         source_key,
         app_mention: event_type == "app_mention",
         in_thread: thread_ts.is_some(),
@@ -2389,6 +2474,9 @@ struct SlackTicketRouter<P> {
     /// The read-only conversational surface used only after action-shaped
     /// Slack routes have been excluded.
     question_answerer: Option<Box<dyn SlackQuestionAnswerer>>,
+    /// What intake records into the ticket work ledger, and the auto-confirm
+    /// allowlist. Reactions themselves are issued by the reactor thread.
+    ticket_work: crate::ticket_reactions::TicketWorkRecorder,
 }
 
 enum SlackQuestionReply {
@@ -3355,7 +3443,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     fn poll_ticket_notifications(&mut self, stop: &AtomicBool) {
         let notifications = self.gates.lock().map_or_else(
             |_| Vec::new(),
-            |gates| gates.pending_slack_notifications(MAX_SLACK_TICKET_STATUS_POLLS),
+            |mut gates| gates.pending_slack_notifications(MAX_SLACK_TICKET_STATUS_POLLS),
         );
         for notification in notifications {
             if stop.load(Ordering::Acquire) {
@@ -3364,6 +3452,10 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             let Ok(status) = self.manage.ticket_status(&notification.job_id) else {
                 continue;
             };
+            // The status read is shared with the reaction ledger, so a job
+            // this poll sees finish is reacted to without a second read.
+            self.ticket_work
+                .observe_job_status(&notification.job_id, status.job_status);
             // A status read already in flight is allowed to settle, but a
             // stop observed after it starts no new Slack effect. The durable
             // notification remains unclaimed for the successor to inspect.
@@ -3377,7 +3469,7 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                 .gates
                 .lock()
                 .ok()
-                .and_then(|mut gates| gates.claim_slack_notification(&notification.job_id).ok())
+                .and_then(|mut gates| gates.claim_slack_notification(&notification).ok())
                 .unwrap_or(false);
             if !claimed {
                 continue;
@@ -3396,16 +3488,114 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                     let _ = self
                         .gates
                         .lock()
-                        .map(|mut gates| gates.complete_slack_notification(&notification.job_id));
+                        .map(|mut gates| gates.complete_slack_notification(&notification));
                 }
                 SlackEffectOutcome::Rejected => {
                     let _ = self
                         .gates
                         .lock()
-                        .map(|mut gates| gates.retry_slack_notification(&notification.job_id));
+                        .map(|mut gates| gates.retry_slack_notification(&notification));
                 }
                 SlackEffectOutcome::Ambiguous => {}
             }
+        }
+    }
+
+    /// Retain the thread binding (and its terminal notification) for one job.
+    fn track_slack_job(
+        &mut self,
+        event: &SlackTicketEvent,
+        issue_url: &str,
+        job_id: &str,
+        thread_context: &str,
+    ) -> bool {
+        self.gates.lock().ok().is_some_and(|mut gates| {
+            let tracked = gates
+                .register_slack_job(
+                    &event.team_id,
+                    event.channel.as_str(),
+                    event.parent.as_str(),
+                    event.user.as_str(),
+                    job_id,
+                    issue_url,
+                )
+                .is_ok();
+            // The thread that asked is the one context the approved job
+            // cannot get from GitHub. Best effort: the gate opens whether or
+            // not this sidecar wrote.
+            if tracked && let Some(state_dir) = gates.state_dir() {
+                let _ = crate::work_brief::record_ticket_thread_context(
+                    &state_dir,
+                    job_id,
+                    issue_url,
+                    thread_context,
+                );
+            }
+            tracked
+        })
+    }
+
+    fn post_ticket_approval(
+        &mut self,
+        event: &SlackTicketEvent,
+        receipt: &automonique_support_connector::TicketDispatchReceipt,
+    ) {
+        if self.interactive_decisions {
+            let _ = self.poster.post_approval_card(
+                &event.channel,
+                &event.parent,
+                receipt,
+                self.manage_url.as_ref(),
+            );
+        } else {
+            let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+            let _ = self.poster.post_thread(
+                &event.channel,
+                &event.parent,
+                &format!(
+                    "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
+                    receipt.issue_title, receipt.issue_url
+                ),
+            );
+        }
+    }
+
+    /// Release a freshly gated job for a poster on the auto-confirm list.
+    ///
+    /// The same confirm path an administrator's `confirm` takes. A
+    /// confirmation Manage does not accept falls back to the ordinary
+    /// approval card, so an auto-confirm failure never strands a ticket.
+    fn auto_confirm_ticket(
+        &mut self,
+        event: &SlackTicketEvent,
+        issue_url: &str,
+        receipt: &automonique_support_connector::TicketDispatchReceipt,
+    ) {
+        match crate::telegram_bridge::confirm_bound_ticket(
+            self.manage.as_mut(),
+            &receipt.job_id,
+            issue_url,
+            &receipt.source_key,
+        ) {
+            Ok(confirmed) if confirmed.approved && confirmed.job_id == receipt.job_id => {
+                let _ = self
+                    .gates
+                    .lock()
+                    .map(|mut gates| gates.resolve(&receipt.job_id));
+                self.ticket_work
+                    .record_job(issue_url, &confirmed.job_id, confirmed.job_status);
+                let short = confirmed.job_id.get(..12).unwrap_or(&confirmed.job_id);
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    &format!(
+                        "✅ Auto-confirmed for <@{}>. Monique job `{short}` is {}.",
+                        event.user,
+                        confirmed.job_status.as_str()
+                    ),
+                );
+            }
+            Ok(_) | Err(_) => self.post_ticket_approval(event, receipt),
         }
     }
 
@@ -3415,43 +3605,49 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
         issue_url: String,
         thread_context: &str,
     ) {
+        // Every message that posts a ticket is recorded, whatever happens
+        // next: it is where the ticket's status reactions will appear. A
+        // short follow-up ("do it") that took its target from the thread did
+        // not post the ticket; the thread's parent did.
+        let posted = crate::ticket_reactions::TicketKey::parse_url(&issue_url)
+            .is_some_and(|(key, _)| key.mentioned_in(&event.text));
+        let post_ts = if posted { &event.ts } else { &event.parent };
+        self.ticket_work
+            .record_post(&issue_url, event.channel.as_str(), post_ts.as_str());
         if !self.features.contains(&SlackFeature::Approvals) {
             return;
         }
+        // A Claude Code session that claimed the ticket owns it: a second
+        // worker on the same ticket would only produce conflicting changes.
+        if let Some(holder) = self.ticket_work.claude_holder(&issue_url) {
+            let session = holder
+                .strip_prefix(crate::ticket_reactions::CLAUDE_HOLDER_PREFIX)
+                .unwrap_or(&holder);
+            let _ = self.poster.post_thread(
+                &event.channel,
+                &event.parent,
+                &format!(
+                    "👀 This ticket is already being worked on in a Claude Code session (`{session}`), so Monique did not open a new job. Its status will show on this message."
+                ),
+            );
+            return;
+        }
+        let auto_confirm = self.ticket_work.auto_confirms(&event.user);
         match self.manage.dispatch_ticket(&issue_url, &event.source_key) {
             Ok(receipt) if !receipt.approved => {
-                let (registered, tracked) =
-                    self.gates.lock().ok().map_or((false, false), |mut gates| {
-                        let registered = gates
-                            .register(crate::telegram_bridge::PendingTicketGate {
-                                job_id: receipt.job_id.clone(),
-                                issue_url: issue_url.clone(),
-                                source_key: receipt.source_key.clone(),
-                            })
-                            .is_ok();
-                        let tracked = gates
-                            .register_slack_job(
-                                &event.team_id,
-                                event.channel.as_str(),
-                                event.parent.as_str(),
-                                event.user.as_str(),
-                                &receipt.job_id,
-                                &issue_url,
-                            )
-                            .is_ok();
-                        // The thread that asked is the one context the
-                        // approved job cannot get from GitHub. Best effort:
-                        // the gate opens whether or not this sidecar wrote.
-                        if tracked && let Some(state_dir) = gates.state_dir() {
-                            let _ = crate::work_brief::record_ticket_thread_context(
-                                &state_dir,
-                                &receipt.job_id,
-                                &issue_url,
-                                thread_context,
-                            );
-                        }
-                        (registered, tracked)
-                    });
+                let registered = self.gates.lock().ok().is_some_and(|mut gates| {
+                    gates
+                        .register(crate::telegram_bridge::PendingTicketGate {
+                            job_id: receipt.job_id.clone(),
+                            issue_url: issue_url.clone(),
+                            source_key: receipt.source_key.clone(),
+                        })
+                        .is_ok()
+                });
+                let tracked =
+                    self.track_slack_job(event, &issue_url, &receipt.job_id, thread_context);
+                self.ticket_work
+                    .record_job(&issue_url, &receipt.job_id, receipt.job_status);
                 if !registered {
                     let _ = self.poster.post_thread(
                         &event.channel,
@@ -3467,24 +3663,28 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
                         "The ticket is pending in Manage, but Monique could not retain this thread's progress binding. Use `/monique status <job-id>` for status after confirmation.",
                     );
                 }
-                if self.interactive_decisions {
-                    let _ = self.poster.post_approval_card(
-                        &event.channel,
-                        &event.parent,
-                        &receipt,
-                        self.manage_url.as_ref(),
-                    );
+                if auto_confirm {
+                    self.auto_confirm_ticket(event, &issue_url, &receipt);
                 } else {
-                    let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
-                    let _ = self.poster.post_thread(
-                        &event.channel,
-                        &event.parent,
-                        &format!(
-                            "🔐 Confirmation required for `{}`\n{}\nMonique job `{short}` is pending approval. A configured Slack admin can reply `confirm {short}`; the same request can also be confirmed in Telegram or Manage. No work starts before confirmation.",
-                            receipt.issue_title, receipt.issue_url
-                        ),
-                    );
+                    self.post_ticket_approval(event, &receipt);
                 }
+            }
+            // An auto-confirm poster asked for work to start without a card,
+            // so a job Manage already holds approved is the expected answer
+            // (a re-post of a ticket in progress), not a broken gate.
+            Ok(receipt) if auto_confirm => {
+                self.track_slack_job(event, &issue_url, &receipt.job_id, thread_context);
+                self.ticket_work
+                    .record_job(&issue_url, &receipt.job_id, receipt.job_status);
+                let short = receipt.job_id.get(..12).unwrap_or(&receipt.job_id);
+                let _ = self.poster.post_thread(
+                    &event.channel,
+                    &event.parent,
+                    &format!(
+                        "Monique job `{short}` for this ticket is already approved and {}.",
+                        receipt.job_status.as_str()
+                    ),
+                );
             }
             Ok(_) => {
                 let _ = self.poster.post_thread(
@@ -4837,6 +5037,7 @@ pub(crate) fn replay_slack_trace(
     };
     let recorder = crate::parity_trace::replay_recorder(&header.scope);
     let mut router = SlackTicketRouter {
+        ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
         poster: crate::shadow::ShadowPoster::new(recorder.clone()),
         manage: Box::new(crate::shadow::ShadowTicketSurface::new(recorder.clone())),
         manage_url: None,
@@ -4876,6 +5077,8 @@ pub(crate) fn replay_slack_trace(
                 user: UserId::new(&event.user).map_err(|_| TraceError::Field("event.user"))?,
                 text: event.text.clone(),
                 parent: MessageTs::new(&event.thread_ts)
+                    .map_err(|_| TraceError::Field("event.thread_ts"))?,
+                ts: MessageTs::new(&event.thread_ts)
                     .map_err(|_| TraceError::Field("event.thread_ts"))?,
                 source_key,
                 app_mention: event.app_mention,
@@ -4981,6 +5184,8 @@ pub(crate) struct SlackTicketWorker {
     /// records and never acts, so its presence cannot change what this worker
     /// does with an event.
     legacy: Option<LegacyObservation>,
+    /// The ticket status reactor, moved onto its own thread at start.
+    reactor: Option<crate::ticket_reactions::TicketReactor>,
 }
 
 /// The configured reference identity and the recorder that files its messages.
@@ -5075,6 +5280,9 @@ pub(crate) enum SlackTicketHost {
         /// the approvals capability present — so the two cannot disagree about
         /// whether a button would be honoured.
         approvals_enabled: bool,
+        /// Where local Claude Code sessions' claims and releases are queued
+        /// for the reactor.
+        claims: crate::ticket_reactions::TicketClaimHandle,
     },
 }
 
@@ -5106,10 +5314,38 @@ impl SlackTicketHost {
             members,
             features,
             interactive_decisions,
+            auto_confirm,
+            team_github_logins,
         } = config;
         let Some(app_token) = app_token else {
             return Ok(Self::Disabled);
         };
+        // The ledger lives beside the ticket registries, and is seeded from
+        // their thread bindings so tickets requested before it existed still
+        // get their status reactions.
+        let mut ledger = crate::ticket_reactions::TicketWorkLedger::open(
+            state_dir.join(crate::ticket_reactions::TICKET_WORK_FILE),
+        )
+        .map_err(|()| SlackConfigError::TicketLedgerUnavailable)?;
+        let bindings = gates
+            .lock()
+            .map_err(|_| SlackConfigError::TicketLedgerUnavailable)?
+            .slack_job_bindings();
+        ledger
+            .backfill(
+                bindings.iter().map(|binding| {
+                    (
+                        binding.channel(),
+                        binding.thread_ts(),
+                        binding.job_id.as_str(),
+                        binding.issue_url.as_str(),
+                    )
+                }),
+                crate::unix_millis().unwrap_or(0),
+            )
+            .map_err(|()| SlackConfigError::TicketLedgerUnavailable)?;
+        let ledger = Arc::new(Mutex::new(ledger));
+        let (claims, claim_requests) = crate::ticket_reactions::claim_queue();
         let approvals_enabled =
             interactive_decisions && features.contains(&SlackFeature::Approvals);
         let generation_canary = ChannelName::new(GENERATION_CANARY_CHANNEL)
@@ -5197,8 +5433,39 @@ impl SlackTicketHost {
             None
         };
         let legacy = legacy_observation(state_dir)?;
+        // The reactor's own Manage and GitHub handles: it runs on its own
+        // thread, and borrowing the router's would put a lock around every
+        // intake call.
+        let reactor_jobs = crate::ticket_intake::FleetConfig::load(state_dir)
+            .map_err(|_| SlackConfigError::TicketActionsUnavailable)?
+            .map(|config| {
+                Box::new(Box::new(config.into_action_client())
+                    as Box<dyn crate::telegram_bridge::TicketActionSurface + Send>)
+                    as Box<dyn crate::ticket_reactions::TicketJobReader>
+            });
+        let reactor_github = match crate::github::GitHubHost::load(state_dir)
+            .map_err(|_| SlackConfigError::GitHubActionsUnavailable)?
+        {
+            crate::github::GitHubHost::Configured(workspace) => {
+                Some(workspace as Box<dyn crate::ticket_reactions::TicketDeliveryReader>)
+            }
+            crate::github::GitHubHost::Disabled => None,
+        };
+        let reactor = crate::ticket_reactions::TicketReactor {
+            ledger: Arc::clone(&ledger),
+            slack: Box::new(Arc::clone(&client)),
+            jobs: reactor_jobs,
+            github: reactor_github,
+            team_logins: team_github_logins,
+            channels: channels.0.iter().map(|(_, id)| id.clone()).collect(),
+            requests: claim_requests,
+            last_job_poll_ms: 0,
+            last_verify_pass_ms: 0,
+            last_reaction_pass_ms: 0,
+        };
         Ok(Self::Configured {
             prepared: Some(Box::new(SlackTicketWorker {
+                reactor: Some(reactor),
                 legacy,
                 transport: Box::new(LiveSlackSocketTransport::new(app_token)),
                 memory: AgentMemoryStore::open(state_dir.join("agent-memory.sqlite3"))
@@ -5210,6 +5477,10 @@ impl SlackTicketHost {
                 generation_canary,
                 last_ticket_status_poll: None,
                 router: SlackTicketRouter {
+                    ticket_work: crate::ticket_reactions::TicketWorkRecorder::new(
+                        Arc::clone(&ledger),
+                        auto_confirm,
+                    ),
                     poster: LiveSlackTicketPoster::new(client),
                     manage: Box::new(manage),
                     manage_url,
@@ -5233,7 +5504,17 @@ impl SlackTicketHost {
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             approvals_enabled,
+            claims,
         })
+    }
+
+    /// Where a local session's ticket claim or release is queued, when Slack
+    /// ticket intake is configured on this daemon.
+    pub(crate) fn ticket_claims(&self) -> Option<crate::ticket_reactions::TicketClaimHandle> {
+        match self {
+            Self::Disabled => None,
+            Self::Configured { claims, .. } => Some(claims.clone()),
+        }
     }
 
     /// Attach the execution lane's live progress before Socket Mode starts.
@@ -5288,7 +5569,22 @@ impl SlackTicketHost {
         *worker = Some(
             std::thread::Builder::new()
                 .name(String::from("automonique-slack-tickets"))
-                .spawn(move || run_slack_ticket_worker(&mut prepared, &stop))
+                .spawn(move || {
+                    // The reactor shares this worker's stop flag and lifetime:
+                    // it starts with it and is joined before it returns, so
+                    // the one handle the drainer holds covers both threads.
+                    let reactions = prepared.reactor.take().and_then(|mut reactor| {
+                        let stop = Arc::clone(&stop);
+                        std::thread::Builder::new()
+                            .name(String::from("automonique-slack-reactions"))
+                            .spawn(move || reactor.run(&stop))
+                            .ok()
+                    });
+                    run_slack_ticket_worker(&mut prepared, &stop);
+                    if let Some(reactions) = reactions {
+                        let _ = reactions.join();
+                    }
+                })
                 .map_err(|_| SlackConfigError::TicketActionsUnavailable)?,
         );
         Ok(())
@@ -7279,6 +7575,8 @@ mod tests {
         status: Option<automonique_support_connector::TicketStatus>,
         canonical_source: Option<String>,
         stop_after_status: Option<Arc<AtomicBool>>,
+        /// Answer a dispatch with a job Manage already holds approved.
+        dispatch_approved: bool,
     }
 
     struct FakeQuestionAnswerer {
@@ -7524,7 +7822,7 @@ mod tests {
                 .lock()
                 .expect("opened")
                 .push((issue_url.to_owned(), source_key.to_owned()));
-            let mut receipt = ticket_receipt(false);
+            let mut receipt = ticket_receipt(self.dispatch_approved);
             receipt.source_key = self
                 .canonical_source
                 .clone()
@@ -7568,6 +7866,7 @@ mod tests {
             user: UserId::new(user).expect("user"),
             text: text.to_owned(),
             parent: MessageTs::new("1723542000.000100").expect("timestamp"),
+            ts: MessageTs::new("1723542000.000100").expect("timestamp"),
             source_key: format!("slack:T0RESERVED:event:{event_id}"),
             app_mention: false,
             in_thread: false,
@@ -7583,6 +7882,7 @@ mod tests {
         admins: Vec<&str>,
     ) -> SlackTicketRouter<FakeTicketPoster> {
         SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster: FakeTicketPoster::default(),
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -7646,6 +7946,7 @@ mod tests {
         let messages = Arc::clone(&poster.messages);
         let decisions = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -7712,6 +8013,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let confirmed = Arc::clone(&manage.confirmed);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -7792,6 +8094,7 @@ mod tests {
             manage: Box<dyn crate::telegram_bridge::TicketActionSurface + Send>,
         ) -> SlackTicketRouter<P> {
             SlackTicketRouter {
+                ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
                 poster,
                 manage,
                 manage_url: None,
@@ -7996,6 +8299,7 @@ mod tests {
         let mut memory =
             AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
         let router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster: FakeTicketPoster::default(),
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -8121,6 +8425,7 @@ mod tests {
         let mut memory =
             AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
         let router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster: FakeTicketPoster::default(),
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -8207,6 +8512,7 @@ mod tests {
             })
             .expect("gate registered");
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -8389,8 +8695,10 @@ mod tests {
             SlackToken::new(SECRET.as_bytes().to_vec()).expect("fixture token"),
         ));
         SlackTicketWorker {
+            reactor: None,
             transport: Box::new(transport),
             router: SlackTicketRouter {
+                ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
                 poster: LiveSlackTicketPoster::new(client),
                 manage: Box::new(FakeManage::default()),
                 manage_url: None,
@@ -8455,6 +8763,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
             approvals_enabled: false,
+            claims: crate::ticket_reactions::claim_queue().0,
         };
         host.start().expect("worker starts");
 
@@ -8681,6 +8990,7 @@ mod tests {
         let messages = Arc::clone(&poster.messages);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -8750,6 +9060,7 @@ mod tests {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -8809,6 +9120,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let issue_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -8864,6 +9176,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let issue_reads = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -8921,6 +9234,7 @@ mod tests {
         };
         let status_reads = Arc::clone(&manage.status_reads);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -8989,6 +9303,7 @@ mod tests {
         };
         let status_reads = Arc::clone(&manage.status_reads);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -9084,6 +9399,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -9148,6 +9464,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -9220,6 +9537,7 @@ mod tests {
         let messages = Arc::clone(&poster.messages);
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -9294,6 +9612,7 @@ mod tests {
         let mut memory =
             AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("memory store");
         let router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster: FakeTicketPoster::default(),
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -9349,6 +9668,7 @@ mod tests {
         let poster = FakeTicketPoster::default();
         let messages = Arc::clone(&poster.messages);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(FakeManage::default()),
             manage_url: None,
@@ -9479,6 +9799,7 @@ mod tests {
         let opened = Arc::clone(&manage.opened);
         let reviews = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -9535,6 +9856,7 @@ mod tests {
         let manage = FakeManage::default();
         let opened = Arc::clone(&manage.opened);
         let mut router = SlackTicketRouter {
+            ticket_work: crate::ticket_reactions::TicketWorkRecorder::disabled(),
             poster,
             manage: Box::new(manage),
             manage_url: None,
@@ -9646,5 +9968,248 @@ mod tests {
         assert!(messages[0].contains("ticket_decisions_unavailable"));
         assert!(messages[0].contains("remains pending"));
         assert!(messages[0].contains("/monique approve job-fixture"));
+    }
+
+    const TICKET_URL: &str = "https://github.com/example/project/issues/42";
+
+    /// A router, the replies it posted, and the work ledger it recorded into.
+    type WorkRouter = (
+        SlackTicketRouter<FakeTicketPoster>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<crate::ticket_reactions::TicketWorkLedger>>,
+    );
+
+    /// A ticket-intake router over an in-memory work ledger. The poster is
+    /// not a member, so a bare URL goes straight to the intake gate.
+    fn work_router(manage: FakeManage, auto_confirm: Vec<&str>) -> WorkRouter {
+        let poster = FakeTicketPoster::default();
+        let messages = Arc::clone(&poster.messages);
+        let recorder = crate::ticket_reactions::TicketWorkRecorder::in_memory(
+            auto_confirm
+                .into_iter()
+                .map(|user| UserId::new(user).expect("user"))
+                .collect(),
+        );
+        let ledger = recorder.ledger().expect("ledger");
+        let router = SlackTicketRouter {
+            ticket_work: recorder,
+            poster,
+            manage: Box::new(manage),
+            manage_url: None,
+            memory_tenant: String::from("primary"),
+            channels: ChannelMap(vec![(
+                name("ops"),
+                ChannelId::new("C0RESERVED01").expect("channel"),
+            )]),
+            admins: vec![UserId::new("U0ADMIN001").expect("admin")],
+            members: Vec::new(),
+            features: vec![SlackFeature::Approvals],
+            interactive_decisions: false,
+            gates: Arc::new(std::sync::Mutex::new(
+                crate::telegram_bridge::TicketGateRegistry::default(),
+            )),
+            github_actions: None,
+            approvals: None,
+            approval_lane: None,
+            question_answerer: None,
+        };
+        (router, messages, ledger)
+    }
+
+    fn ticket_key() -> crate::ticket_reactions::TicketKey {
+        crate::ticket_reactions::TicketKey::parse_url(TICKET_URL)
+            .expect("ticket")
+            .0
+    }
+
+    #[test]
+    fn a_ticket_post_is_recorded_by_its_own_ts_and_its_job_is_followed() {
+        let (mut router, messages, ledger) = work_router(FakeManage::default(), Vec::new());
+        let mut event = ticket_event("U0CLIENT01", TICKET_URL, "EvPost");
+        event.ts = MessageTs::new("1723542055.000300").expect("ts");
+        router.handle_with_context(event, "");
+        let ledger = ledger.lock().expect("ledger");
+        let posts = ledger.posts(&ticket_key());
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].channel, "C0RESERVED01");
+        assert_eq!(
+            posts[0].ts, "1723542055.000300",
+            "the message, not its thread"
+        );
+        assert_eq!(
+            ledger.ticket_jobs(&ticket_key()),
+            vec![String::from("job-fixture-123456")]
+        );
+        // A job waiting for approval is not work under way: no 👀 is owed.
+        assert!(ledger.pending_reactions(None, 8).is_empty());
+        assert!(messages.lock().expect("messages")[0].contains("Confirmation required"));
+    }
+
+    #[test]
+    fn a_claude_claim_holds_intake_off_the_ticket() {
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let (mut router, messages, ledger) = work_router(manage, Vec::new());
+        let (key, kind) = crate::ticket_reactions::TicketKey::parse_url(TICKET_URL).expect("key");
+        ledger
+            .lock()
+            .expect("ledger")
+            .claim(
+                &key,
+                kind,
+                &crate::ticket_reactions::ClaimHolder::parse_claude("claude:session-1")
+                    .expect("holder"),
+                1,
+            )
+            .expect("claim");
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvPost"), "");
+        assert!(opened.lock().expect("opened").is_empty(), "no Monique job");
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("Claude Code session (`session-1`)"));
+        // The post is still recorded, and owes 👀 because the session works it.
+        let ledger = ledger.lock().expect("ledger");
+        assert_eq!(ledger.posts(&key).len(), 1);
+        assert_eq!(
+            ledger.pending_reactions(None, 8)[0].name,
+            automonique_slack_connector::ReactionName::Eyes
+        );
+    }
+
+    #[test]
+    fn an_auto_confirm_poster_is_released_without_an_approval_card() {
+        let manage = FakeManage::default();
+        let opened = Arc::clone(&manage.opened);
+        let confirmed = Arc::clone(&manage.confirmed);
+        let (mut router, messages, ledger) = work_router(manage, vec!["U0TRUSTED1"]);
+        router.handle_with_context(ticket_event("U0TRUSTED1", TICKET_URL, "EvAuto"), "");
+        assert_eq!(opened.lock().expect("opened").len(), 1);
+        assert_eq!(
+            confirmed.lock().expect("confirmed").as_slice(),
+            [(
+                String::from(TICKET_URL),
+                String::from("slack:T0RESERVED:event:EvAuto")
+            )]
+        );
+        let messages = messages.lock().expect("messages");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("✅ Auto-confirmed for <@U0TRUSTED1>."));
+        assert!(!messages[0].contains("Confirmation required"));
+        // The released job is no longer a pending gate.
+        assert!(
+            router
+                .gates
+                .lock()
+                .expect("gates")
+                .matching("job-fixture")
+                .is_empty()
+        );
+        assert_eq!(
+            ledger.lock().expect("ledger").conflicts(
+                &ticket_key(),
+                &crate::ticket_reactions::ClaimHolder::parse_claude("claude:x").expect("holder")
+            )[0]
+            .status,
+            "pending"
+        );
+
+        // A poster not on the list still gets the ordinary approval card.
+        let manage = FakeManage::default();
+        let confirmed = Arc::clone(&manage.confirmed);
+        let (mut router, messages, _) = work_router(manage, vec!["U0TRUSTED1"]);
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvCard"), "");
+        assert!(confirmed.lock().expect("confirmed").is_empty());
+        assert!(messages.lock().expect("messages")[0].contains("Confirmation required"));
+    }
+
+    #[test]
+    fn an_already_approved_receipt_is_accepted_only_for_an_auto_confirm_poster() {
+        let (mut router, messages, _) = work_router(
+            FakeManage {
+                dispatch_approved: true,
+                ..FakeManage::default()
+            },
+            vec!["U0TRUSTED1"],
+        );
+        router.handle_with_context(ticket_event("U0TRUSTED1", TICKET_URL, "EvAgain"), "");
+        let reply = messages.lock().expect("messages")[0].clone();
+        assert!(reply.contains("already approved and pending"), "{reply}");
+        assert!(!reply.contains("contract was violated"));
+
+        let (mut router, messages, _) = work_router(
+            FakeManage {
+                dispatch_approved: true,
+                ..FakeManage::default()
+            },
+            vec!["U0TRUSTED1"],
+        );
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvOther"), "");
+        assert!(messages.lock().expect("messages")[0].contains("contract was violated"));
+    }
+
+    #[test]
+    fn a_notification_poll_shares_its_status_read_with_the_work_ledger() {
+        let (mut router, _, ledger) = work_router(
+            FakeManage {
+                status: Some(done_ticket_status()),
+                ..FakeManage::default()
+            },
+            Vec::new(),
+        );
+        router.handle_with_context(ticket_event("U0CLIENT01", TICKET_URL, "EvPost"), "");
+        router.poll_ticket_notifications(&AtomicBool::new(false));
+        let pending = ledger.lock().expect("ledger").pending_reactions(None, 8);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].name,
+            automonique_slack_connector::ReactionName::WhiteCheckMark
+        );
+    }
+
+    #[test]
+    fn auto_confirm_and_team_logins_are_optional_repeatable_v1_keys() {
+        let mut lines = complete();
+        lines.push(String::from("auto_confirm=U0TRUSTED1"));
+        lines.push(String::from("auto_confirm=U0TRUSTED2"));
+        lines.push(String::from("team_github_login=team-member"));
+        let parsed = SlackConfig::parse(&config(&borrowed(&lines)))
+            .expect("v1 with the new keys")
+            .expect("present");
+        assert_eq!(parsed.auto_confirm.len(), 2);
+        assert_eq!(parsed.team_github_logins, vec![String::from("team-member")]);
+        let rendered = format!("{parsed:?}");
+        assert!(rendered.contains("auto_confirm_count: 2"));
+        assert!(!rendered.contains("U0TRUSTED1"));
+        assert!(
+            self::parsed().auto_confirm.is_empty(),
+            "off unless configured"
+        );
+
+        for (bad, category) in [
+            ("auto_confirm=not a user", "slack_config_auto_confirm"),
+            (
+                "auto_confirm=U0TRUSTED1\nauto_confirm=U0TRUSTED1",
+                "slack_config_auto_confirm",
+            ),
+            (
+                "team_github_login=-leading",
+                "slack_config_team_github_login",
+            ),
+            ("team_github_login=a b", "slack_config_team_github_login"),
+            (
+                "team_github_login=Team-Member\nteam_github_login=team-member",
+                "slack_config_team_github_login",
+            ),
+        ] {
+            let mut lines = complete();
+            lines.push(bad.to_owned());
+            assert_eq!(
+                SlackConfig::parse(&config(&borrowed(&lines)))
+                    .expect_err(bad)
+                    .category(),
+                category,
+                "{bad}"
+            );
+        }
     }
 }

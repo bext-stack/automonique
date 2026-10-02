@@ -33,6 +33,14 @@ end=automonique.slack/v2
   `commands`, `files`, and `app_home`.
 - v1 implies the pre-v2 approvals/conversation/commands behavior but never
   enables interactive decisions.
+- `auto_confirm=U…` (optional, repeatable, accepted by v1 and v2) names a
+  Slack user whose ticket posts in a configured channel are confirmed through
+  the ordinary confirm path, so the worker starts without an approval card.
+  Off unless listed. It never applies while a Claude Code session holds the
+  ticket, and a confirmation Manage refuses falls back to the approval card.
+  Unlisted users keep the approval card.
+- `team_github_login=<login>` (optional, repeatable, v1 and v2) names a GitHub
+  login of the delivery team. Logins are configuration, never code.
 
 `files` is reserved but must remain disabled until the tenant has an explicit
 artifact size, retention, access and deletion policy and the external-upload
@@ -91,11 +99,54 @@ Subscribe the bot to the events used by the enabled features:
 - file events only after the artifact policy gate is implemented.
 
 The bot token needs the narrow scopes for the enabled calls. The present
-surface uses `chat:write`, channel history scopes appropriate to configured
-channel types, and `users:read`. App Home publishing itself requires a valid
-app installation; Slack currently documents no additional OAuth scope for
-`views.publish`. Do not add `chat:write.public`: invite the app to each
-configured channel instead.
+surface uses `chat:write`, `reactions:write`, channel history scopes
+appropriate to configured channel types, and `users:read`. App Home publishing
+itself requires a valid app installation; Slack currently documents no
+additional OAuth scope for `views.publish`. Do not add `chat:write.public`:
+invite the app to each configured channel instead.
+
+## Ticket status reactions
+
+The daemon is the single owner of the status reactions on a Slack message that
+posted a GitHub ticket. Nothing else reacts with the bot token — in particular
+no Claude Code hook: a session claims and releases through the daemon instead.
+
+- 👀 `eyes` — somebody has started: a Monique job reached `claimed` or
+  `running`, or a local Claude Code session claimed the ticket.
+- ✅ `white_check_mark` — the ticket is verifiably finished: its Monique job
+  reached `done`, or GitHub shows the pull request merged, the issue closed as
+  `completed` (or with no recorded reason), or the issue's **latest** comment
+  written by a `team_github_login` reports a delivery (`en ligne`,
+  `en production`, `déploi…`/`deploy…`, `corrigé`, `maintenant`, `is live`,
+  `deployed`, `fixed`, case-insensitive). A later comment from anyone else
+  makes the ticket unfinished again. A turn or a run ending never counts.
+
+The reactions are derived from `ticket-work.v1.json`, an owner-only ledger
+beside the other ticket registries: per ticket, the Slack posts that cited it
+(recorded at intake and seeded from `slack-ticket-jobs.v1.json` on start), its
+claims, the reactions already applied, and a verification queue. A released
+ticket that is not finished stays queued and is checked again every ten
+minutes, three tickets per pass, for up to 21 days. A post of a ticket already
+verified finished receives no 👀; it is checked once more and receives its ✅
+only if the ticket is still finished. The bot only ever adds its own
+reactions; a human's reactions are never touched. A Claude claim lapses after
+twelve hours without renewal.
+
+Local sessions use the admin socket:
+
+```text
+automonique ticket claim <github-url> --holder claude:<session>
+automonique ticket release <github-url> --holder claude:<session>
+```
+
+Both print one JSON line, `{"conflicts":[{"holder":…,"status":…}],"posts_found":N,"reacted":N}`.
+A claim reacts 👀 on every known post of the ticket — searching the configured
+channels' recent history when the daemon has not recorded one — and reports
+every competing Monique job (`pending_approval`, `pending`, `claimed`,
+`running`) or other session. While a session holds a ticket, Slack intake for
+it answers in thread instead of opening a Monique job. A release checks GitHub
+at once and reacts ✅ when the ticket is finished; otherwise the ticket is
+queued for verification.
 
 ## Decision contract and ordering
 

@@ -393,6 +393,134 @@ fn host_features_response_refuses_malformed_and_oversized_offers() {
 }
 
 #[test]
+fn ticket_claim_and_release_requests_round_trip_with_exact_bodies() {
+    use automonique_protocol::admin::TicketClaim;
+    let claim = TicketClaim::new(
+        "https://github.com/example/project/issues/42",
+        "claude:session-1",
+    )
+    .expect("a claim");
+    for (release, kind) in [(false, "ticket_claim"), (true, "ticket_release")] {
+        let request = AdminRequest::ticket_claim(request_id(), claim.clone(), release);
+        let payload = request.to_message().expect("encode").to_canonical_bytes();
+        assert_eq!(
+            std::str::from_utf8(&payload).expect("utf-8"),
+            format!(
+                r#"{{"body":{{"holder":"claude:session-1","issue_url":"https://github.com/example/project/issues/42"}},"kind":"{kind}","protocol":"automonique.admin","request_id":"req-admin-1","version":1}}"#
+            )
+        );
+        let decoded = AdminRequest::from_canonical_bytes(&payload).expect("decode");
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.ticket(), Some(&claim));
+    }
+    let widened = br#"{"body":{"holder":"claude:s","issue_url":"https://github.com/a/b/issues/1","x":1},"kind":"ticket_claim","protocol":"automonique.admin","request_id":"r","version":1}"#;
+    assert_eq!(
+        AdminRequest::from_canonical_bytes(widened).expect_err("an extra field"),
+        AdminError::InvalidBody
+    );
+}
+
+#[test]
+fn a_ticket_claim_names_a_github_url_and_a_claude_session_only() {
+    use automonique_protocol::admin::{MAX_TICKET_URL_BYTES, TicketClaim};
+    for (url, holder) in [
+        ("http://github.com/a/b/issues/1", "claude:s"),
+        ("https://example.invalid/a/b/issues/1", "claude:s"),
+        ("https://github.com/", "claude:s"),
+        ("https://github.com/a b/issues/1", "claude:s"),
+        ("https://github.com/a/b/issues/1", "monique-job:job-1"),
+        ("https://github.com/a/b/issues/1", "claude:"),
+        ("https://github.com/a/b/issues/1", "claude:a b"),
+    ] {
+        assert_eq!(
+            TicketClaim::new(url, holder),
+            Err(AdminError::InvalidBody),
+            "{url} {holder}"
+        );
+    }
+    let long = format!(
+        "https://github.com/{}",
+        "a".repeat(MAX_TICKET_URL_BYTES - 18)
+    );
+    assert!(TicketClaim::new(long, "claude:s").is_err());
+    assert!(
+        TicketClaim::new(
+            "https://github.com/a/b/pull/7",
+            format!("claude:{}", "s".repeat(128))
+        )
+        .is_ok()
+    );
+    assert!(
+        TicketClaim::new(
+            "https://github.com/a/b/pull/7",
+            format!("claude:{}", "s".repeat(129))
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_ticket_claim_result_round_trips_and_refuses_an_unknown_status() {
+    use automonique_protocol::admin::{MAX_TICKET_CONFLICTS, TicketClaimConflict};
+    let response = AdminResponse::TicketClaimed {
+        request_id: request_id(),
+        posts_found: 2,
+        reacted: 1,
+        conflicts: vec![
+            TicketClaimConflict::new("monique-job:job-1", "running").expect("conflict"),
+            TicketClaimConflict::new("claude:other", "claimed").expect("conflict"),
+        ],
+    };
+    let payload = response.to_message().expect("encode").to_canonical_bytes();
+    assert_eq!(
+        std::str::from_utf8(&payload).expect("utf-8"),
+        r#"{"body":{"conflicts":[{"holder":"monique-job:job-1","status":"running"},{"holder":"claude:other","status":"claimed"}],"posts_found":2,"reacted":1},"kind":"ticket_claim_result","protocol":"automonique.admin","request_id":"req-admin-1","version":1}"#
+    );
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(&payload).expect("decode"),
+        response
+    );
+    assert!(TicketClaimConflict::new("claude:other", "done").is_err());
+    let unknown = br#"{"body":{"conflicts":[{"holder":"claude:x","status":"done"}],"posts_found":0,"reacted":0},"kind":"ticket_claim_result","protocol":"automonique.admin","request_id":"req-admin-1","version":1}"#;
+    assert_eq!(
+        AdminResponse::from_canonical_bytes(unknown),
+        Err(AdminError::InvalidBody)
+    );
+    let oversized = AdminResponse::TicketClaimed {
+        request_id: request_id(),
+        posts_found: 0,
+        reacted: 0,
+        conflicts: (0..=MAX_TICKET_CONFLICTS)
+            .map(|index| {
+                TicketClaimConflict::new(format!("claude:s{index}"), "claimed").expect("conflict")
+            })
+            .collect(),
+    };
+    assert_eq!(oversized.to_message(), Err(AdminError::InvalidBody));
+}
+
+#[test]
+fn a_maximal_ticket_claim_result_fits_one_admin_frame() {
+    use automonique_protocol::admin::{
+        MAX_TICKET_CONFLICTS, MAX_TICKET_HOLDER_BYTES, TicketClaimConflict,
+    };
+    let response = AdminResponse::TicketClaimed {
+        request_id: RequestId::new("r".repeat(automonique_protocol::codec::MAX_REQUEST_ID_BYTES))
+            .expect("a maximal request id"),
+        posts_found: u32::MAX,
+        reacted: u32::MAX,
+        conflicts: (0..MAX_TICKET_CONFLICTS)
+            .map(|_| {
+                TicketClaimConflict::new("\"".repeat(MAX_TICKET_HOLDER_BYTES), "pending_approval")
+                    .expect("a maximal conflict")
+            })
+            .collect(),
+    };
+    let payload = response.to_message().expect("encode").to_canonical_bytes();
+    assert!(payload.len() <= MAX_ADMIN_CANONICAL_BYTES);
+}
+
+#[test]
 fn a_maximal_host_features_response_fits_one_admin_frame() {
     let name = "\\".repeat(automonique_protocol::sandbox::MAX_SANDBOX_FIELD_BYTES);
     let response = AdminResponse::HostFeatures {
@@ -2658,6 +2786,7 @@ mod capability {
             "automation scheduler worker health in the durable-state counts",
         ),
         (11, "the read-only host enforcement features endpoint"),
+        (12, "local session ticket claim and release"),
     ];
 
     /// Every endpoint, at the maturity it had when it landed.
@@ -2713,6 +2842,8 @@ mod capability {
         "automonique.platform/claim_control",
         "automonique.platform/release_control",
         "automonique.admin/host_features",
+        "automonique.admin/ticket_claim",
+        "automonique.admin/ticket_release",
     ];
 
     #[test]
@@ -2767,7 +2898,7 @@ mod capability {
     /// closed set rather than by reading the table.
     #[test]
     fn every_admin_command_is_declared() {
-        assert_eq!(AdminCommand::ALL.len(), 16);
+        assert_eq!(AdminCommand::ALL.len(), 18);
         for command in AdminCommand::ALL {
             let endpoint = format!("automonique.admin/{}", command.kind());
             assert!(

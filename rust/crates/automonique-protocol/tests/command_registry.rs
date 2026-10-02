@@ -101,7 +101,7 @@ fn spec_with(
 // ---------------------------------------------------------------------------
 
 /// How many commands the closed [`AdminCommand`] enum carries.
-const ADMIN_COMMAND_COUNT: usize = 16;
+const ADMIN_COMMAND_COUNT: usize = 18;
 
 /// Every admin command, in the order the enum declares them.
 const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
@@ -121,6 +121,8 @@ const EVERY_ADMIN_COMMAND: [AdminCommand; ADMIN_COMMAND_COUNT] = [
     AdminCommand::ResumeIntake,
     AdminCommand::Shutdown,
     AdminCommand::HostFeatures,
+    AdminCommand::TicketClaim,
+    AdminCommand::TicketRelease,
 ];
 
 /// Each command's position in [`EVERY_ADMIN_COMMAND`].
@@ -148,6 +150,8 @@ fn position(command: AdminCommand) -> usize {
         AdminCommand::ResumeIntake => 13,
         AdminCommand::Shutdown => 14,
         AdminCommand::HostFeatures => 15,
+        AdminCommand::TicketClaim => 16,
+        AdminCommand::TicketRelease => 17,
     }
 }
 
@@ -180,6 +184,17 @@ fn representative_requests(command: AdminCommand) -> Vec<AdminRequest> {
         AdminCommand::Shutdown => vec![AdminRequest::new(request_id(), AdminCommand::Shutdown)],
         AdminCommand::HostFeatures => {
             vec![AdminRequest::new(request_id(), AdminCommand::HostFeatures)]
+        }
+        command @ (AdminCommand::TicketClaim | AdminCommand::TicketRelease) => {
+            vec![AdminRequest::ticket_claim(
+                request_id(),
+                automonique_protocol::admin::TicketClaim::new(
+                    "https://github.com/example/project/issues/42",
+                    "claude:session-1",
+                )
+                .expect("a valid claim"),
+                command == AdminCommand::TicketRelease,
+            )]
         }
         AdminCommand::SubmitSynthetic => vec![AdminRequest::submit(
             request_id(),
@@ -383,7 +398,7 @@ mod anti_drift {
         );
     }
 
-    /// The three disciplines partition the sixteen commands, and the partition is
+    /// The three disciplines partition the eighteen commands, and the partition is
     /// stated rather than derived, so reclassifying a command — describing a
     /// write as a read, or dropping a retry key — fails here.
     #[test]
@@ -424,7 +439,14 @@ mod anti_drift {
         );
         assert_eq!(
             named(|mutation| matches!(mutation, MutationDiscipline::Unkeyed { .. })),
-            ["pause_intake", "resume_intake", "rollback", "shutdown"],
+            [
+                "pause_intake",
+                "resume_intake",
+                "rollback",
+                "shutdown",
+                "ticket_claim",
+                "ticket_release"
+            ],
             "the set of commands exempt from the retry discipline changed"
         );
         assert_eq!(
@@ -476,6 +498,8 @@ mod seeded_registry {
                 "status",
                 "submit_run",
                 "submit_synthetic",
+                "ticket_claim",
+                "ticket_release",
             ]
         );
         let mut sorted = ids.clone();
