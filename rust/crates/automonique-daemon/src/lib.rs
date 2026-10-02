@@ -258,6 +258,7 @@ pub mod shadow;
 pub mod shadow_config;
 pub mod share;
 pub mod shot;
+mod shot_interact;
 pub mod shutdown_signal;
 pub mod site_inventory;
 pub mod skill_runtime;

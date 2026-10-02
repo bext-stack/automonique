@@ -172,6 +172,22 @@ host's headless Chromium (a Playwright cache or a system browser, or
 line otherwise; a navigation that produced an empty document is a failure,
 not a blank proof. It never runs past its deadline.
 
+A state that needs an interaction first is reached with a short declarative
+action list, never a script: `--wait-for <css>`, `--click <css>`, `--hover
+<css>` and `--scroll-to <css>` are repeatable (twelve at most, selectors of 300
+characters at most) and run in the order they are written on the command
+line. Each waits until its selector exists and is visible (`--timeout-ms N`,
+1000..=60000, default 10000) before acting; a click or hover is a real pointer
+event at the element's centre and is refused while another element covers it.
+`--selector <css>` captures that element's bounding box instead of the
+viewport, and `--wait-ms N` (0..=5000, default 300) settles after the last
+action. A failed action is the failure reason, for example
+`MONIQUE_SHOT_FAIL: click ".modal-open": not found after 10000 ms`. These
+options drive the browser over the DevTools protocol on a loopback port the
+browser picks, with a throwaway profile; an invocation without them stays on
+the browser's own screenshot mode. A selector is passed to the page as a call
+argument, not as code.
+
 Two more verbs are named by the method. Each is off until the operator writes
 its configuration, a private (`0600`, owner-only, regular) file in the state
 directory, which the verb finds through `AUTOMONIQUE_STATE_DIR` or, failing

@@ -47,6 +47,11 @@ automonique-transport-runtime = { path = "../automonique-transport-runtime" }
 # crate defines, and does not re-export it: a host cannot construct a poller
 # without naming these types.
 automonique-transports = { path = "../automonique-transports" }
+# The interactive screenshot path decodes the PNG the browser returns and
+# speaks the DevTools protocol over a loopback websocket. Both crates are
+# already in this crate's graph (through `ureq` and the Slack connector), so
+# naming them here adds no package to the lockfile.
+base64.workspace = true
 listenfd.workspace = true
 nix.workspace = true
 rusqlite.workspace = true
@@ -55,6 +60,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 toml_edit.workspace = true
+tungstenite.workspace = true
 ureq.workspace = true
 zeroize.workspace = true
 
