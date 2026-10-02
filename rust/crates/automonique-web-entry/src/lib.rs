@@ -3866,22 +3866,7 @@ impl WebIntegration {
     /// The enabled sites and Manage profiles. The caller decides whether the
     /// turn needs them (keyword check or router).
     fn site_context(&self, message: &str) -> Option<LiveSiteContext> {
-        let prism = prism_sites(Path::new(NGINX_SITES_ENABLED));
-        let all_hosts = enabled_hosts(Path::new(NGINX_SITES_ENABLED));
-        let enabled_sites = match (prism, all_hosts) {
-            (Ok(prism), Ok(all_hosts)) => format!(
-                "status=available\nprism_app_count={}\nprism_apps={}\nprism_hostname_count={}\nprism_hostnames={}\nenabled_hostname_count={}\nenabled_hostnames={}",
-                prism.apps().len(),
-                bounded_ranked_values(prism.apps(), message, 1_000),
-                prism.sites().len(),
-                bounded_ranked_values(prism.sites(), message, 1_500),
-                all_hosts.sites().len(),
-                bounded_ranked_values(all_hosts.sites(), message, 2_000),
-            ),
-            _ => String::from(
-                "status=unavailable\nprism_app_count=unavailable\nprism_apps=unavailable\nprism_hostname_count=unavailable\nprism_hostnames=unavailable\nenabled_hostname_count=unavailable\nenabled_hostnames=unavailable",
-            ),
-        };
+        let enabled_sites = enabled_sites_snapshot(Path::new(NGINX_SITES_ENABLED), message);
         let manage_profiles = self.manage.profile_app.as_ref().map(|profile_app| {
             match manage_profiles(message, profile_app) {
                 Ok(inventory) => render_manage_profile_inventory(inventory),
@@ -5999,7 +5984,7 @@ fn compose_chat_prompt(
             ),
             requested(
                 context.live_sites.map(|sites| sites.enabled_sites.as_str()),
-                1_500,
+                ENABLED_SITES_BUDGET,
             ),
             requested(
                 context
@@ -6663,6 +6648,35 @@ fn bounded_values(values: &[String], characters: usize) -> String {
         rendered.push_str(value);
     }
     rendered
+}
+
+/// Characters of the enabled-site snapshot one chat turn may carry.
+const ENABLED_SITES_BUDGET: usize = 1_500;
+
+/// Render the enabled-site inventory for one chat turn within
+/// [`ENABLED_SITES_BUDGET`], whatever the size of the estate.
+///
+/// Every count and the inventory's coverage come first and each list has its
+/// own share, so a host serving thousands of names still reports all three
+/// totals, says whether the inventory was truncated, and lists the names the
+/// question matches before any others.
+fn enabled_sites_snapshot(sites_enabled: &Path, message: &str) -> String {
+    match (prism_sites(sites_enabled), enabled_hosts(sites_enabled)) {
+        (Ok(prism), Ok(all_hosts)) => format!(
+            "status=available\nprism_app_count={}\nprism_hostname_count={}\nprism_coverage={}\nenabled_hostname_count={}\nenabled_coverage={}\nprism_apps={}\nprism_hostnames={}\nenabled_hostnames={}",
+            prism.apps().len(),
+            prism.sites().len(),
+            prism.coverage(),
+            all_hosts.sites().len(),
+            all_hosts.coverage(),
+            bounded_ranked_values(prism.apps(), message, 350),
+            bounded_ranked_values(prism.sites(), message, 400),
+            bounded_ranked_values(all_hosts.sites(), message, 400),
+        ),
+        _ => String::from(
+            "status=unavailable\nprism_app_count=unavailable\nprism_apps=unavailable\nprism_hostname_count=unavailable\nprism_hostnames=unavailable\nenabled_hostname_count=unavailable\nenabled_hostnames=unavailable",
+        ),
+    }
 }
 
 fn bounded_ranked_values(values: &[String], question: &str, characters: usize) -> String {
@@ -13377,6 +13391,51 @@ mod tests {
             utc_rfc3339_from_unix_millis(1_775_433_480_000).as_deref(),
             Some("2026-04-05T23:58:00.000Z")
         );
+    }
+
+    #[test]
+    fn enabled_sites_snapshot_fits_its_budget_for_a_large_estate() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = tempfile::tempdir().expect("fixture");
+        let enabled = fixture.path().join("enabled");
+        std::fs::create_dir(&enabled).expect("enabled");
+        std::fs::set_permissions(&enabled, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        for index in 0..700 {
+            let app = fixture
+                .path()
+                .join("bext/sites")
+                .join(format!("shop-{index:04}-prism"));
+            std::fs::create_dir_all(&app).expect("app");
+            std::fs::write(
+                app.join("bext.config.toml"),
+                "[framework]\ntype = \"prism\"\n",
+            )
+            .expect("manifest");
+            let vhost = enabled.join(format!("{index:04}.conf"));
+            std::fs::write(
+                &vhost,
+                format!(
+                    "server_name shop-{index:04}.example.test www.shop-{index:04}.example.test alt-{index:04}.example.test;\nroot {};\n",
+                    app.display()
+                ),
+            )
+            .expect("vhost");
+            std::fs::set_permissions(&vhost, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        }
+        let snapshot = enabled_sites_snapshot(&enabled, "what is shop-0421 serving?");
+        // The whole snapshot fits the section, so nothing after the lists is
+        // cut off at prompt assembly, however large the estate.
+        assert!(
+            snapshot.chars().count() <= ENABLED_SITES_BUDGET,
+            "{snapshot}"
+        );
+        assert!(snapshot.starts_with(
+            "status=available\nprism_app_count=700\nprism_hostname_count=2048\nprism_coverage=truncated=yes skipped_vhost_files=0\nenabled_hostname_count=2048\nenabled_coverage=truncated=yes skipped_vhost_files=0\n"
+        ));
+        // The names the question matches lead each list.
+        assert!(snapshot.contains("\nprism_apps=shop-0421-prism, "));
+        assert!(snapshot.contains("\nprism_hostnames=shop-0421.example.test, "));
+        assert!(snapshot.contains("\nenabled_hostnames=shop-0421.example.test, "));
     }
 
     #[test]

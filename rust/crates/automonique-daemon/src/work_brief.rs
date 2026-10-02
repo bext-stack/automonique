@@ -38,6 +38,10 @@ const MAX_MEMORY_MATCH_BYTES: usize = 1_200;
 const MAX_KNOWLEDGE_BYTES: usize = 2_400;
 const MAX_SKILLS_BYTES: usize = 4 * 1024;
 const MAX_SITES_BYTES: usize = 700;
+/// Most named sites whose serving directory the brief spells out, and the
+/// bytes those lines may take together.
+const MAX_NAMED_LOCATIONS: usize = 8;
+const MAX_LOCATIONS_BYTES: usize = 1_200;
 const MAX_HINT_BYTES: usize = 2_000;
 /// Absolute ceiling on the rendered brief.
 pub const MAX_BRIEF_BYTES: usize = 12 * 1024;
@@ -234,41 +238,13 @@ pub fn render(state_dir: &Path, request: &WorkBriefRequest) -> String {
         }
     }
 
-    // Managed sites that the hint names.
-    match crate::site_inventory::prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
-    {
-        Ok(inventory) => {
-            let terms = significant_terms(&hint);
-            // Match the request's words against each deployment's own label,
-            // never against the shared platform suffix: "bext" in a request
-            // must not name all 141 `*.bext.dev` hosts.
-            let named: Vec<&str> = inventory
-                .apps()
-                .iter()
-                .chain(inventory.sites())
-                .map(String::as_str)
-                .filter(|value| {
-                    let label = site_label_stem(value);
-                    terms.iter().any(|term| label.contains(term.as_str()))
-                })
-                .collect();
-            if named.is_empty() {
-                brief.push_str(&format!(
-                    "[managed_sites app_count={} hostname_count={} named_by_request=none]\n",
-                    inventory.apps().len(),
-                    inventory.sites().len()
-                ));
-            } else {
-                brief.push_str(&format!(
-                    "[managed_sites app_count={} hostname_count={}]\nnamed_by_request={}\n[/managed_sites]\n",
-                    inventory.apps().len(),
-                    inventory.sites().len(),
-                    bounded(&named.join(", "), MAX_SITES_BYTES)
-                ));
-            }
-        }
-        Err(_) => brief.push_str("[managed_sites status=unavailable]\n"),
-    }
+    // Managed sites that the hint names, and where their code lives.
+    brief.push_str(&managed_sites_section(
+        crate::site_inventory::prism_sites(Path::new(crate::site_inventory::NGINX_SITES_ENABLED))
+            .as_ref()
+            .ok(),
+        &hint,
+    ));
 
     // Approved skills, exactly as the scratchpad lane injects them.
     match crate::skill_runtime::load_active(state_dir) {
@@ -286,6 +262,98 @@ pub fn render(state_dir: &Path, request: &WorkBriefRequest) -> String {
 
     brief.push_str("[/automonique_local_context]");
     bounded(&brief, MAX_BRIEF_BYTES)
+}
+
+/// Render what the enabled-site inventory says about the sites a request
+/// names: which hosts and apps match and, for the few it names most
+/// precisely, which directory serves them.
+///
+/// The app root is a fact for the job, not an instruction: it is printed as a
+/// `location` data line inside the brief's untrusted-context block, and only
+/// when the inventory judged it safe to show (see
+/// [`crate::site_inventory::PrismSiteInventory::app_root`]). A large estate
+/// cannot grow this section: both lists are cut to fixed byte ceilings.
+fn managed_sites_section(
+    inventory: Option<&crate::site_inventory::PrismSiteInventory>,
+    hint: &str,
+) -> String {
+    let Some(inventory) = inventory else {
+        return String::from("[managed_sites status=unavailable]\n");
+    };
+    let header = format!(
+        "managed_sites app_count={} hostname_count={} {}",
+        inventory.apps().len(),
+        inventory.sites().len(),
+        inventory.coverage(),
+    );
+    let terms = significant_terms(hint);
+    let hosts = named_hosts(hint);
+    // Most precise first, so the byte and location ceilings cut the loosest
+    // matches: a hostname spelled in full, then an app named by its own
+    // label, then anything whose label merely contains a request word.
+    let exact_hosts = inventory
+        .sites()
+        .iter()
+        .filter(|site| hosts.iter().any(|host| host == *site));
+    let exact_apps = inventory.apps().iter().filter(|app| {
+        let stem = site_label_stem(app);
+        terms.iter().any(|term| term == *app || *term == stem)
+    });
+    // Match the request's words against each deployment's own label, never
+    // against the shared platform suffix: "bext" in a request must not name
+    // every host under the platform's domain.
+    let loose = inventory
+        .apps()
+        .iter()
+        .chain(inventory.sites())
+        .filter(|value| {
+            let label = site_label_stem(value);
+            terms.iter().any(|term| label_names_term(&label, term))
+        });
+    let mut named: Vec<&str> = Vec::new();
+    for value in exact_hosts.chain(exact_apps).chain(loose) {
+        if !named.contains(&value.as_str()) {
+            named.push(value);
+        }
+    }
+    if named.is_empty() {
+        return format!("[{header} named_by_request=none]\n");
+    }
+    let mut section = format!(
+        "[{header}]\nnamed_by_request={}\n",
+        bounded(&named.join(", "), MAX_SITES_BYTES)
+    );
+    let mut located: Vec<&str> = Vec::new();
+    let mut locations = String::new();
+    for value in named {
+        if located.len() >= MAX_NAMED_LOCATIONS {
+            break;
+        }
+        let (host, app) = if value.contains('.') {
+            (Some(value), inventory.app_for_host(value))
+        } else {
+            (None, Some(value))
+        };
+        let Some(app) = app else {
+            continue;
+        };
+        if located.contains(&app) {
+            continue;
+        }
+        let line = format!(
+            "location {}app={app} root={}\n",
+            host.map(|host| format!("host={host} ")).unwrap_or_default(),
+            inventory.app_root(app).unwrap_or("withheld"),
+        );
+        if locations.len() + line.len() > MAX_LOCATIONS_BYTES {
+            break;
+        }
+        located.push(app);
+        locations.push_str(&line);
+    }
+    section.push_str(&locations);
+    section.push_str("[/managed_sites]\n");
+    section
 }
 
 struct ThreadContextRow {
@@ -417,18 +485,73 @@ fn significant_terms(text: &str) -> Vec<String> {
         "projet",
         "issuecomment",
     ];
-    let mut terms: Vec<String> = text
-        .to_lowercase()
-        .split(|character: char| !character.is_alphanumeric() && character != '-')
-        .map(|term| term.trim_matches('-'))
-        .filter(|term| term.len() >= 5)
-        .filter(|term| !term.chars().all(|character| character.is_ascii_digit()))
-        .filter(|term| !PLATFORM_NOUNS.contains(term))
-        .map(str::to_owned)
-        .collect();
+    // Accents are folded so "Régal" names "regal-prism"; deployment labels
+    // are ASCII.
+    let text = crate::local_knowledge::fold_diacritics(&text.to_lowercase());
+    let words = |text: &str, shortest: usize| -> Vec<String> {
+        text.split(|character: char| !character.is_alphanumeric() && character != '-')
+            .map(|term| term.trim_matches('-'))
+            .filter(|term| term.len() >= shortest)
+            .filter(|term| !term.chars().all(|character| character.is_ascii_digit()))
+            .filter(|term| !PLATFORM_NOUNS.contains(term))
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut terms = words(&text, 5);
+    // A leading "[TAG]" is how a ticket title names its client, and client
+    // tags are often short ("[ACME]"): inside it a three-letter word counts.
+    if let Some((tag, _)) = text
+        .trim_start()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        terms.extend(words(tag, 3));
+    }
+    // A name written with an apostrophe ("Regal'Terre") is deployed without
+    // one ("regalterre"). Elisions ("l'adresse") are not names.
+    terms.extend(crate::local_knowledge::apostrophe_compounds(&text));
     terms.sort();
     terms.dedup();
     terms
+}
+
+/// Hostnames a request spells in full, lowercased: "see shop.example.test."
+/// names `shop.example.test`. Bounded, because a request can paste a list.
+fn named_hosts(text: &str) -> Vec<String> {
+    const MAX_NAMED_HOSTS: usize = 8;
+    let mut hosts: Vec<String> = Vec::new();
+    for word in text.split(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '.')
+    }) {
+        let host = word.trim_matches(['.', '-']).to_ascii_lowercase();
+        let labels_are_dns = host.len() <= 253
+            && host.contains('.')
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            });
+        if labels_are_dns && !hosts.contains(&host) {
+            hosts.push(host);
+            if hosts.len() >= MAX_NAMED_HOSTS {
+                break;
+            }
+        }
+    }
+    hosts
+}
+
+/// Whether a request word names a deployment label. A full word may sit
+/// anywhere in the label; a short tag must start one of its parts, so "acme"
+/// names "acme-shop" without three letters matching inside unrelated names.
+fn label_names_term(label: &str, term: &str) -> bool {
+    if term.len() >= 5 {
+        return label.contains(term);
+    }
+    label
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|part| part.starts_with(term))
 }
 
 /// The part of a hostname or app name that names the site: the last two
@@ -566,6 +689,227 @@ mod tests {
             "edt.staging"
         );
         assert_eq!(site_label_stem("blog"), "blog");
+    }
+
+    #[test]
+    fn request_terms_keep_client_tags_hostnames_and_apostrophe_names() {
+        // The hostname's own label is one term; the platform's domain is not.
+        assert_eq!(
+            significant_terms("[ACME] page dépliant acme-communication.platform.example"),
+            ["acme", "acme-communication", "depliant", "example"]
+        );
+        // A short client tag counts inside the leading brackets only.
+        assert!(significant_terms("[ABC] fiche produit").contains(&String::from("abc")));
+        assert!(!significant_terms("fiche abc produit").contains(&String::from("abc")));
+        assert!(!significant_terms("[2042] fiche produit").contains(&String::from("2042")));
+        // An apostrophe name is offered joined; an elision is not a name.
+        let terms = significant_terms("[Régal'Terre] l'adresse de paiement");
+        assert!(terms.contains(&String::from("regalterre")));
+        assert!(terms.contains(&String::from("regal")));
+        assert!(terms.contains(&String::from("adresse")));
+        assert!(!terms.contains(&String::from("ladresse")));
+
+        assert_eq!(
+            named_hosts("voir https://shop.example.test/panier, puis Www.Shop2.Example.Test."),
+            ["shop.example.test", "www.shop2.example.test"]
+        );
+        assert!(named_hosts("version 2 of main, no host").is_empty());
+        assert_eq!(
+            named_hosts(
+                &(0..20)
+                    .map(|index| format!("h{index}.example.test"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+            .len(),
+            8
+        );
+
+        assert!(label_names_term("acme-communication", "communication"));
+        assert!(label_names_term("acme-shop", "acme"));
+        assert!(label_names_term("shop.acme", "acme"));
+        // A short tag must start a part of the label.
+        assert!(!label_names_term("pharmacmeter", "acme"));
+    }
+
+    /// A temp estate of Prism apps: `(app, hostnames, root directory mode)`.
+    fn estate(
+        fixture: &Path,
+        apps: &[(&str, &str, u32)],
+    ) -> crate::site_inventory::PrismSiteInventory {
+        use std::os::unix::fs::PermissionsExt as _;
+        let enabled = fixture.join("enabled");
+        fs::create_dir(&enabled).expect("enabled");
+        fs::set_permissions(&enabled, fs::Permissions::from_mode(0o755)).expect("mode");
+        for (app, hosts, mode) in apps {
+            let root = fixture.join("bext/sites").join(app);
+            fs::create_dir_all(&root).expect("app");
+            fs::write(
+                root.join("bext.config.toml"),
+                "[framework]\ntype = \"prism\"\n",
+            )
+            .expect("manifest");
+            fs::set_permissions(&root, fs::Permissions::from_mode(*mode)).expect("mode");
+            let vhost = enabled.join(format!("{app}.conf"));
+            fs::write(
+                &vhost,
+                format!("server_name {hosts};\nroot {};\n", root.display()),
+            )
+            .expect("vhost");
+            fs::set_permissions(&vhost, fs::Permissions::from_mode(0o644)).expect("mode");
+        }
+        crate::site_inventory::prism_sites(&enabled).expect("inventory")
+    }
+
+    #[test]
+    fn named_host_gets_its_serving_directory_and_an_unsafe_root_is_withheld() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let inventory = estate(
+            fixture.path(),
+            &[
+                (
+                    "acme-communication-prism",
+                    "acme-communication.platform.example",
+                    0o755,
+                ),
+                (
+                    "acme-prism",
+                    "acme.platform.example www.acme.example",
+                    0o775,
+                ),
+                ("open-prism", "open.platform.example", 0o777),
+                ("other-prism", "other.platform.example", 0o755),
+            ],
+        );
+        let root = |app: &str| fixture.path().join("bext/sites").join(app);
+
+        let section = managed_sites_section(
+            Some(&inventory),
+            "[ACME] page dépliant acme-communication.platform.example",
+        );
+        // The host spelled in full leads, then the apps the request names.
+        assert_eq!(
+            section,
+            format!(
+                "[managed_sites app_count=4 hostname_count=5 truncated=no skipped_vhost_files=0]\n\
+                 named_by_request=acme-communication.platform.example, acme-communication-prism, acme-prism, acme.platform.example\n\
+                 location host=acme-communication.platform.example app=acme-communication-prism root={}\n\
+                 location app=acme-prism root={}\n\
+                 [/managed_sites]\n",
+                root("acme-communication-prism").display(),
+                root("acme-prism").display(),
+            )
+        );
+
+        // A world-writable root is an enabled app whose path is not handed out.
+        let section = managed_sites_section(Some(&inventory), "open.platform.example is down");
+        assert!(
+            section.contains("location host=open.platform.example app=open-prism root=withheld\n")
+        );
+        assert!(!section.contains(&root("open-prism").display().to_string()));
+
+        // Naming the platform alone names no site, and shows no path.
+        let section = managed_sites_section(Some(&inventory), "the platform is slow today");
+        assert_eq!(
+            section,
+            "[managed_sites app_count=4 hostname_count=5 truncated=no skipped_vhost_files=0 named_by_request=none]\n"
+        );
+        assert_eq!(
+            managed_sites_section(None, "anything"),
+            "[managed_sites status=unavailable]\n"
+        );
+    }
+
+    #[test]
+    fn a_large_estate_cannot_grow_the_sites_section() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let apps = (0..700)
+            .map(|index| {
+                (
+                    format!("shop-{index:04}-prism"),
+                    format!("shop-{index:04}.platform.example"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let inventory = estate(
+            fixture.path(),
+            &apps
+                .iter()
+                .map(|(app, host)| (app.as_str(), host.as_str(), 0o755))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(inventory.apps().len(), 700);
+        // The tag names every one of the 1,400 apps and hosts.
+        let section =
+            managed_sites_section(Some(&inventory), "[SHOP] shop-0421.platform.example panier");
+        assert!(section.len() <= 200 + MAX_SITES_BYTES + MAX_LOCATIONS_BYTES);
+        assert!(section.matches("\nlocation ").count() <= MAX_NAMED_LOCATIONS);
+        assert!(section.contains("[truncated=yes]"));
+        // The host spelled in full survives the cut, first.
+        assert!(section.contains("named_by_request=shop-0421.platform.example, "));
+        assert!(
+            section
+                .contains("\nlocation host=shop-0421.platform.example app=shop-0421-prism root=")
+        );
+        assert!(section.ends_with("[/managed_sites]\n"));
+    }
+
+    #[test]
+    fn only_an_internal_team_memory_travels_into_a_job() {
+        use automonique_store::agent_memory::{
+            MemoryInput, MemorySensitivity, MemoryStatus, MemoryVisibility,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let mut store =
+            AgentMemoryStore::open(root.path().join("agent-memory.sqlite3")).expect("store");
+        let mut record = |key: &str, kind, sensitivity, visibility| {
+            store
+                .record_memory(&MemoryInput {
+                    tenant: "primary",
+                    actor: "telegram:42",
+                    scope: "user:telegram:42",
+                    kind,
+                    content: "Open a pull request against staging.",
+                    status: MemoryStatus::Active,
+                    confidence: 1000,
+                    sensitivity,
+                    visibility,
+                    source_transport: "owner-cli",
+                    source_key: key,
+                    valid_from_ms: 1,
+                    expires_at_ms: None,
+                    review_at_ms: None,
+                    created_at_ms: 1,
+                })
+                .expect("memory")
+        };
+        // What `/remember` and `remember-active` write: never shared.
+        assert!(!shareable_with_a_job(&record(
+            "a",
+            MemoryKind::UserProfile,
+            MemorySensitivity::Personal,
+            MemoryVisibility::Private,
+        )));
+        assert!(!shareable_with_a_job(&record(
+            "b",
+            MemoryKind::Procedure,
+            MemorySensitivity::Internal,
+            MemoryVisibility::Private,
+        )));
+        // What `automonique-memory remember-procedure` writes.
+        let procedure = record(
+            "c",
+            MemoryKind::Procedure,
+            MemorySensitivity::Internal,
+            MemoryVisibility::Team,
+        );
+        assert!(shareable_with_a_job(&procedure));
+        assert!(
+            render_memories(&[procedure])
+                .ends_with("kind=procedure confidence=1000: Open a pull request against staging.")
+        );
     }
 
     #[test]
