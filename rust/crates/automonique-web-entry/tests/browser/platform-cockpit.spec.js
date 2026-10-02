@@ -359,7 +359,7 @@ test("completed sessions open history and enable only exact revision follow-ups"
   await option.click();
   await expect(page.locator("#platform-session-status")).toContainText("Saved history");
   await expect(page.locator("#platform-history")).toContainText("Saved task result");
-  await expect(page.locator("#platform-session-posture")).toContainText("read only");
+  await expect(page.locator("#platform-session-posture")).toContainText("reply only");
   await expect(page.locator("#platform-follow-up")).toBeEnabled();
   await expect(page.locator("#platform-composer-note")).toContainText("9007199254740995");
 });

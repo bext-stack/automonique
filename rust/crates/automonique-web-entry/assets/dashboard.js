@@ -1260,8 +1260,10 @@ const frenchUi = Object.freeze({
   "Reply to Monique…": "Répondre à Monique…",
   "Send": "Envoyer",
   "Replies are checked against the latest state first.": "Chaque réponse est d’abord vérifiée avec l’état le plus récent.",
-  "Up to date · read only": "À jour · lecture seule",
-  "Out of date · read only": "Pas à jour · lecture seule",
+  "Up to date · reply only": "À jour · réponse seulement",
+  "Out of date · reply only": "Pas à jour · réponse seulement",
+
+  "Task completed. Its conversation is open on the right.": "Tâche terminée. Sa conversation est ouverte à droite.",
   "You": "Vous",
   "Monique started working": "Monique a commencé",
   "Monique finished": "Monique a terminé",
@@ -1692,6 +1694,7 @@ function translatePhraseForFrench(value) {
     [/^Agent run (.+) failed$/, (match) => `L’exécution d’agent ${match[1]} a échoué`],
     [/^Live output · (.+) events$/, (match) => `Sortie en direct · ${match[1]} événements`],
     [/^Ready to reply \(version (\d+)\)\.$/, (match) => `Prêt à répondre (version ${match[1]}).`],
+    [/^You can reply\. Monique continues this task with your message\. \(version (\d+)\)$/, (match) => `Vous pouvez répondre. Monique poursuit cette tâche avec votre message. (version ${match[1]})`],
     [/^(\d+) \/ (\d+) accounts$/, (match) => `${match[1]} / ${match[2]} comptes`],
     [/^(\S+) (memory|memories)(?: for “(.+)”)?$/, (match) => `${match[1]} souvenir${match[2] === "memory" ? "" : "s"}${match[3] ? ` pour « ${match[3]} »` : ""}`],
     [/^(Live|Saved history)(?: · (\d+) to approve)?$/, (match) => `${match[1] === "Live" ? "En direct" : "Historique enregistré"}${match[2] ? ` · ${match[2]} à approuver` : ""}`],
@@ -3438,7 +3441,9 @@ function renderRetainedPlatform(retained) {
     title.setAttribute("data-i18n-skip", "");
     title.textContent = consoleSessionTitle(session);
     const detail = document.createElement("small");
-    detail.textContent = session.attachable === false ? "Read only" : "Can reply";
+    // Whether replies are possible is only known once the conversation is
+    // opened, so the row no longer guesses ("Read only" was wrong for tasks).
+    detail.hidden = true;
     main.append(title, detail);
     const stateWord = String(record.summary || "").trim().toLowerCase();
     const state = consoleSessionWorking(coordinate.id)
@@ -3708,7 +3713,7 @@ function settlePlatformFence(command) {
   byId("platform-composer-note").textContent = platformMutation
     ? "Waiting for your last reply to be confirmed before you can send another."
     : revision
-      ? `Ready to reply (version ${revision}).`
+      ? `You can reply. Monique continues this task with your message. (version ${revision})`
       : "Replies are not available for this conversation right now.";
 }
 
@@ -3732,7 +3737,8 @@ async function openPlatformSession(sessionId) {
     const coordinate = record.resource || {};
     byId("platform-session-coordinate").textContent = `${coordinate.authority || "automonique"} / ${coordinate.kind || "session"} / ${coordinate.id || sessionId}`;
     byId("platform-session-summary").textContent = consoleSessionTitle(view.session || {});
-    byId("platform-session-posture").textContent = record.freshness === "stale" ? "Out of date · read only" : "Up to date · read only";
+    // Replies are allowed; what is not claimed is control of a live run.
+    byId("platform-session-posture").textContent = record.freshness === "stale" ? "Out of date · reply only" : "Up to date · reply only";
     const approvals = view.command?.state === "ready" && Array.isArray(view.command.pending_approvals) ? view.command.pending_approvals.length : 0;
     // A run target is not proof that anything is executing, so it is named as linked only.
     byId("platform-session-status").textContent = `${view.attachment_cursor ? "Live" : "Saved history"}${approvals === 0 ? "" : ` · ${approvals} to approve`}`;
@@ -3809,7 +3815,9 @@ async function sendPlatformFollowUp(event) {
   event.preventDefault();
   if (platformBusy || platformMutation || !platformSelectedSession) return;
   const text = byId("platform-follow-up").value.trim();
-  const revisionText = byId("platform-composer-note").textContent.match(/[0-9]+/)?.[0];
+  // The exact revision this reply is fenced against, never re-read from the
+  // note's visible (and translatable) text.
+  const revisionText = platformExactRevision;
   if (!text || !validPlatformDecimal(revisionText, false)) return;
   const idempotencyKey = crypto.randomUUID();
   storePlatformMutation({ sessionId: platformSelectedSession, idempotencyKey, expectedRevision: revisionText });
@@ -4344,7 +4352,9 @@ function acceptPlatformTaskResult(view) {
     savePlatformTask({ ...platformTask, pending: false, sessionId });
     if (outcome === "completed") {
       byId("platform-task-text").value = "";
-      renderPlatformTask(sessionId ? "Task completed. Open its session to read the result or continue." : "Task completed; no retained session was returned.");
+      renderPlatformTask(sessionId ? "Task completed. Its conversation is open on the right." : "Task completed; no retained session was returned.");
+      // Show the result straight away instead of asking for another click.
+      if (sessionId) window.setTimeout(() => consoleOpenSession(sessionId), 0);
     } else renderPlatformTask(`Task did not complete: ${view.receipt?.explanation || view.explanation || outcome}. You can submit a new task.`);
   } else if (outcome === "accepted") {
     byId("platform-task-text").value = "";
