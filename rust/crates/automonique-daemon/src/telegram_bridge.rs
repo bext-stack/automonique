@@ -6001,15 +6001,15 @@ where
                 }),
             );
             if live.is_empty() {
-                bounded_question_context(&format!("{}\n\n{durable}", continuation.memory_context))
+                bounded_question_sections(&continuation.memory_context, &[("durable", &durable)])
             } else {
                 // Every validated selection remains represented. In
                 // particular, a Slack read must not silently displace status
                 // or ticket sources selected by the same closed plan.
-                bounded_question_context(&format!(
-                    "{}\n\n{live}\n\n{durable}",
-                    continuation.memory_context
-                ))
+                bounded_question_sections(
+                    &continuation.memory_context,
+                    &[("live", &live), ("durable", &durable)],
+                )
             }
         };
         let prompt = question_prompt(
@@ -7907,7 +7907,7 @@ where
                             .ok()
                     })
                     .unwrap_or_default();
-                let context = bounded_question_context(&format!("{memory_context}\n\n{durable}"));
+                let context = bounded_question_sections(&memory_context, &[("durable", &durable)]);
                 // A named typed source has already selected the operational
                 // read. Skip the conversational router and spend the one model
                 // call synthesizing that evidence. Explicit deep reasoning is
@@ -8192,7 +8192,7 @@ where
             }
         };
         let live = self.live_operational_context(instruction);
-        let context = bounded_question_context(&format!("{memory}\n\n{live}\n\n{durable}"));
+        let context = bounded_question_sections(&memory, &[("live", &live), ("durable", &durable)]);
         let Some(actions) = self.github_actions.as_mut() else {
             return Answer::Unavailable {
                 chat_id,
@@ -8433,7 +8433,7 @@ where
         // The current message fixes the only issue reference for this read.
         // Memory remains useful answer context but cannot add another target.
         let live = self.live_operational_context_selected(question, "", None, true, None, None);
-        let context = bounded_question_context(&format!("{memory_context}\n\n{live}"));
+        let context = bounded_question_sections(&memory_context, &[("live", &live)]);
         let profile = if deep {
             QuestionProfile::Operational
         } else {
@@ -10401,6 +10401,99 @@ fn bounded_question_context(context: &str) -> String {
     bounded
 }
 
+/// Bound conversation memory plus the fact sections an answer depends on.
+///
+/// Facts (live Slack/GitHub/Manage reads, then durable status and baseline
+/// facts, in the order given) are budgeted first; memory gets what remains
+/// and is what gets trimmed first, keeping its newest lines. The rendering is
+/// unchanged when everything fits: `memory`, then each non-empty section,
+/// separated by blank lines. When anything is cut, a final marker names every
+/// cut section, e.g. `truncated=memory`. The result never exceeds
+/// [`MAX_QUESTION_CONTEXT_BYTES`] bytes.
+fn bounded_question_sections(memory: &str, facts: &[(&'static str, &str)]) -> String {
+    const SEPARATOR: &str = "\n\n";
+    let facts: Vec<(&str, &str)> = facts
+        .iter()
+        .copied()
+        .filter(|(_, text)| !text.is_empty())
+        .collect();
+    let joined = std::iter::once(memory)
+        .chain(facts.iter().map(|(_, text)| *text))
+        .collect::<Vec<_>>()
+        .join(SEPARATOR);
+    if joined.len() <= MAX_QUESTION_CONTEXT_BYTES {
+        return joined;
+    }
+    // Worst-case marker: every section named.
+    let mark_for = |cut: &[&str]| {
+        format!(
+            "\n[snapshot_truncated=yes; truncated={}; additional bytes omitted]\n",
+            cut.join(",")
+        )
+    };
+    let worst_names: Vec<&str> = std::iter::once("memory")
+        .chain(facts.iter().map(|(name, _)| *name))
+        .collect();
+    let reserve = mark_for(&worst_names).len() + SEPARATOR.len() * (facts.len() + 1);
+    let mut remaining = MAX_QUESTION_CONTEXT_BYTES.saturating_sub(reserve);
+    let mut cut = Vec::new();
+    let mut kept_facts = Vec::new();
+    for (name, text) in &facts {
+        if text.len() <= remaining {
+            remaining -= text.len();
+            kept_facts.push((*text).to_owned());
+        } else {
+            let head = line_bounded_head(text, remaining);
+            remaining -= head.len();
+            cut.push(*name);
+            if !head.is_empty() {
+                kept_facts.push(head.to_owned());
+            }
+        }
+    }
+    let memory_kept = if memory.len() <= remaining {
+        memory
+    } else {
+        cut.insert(0, "memory");
+        line_bounded_tail(memory, remaining)
+    };
+    let mut bounded = std::iter::once(memory_kept)
+        .filter(|text| !text.is_empty())
+        .chain(kept_facts.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(SEPARATOR);
+    bounded.push_str(&mark_for(&cut));
+    bounded
+}
+
+/// The longest prefix of `value` within `max_bytes` that ends at a line end.
+fn line_bounded_head(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end]
+        .rfind('\n')
+        .map_or("", |newline| &value[..newline])
+}
+
+/// The longest suffix of `value` within `max_bytes` that starts a line.
+fn line_bounded_tail(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut start = value.len() - max_bytes;
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..]
+        .find('\n')
+        .map_or("", |newline| &value[start + newline + 1..])
+}
+
 fn bounded_utf8(value: &str, max_bytes: usize, mark: &str) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
@@ -12032,7 +12125,7 @@ pub(crate) fn answer_read_only_transport_question(
         if let Ok(Some(context)) =
             surface.local_entity_question_context(question, administrators, configured)
         {
-            let context = bounded_question_context(&format!("{memory_context}\n\n{context}"));
+            let context = bounded_question_sections(memory_context, &[("entity", &context)]);
             let Some(prompt) =
                 question_prompt(question, &context, QuestionProfile::OperationalLookup)
             else {
@@ -12167,9 +12260,12 @@ pub(crate) fn answer_read_only_transport_question(
                     },
                 );
                 if live.is_empty() {
-                    bounded_question_context(&format!("{memory_context}\n\n{durable}"))
+                    bounded_question_sections(memory_context, &[("durable", &durable)])
                 } else {
-                    bounded_question_context(&format!("{memory_context}\n\n{live}\n\n{durable}"))
+                    bounded_question_sections(
+                        memory_context,
+                        &[("live", &live), ("durable", &durable)],
+                    )
                 }
             };
             let Some(prompt) = question_prompt(question, &context, plan.profile) else {
@@ -12286,7 +12382,10 @@ pub(crate) fn answer_approved_escalation(
                 live.push_str("[/live_github_issues]");
             }
             (
-                bounded_question_context(&format!("{memory_context}\n\n{live}\n\n{durable}")),
+                bounded_question_sections(
+                    memory_context,
+                    &[("live", &live), ("durable", &durable)],
+                ),
                 QuestionProfile::Operational,
             )
         }
@@ -18879,6 +18978,51 @@ mod live_github_issue_tests {
         );
         assert!(facts.contains("comment newest_rank=1 author=reviewer"));
         assert!(github.full_reads.is_empty());
+    }
+
+    #[test]
+    fn a_long_memory_tail_no_longer_pushes_live_github_issues_out() {
+        let memory = (0..400)
+            .map(|turn| {
+                format!("user | content_untrusted=earlier turn {turn} about something else")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut github = FakeIssues::default();
+        let issues = live_github_issue_facts(
+            Some(&mut github),
+            "are these done? alpha#12 and beta#3",
+            true,
+            12,
+        )
+        .expect("issues read");
+        let live = format!("[live_github_issues]\n{issues}[/live_github_issues]");
+        let durable = "[status]\nhealth=operational\n[/status]";
+        assert!(memory.len() + live.len() > MAX_QUESTION_CONTEXT_BYTES);
+
+        let context = bounded_question_sections(&memory, &[("live", &live), ("durable", durable)]);
+        assert!(context.len() <= MAX_QUESTION_CONTEXT_BYTES);
+        assert!(context.contains(&live), "the whole live block survives");
+        assert!(context.contains("comment newest_rank=1 author=reviewer"));
+        assert!(context.contains(durable));
+        assert!(context.contains("snapshot_truncated=yes; truncated=memory;"));
+        // Memory keeps its newest lines, starting on a line boundary.
+        assert!(context.contains("earlier turn 399 about something else"));
+        assert!(!context.contains("earlier turn 0 about"));
+        assert!(context.starts_with("user | content_untrusted=earlier turn"));
+        // The legacy order (memory first) is what used to cut the live block.
+        assert!(!bounded_question_context(&format!("{memory}\n\n{live}")).contains(&live));
+
+        // Everything that fits renders exactly as before, with no marker.
+        let small = bounded_question_sections("memory", &[("live", ""), ("durable", "facts")]);
+        assert_eq!(small, "memory\n\nfacts");
+
+        // Oversized facts name the section that was cut, never silently.
+        let huge = format!("[status]\n{}", "row=x\n".repeat(3_000));
+        let context = bounded_question_sections("memory", &[("live", &live), ("durable", &huge)]);
+        assert!(context.len() <= MAX_QUESTION_CONTEXT_BYTES);
+        assert!(context.contains(&live));
+        assert!(context.contains("truncated=memory,durable;"));
     }
 
     #[test]
