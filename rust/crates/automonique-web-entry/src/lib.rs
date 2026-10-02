@@ -3533,10 +3533,20 @@ impl WebIntegration {
                 }
             },
         };
+        // The shared router never sees this turn's live reads. When the answer
+        // was grounded in them, a plain shared-router answer would replace it
+        // with an uninformed one ("no Slack messages in this snapshot"), so
+        // only an approval card for a deeper investigation may come from it.
+        let grounded_in_live_reads = live_sources.iter().any(|source| {
+            ["slack:", "github:", "manage:"]
+                .iter()
+                .any(|prefix| source.starts_with(prefix))
+        });
         if action.is_none()
             && automonique_daemon::telegram_bridge::answer_requires_escalation(message, &answer)
             && let Some((recovered_answer, recovered_action)) =
                 self.recover_authority_gap(message, &history, &conversation, sequence, binding)?
+            && (recovered_action.is_some() || !grounded_in_live_reads)
         {
             answer = recovered_answer;
             action = recovered_action;
