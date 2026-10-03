@@ -2752,7 +2752,7 @@ async function artifactApi(body) {
 function artifactOptions(context={}) {
   const options={context,previewUrl:"/artifact-preview",publicBase:artifactPublicBase,
     api:async body=>{const result=await artifactApi(body);options.publicBase=artifactPublicBase;if(body.action==="list" && (context.run_id || context.conversation_id))result.items=(result.items||[]).filter(a=>context.run_id?a.run_id===context.run_id:a.conversation_id===context.conversation_id);return result;},
-    onRevise:(artifact,version)=>{byId("artifact-dialog").close();showView("chat");const prompt=`Please revise the deliverable "${artifact.title}" (artifact ${artifact.id}, version ${version.number}). Preserve its bundle ID and publish a new version. Requested changes: `;const input=byId("chat-input");input.value=prompt;if(chatUi.loading || !chatUi.ready)chatUi.seededPrompt=prompt;updateChatComposer();input.focus();}};
+    onRevise:(artifact,version)=>{byId("artifact-dialog").close();showView("chat");const prompt=`Please revise the deliverable "${artifact.title}" (artifact ${artifact.id}, version ${version.number})${artifact.issue_url ? ` for ${artifact.issue_url}` : ""}. Use monique-artifact download to retrieve it. Preserve its bundle ID and publish a new version. Requested changes: `;const input=byId("chat-input");input.value=prompt+(input.value ? `\n\n${input.value}` : "");if(chatUi.loading || !chatUi.ready)chatUi.seededPrompt=input.value;updateChatComposer();input.focus();}};
   return options;
 }
 function mountArtifactLibrary(){artifactLibrary?.destroy();artifactLibrary=window.ArtifactWorkspace.mount(byId("artifact-library"),artifactOptions());}

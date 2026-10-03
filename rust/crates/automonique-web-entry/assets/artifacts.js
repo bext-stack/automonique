@@ -48,21 +48,13 @@ function mount(root,options){
  if(f.bytes>32*1048576){box.replaceChildren(el('p','Téléchargez ce fichier pour le consulter ('+bytes(f.bytes)+').','aw-sub'));return;}
  const blob=await fileBytes(a,v.number,f);if(token!==generation)return;
  const html=/\.html?$/i.test(f.path)||f.type==='text/html';
- if(html){const doc=new DOMParser().parseFromString(await blob.text(),'text/html');doc.querySelectorAll('base,meta[http-equiv],iframe,object,embed').forEach(n=>n.remove());
+ if(html){
  async function dataUrl(blob){const data=new Uint8Array(await blob.arrayBuffer());let raw='';for(let i=0;i<data.length;i+=32768)raw+=String.fromCharCode(...data.subarray(i,i+32768));return 'data:'+(blob.type||'application/octet-stream')+';base64,'+btoa(raw);}
- const map=new Map();let budget=32*1048576-f.bytes;
- // Only bundled dependencies are made available. No remote network requests.
- for(const dep of v.files){if(dep.path===f.path||dep.bytes>budget||dep.bytes>8*1048576)continue;budget-=dep.bytes;const data=await fileBytes(a,v.number,dep);if(token!==generation)return;map.set(dep.path,{blob:data,type:dep.type,url:await dataUrl(data)});}
- function pathFor(ref,base){try{const url=new URL(ref,'https://artifact.invalid/'+base);return url.origin==='https://artifact.invalid'?decodeURIComponent(url.pathname.slice(1)):null;}catch{return null;}}
- const resolved=new Map();function resolve(ref,base){if(!ref||ref.startsWith('#')||ref.startsWith('data:'))return ref;const path=pathFor(ref,base);if(path&&resolved.has(path))return resolved.get(path);const item=path&&map.get(path);if(!item)return '';const u=item.url;resolved.set(path,u);return u;}
- function css(text,base){return text.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi,(_,q,ref)=>'url("'+resolve(ref,base)+'")').replace(/@import[^;]+;/gi,'');}
- for(const [path,item] of map){if(item.type==='text/css'||path.endsWith('.css')){const u=await dataUrl(new Blob([css(await item.blob.text(),path)],{type:'text/css'}));resolved.set(path,u);}}
- for(const node of doc.querySelectorAll('script[src],link[rel=stylesheet][href]')){const attr=node.tagName==='SCRIPT'?'src':'href';const item=map.get(pathFor(node.getAttribute(attr),f.path));if(!item){node.remove();continue;}if(attr==='src'){node.removeAttribute('src');node.textContent=await item.blob.text();}else{const style=doc.createElement('style');style.textContent=css(await item.blob.text(),pathFor(node.getAttribute(attr),f.path));node.replaceWith(style);}}
- doc.querySelectorAll('[src],[href],[poster]').forEach(n=>{for(const attr of ['src','href','poster'])if(n.hasAttribute(attr)){const ref=n.getAttribute(attr);if(n.tagName==='A'){if(ref.startsWith('#'))continue;n.removeAttribute(attr);n.setAttribute('title','Consultez les pièces jointes dans la liste des fichiers.');}else n.setAttribute(attr,resolve(ref,f.path));}});
- doc.querySelectorAll('[srcset]').forEach(n=>n.removeAttribute('srcset'));
- doc.querySelectorAll('style').forEach(n=>{n.textContent=css(n.textContent,f.path);});doc.querySelectorAll('[style]').forEach(n=>n.setAttribute('style',css(n.getAttribute('style'),f.path)));
+ const files=[];let budget=32*1048576-f.bytes;
+ for(const dep of v.files){if(dep.path===f.path||dep.bytes>budget||dep.bytes>8*1048576)continue;budget-=dep.bytes;const data=await fileBytes(a,v.number,dep);if(token!==generation)return;files.push({path:dep.path,type:dep.type,url:await dataUrl(data),text:/\.(css|js)$/i.test(dep.path)||/javascript|text\/css/.test(dep.type)?await data.text():''});}
+ const htmlText=await blob.text();if(token!==generation)return;
  const frame=el('iframe');frame.title=a.title+' — aperçu isolé';frame.setAttribute('sandbox','allow-scripts');frame.referrerPolicy='no-referrer';frame.src=options.previewUrl;
- frame.addEventListener('load',()=>frame.contentWindow?.postMessage({type:'artifact-preview',html:'<!doctype html>'+doc.documentElement.outerHTML},'*'),{once:true});box.replaceChildren(frame);
+ frame.addEventListener('load',()=>frame.contentWindow?.postMessage({type:'artifact-preview',html:htmlText,files,entry:f.path},'*'),{once:true});box.replaceChildren(frame);
  }else if(f.type.startsWith('image/')&&f.type!=='image/svg+xml'){const img=el('img');img.alt=f.path;img.src=objectUrl(blob);box.replaceChildren(img);}
  else if(f.type.startsWith('video/')||f.type.startsWith('audio/')){const media=el(f.type.startsWith('video/')?'video':'audio');media.controls=true;media.src=objectUrl(blob);box.replaceChildren(media);}
  else if(f.type.startsWith('text/')||/\.(json|md|csv|txt|js|css|svg)$/i.test(f.path)){box.replaceChildren(el('pre',(await blob.text()).slice(0,500000)));}
