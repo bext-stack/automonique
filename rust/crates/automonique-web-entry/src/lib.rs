@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_auth;
+mod connection_tests;
 mod jev;
 mod mobile_auth;
 mod mobile_task;
@@ -168,6 +169,7 @@ pub enum Route {
     ApiMemorySearch,
     ApiMemoryAction,
     ApiConfiguration,
+    ApiConnectionTest,
     ApiAgentAccounts,
     ApiAgentAccountsAction,
     ApiOperations,
@@ -760,6 +762,7 @@ pub struct WebIntegration {
     github: Mutex<Option<Box<dyn GitHubSurface + Send>>>,
     manage: ManageIntegration,
     mcp: Mutex<McpRegistry>,
+    connection_tests: connection_tests::ConnectionTests,
     pending_manage_actions: Mutex<BTreeMap<String, PendingManageAction>>,
     pending_escalations: Mutex<BTreeMap<String, PendingWebEscalation>>,
     /// Drafted Slack posts awaiting a decision. A row is removed before the
@@ -2437,6 +2440,7 @@ impl WebIntegration {
             github: Mutex::new(github),
             manage,
             mcp: Mutex::new(mcp),
+            connection_tests: connection_tests::ConnectionTests::default(),
             pending_manage_actions: Mutex::new(BTreeMap::new()),
             pending_escalations: Mutex::new(BTreeMap::new()),
             pending_slack_posts: Mutex::new(BTreeMap::new()),
@@ -7173,6 +7177,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/memory/search" => Route::ApiMemorySearch,
                 "/api/memory/action" => Route::ApiMemoryAction,
                 "/api/configuration" => Route::ApiConfiguration,
+                "/api/connections/test" => Route::ApiConnectionTest,
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
@@ -7217,6 +7222,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiMemoryAction
+                    | Route::ApiConnectionTest
                     | Route::ApiAgentAccountsAction
                     | Route::ApiTicketDetail
                     | Route::ApiPlatformCockpit
@@ -7681,6 +7687,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiMemoryAction
         | Route::ApiConfiguration
         | Route::ApiAgentAccounts
+        | Route::ApiConnectionTest
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
         | Route::ApiTicketDetail
@@ -7805,6 +7812,18 @@ fn api_response(
             }
         }
         Route::ApiConfiguration => json_response("200 OK", &integration.configuration()),
+        Route::ApiConnectionTest => {
+            match serde_json::from_slice::<connection_tests::TestRequest>(body) {
+                Ok(request) => match integration
+                    .connection_tests
+                    .run(&integration.state_dir, request.connector)
+                {
+                    Ok(view) => json_response("200 OK", &view),
+                    Err(category) => json_error("409 Conflict", category),
+                },
+                Err(_) => json_error("400 Bad Request", "invalid_json"),
+            }
+        }
         Route::ApiAgentAccounts => match integration.agent_accounts() {
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
@@ -8528,6 +8547,7 @@ fn handle(
             | Route::ApiMemoryAction
             | Route::ApiConfiguration
             | Route::ApiAgentAccounts
+            | Route::ApiConnectionTest
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations
             | Route::ApiTicketDetail
@@ -11914,6 +11934,39 @@ mod tests {
             .as_bytes(),
         );
         assert!(wrong_lane.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn connection_tests_require_authenticated_json_posts() {
+        let body = r#"{"connector":"slack"}"#;
+        let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
+        for (method, auth, content_type, expected) in [
+            (
+                "GET",
+                basic.as_str(),
+                "application/json",
+                "405 Method Not Allowed",
+            ),
+            ("POST", "", "application/json", "401 Unauthorized"),
+            ("POST", basic.as_str(), "text/plain", "400 Bad Request"),
+            (
+                "POST",
+                basic.as_str(),
+                "application/json",
+                "503 Service Unavailable",
+            ),
+        ] {
+            let bytes = format!(
+                "{method} /api/connections/test HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: {auth}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response = exchange_without_integration(bytes.as_bytes());
+            assert!(
+                response.starts_with(format!("HTTP/1.1 {expected}\r\n").as_bytes()),
+                "{method}: {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
     }
 
     #[test]

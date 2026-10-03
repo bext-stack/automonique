@@ -3200,6 +3200,71 @@ fn bounded_field(value: &str, max_bytes: usize) -> String {
     format!("{}{mark}", &value[..end])
 }
 
+/// Verify the configured GitHub credential with a read-only identity request.
+pub(crate) fn test_connection(state_dir: &Path) -> crate::connection_checks::CheckResult {
+    GitHubConfig::load(state_dir)
+        .map_err(|_| "invalid_configuration")?
+        .ok_or("not_configured")?;
+    let token = diagnostic_gh_token()?;
+    let client = GitHubClient::new(GitHubBase::production(), token);
+    match client.whoami() {
+        Ok(reply) if reply.accepted().is_some() => Ok("account_authenticated"),
+        Ok(_) => Err("authentication_rejected"),
+        Err(automonique_github_connector::GitHubFailure::TimedOut) => Err("timed_out"),
+        Err(_) => Err("service_unavailable"),
+    }
+}
+
+// A dashboard check must never wait indefinitely on the native credential helper.
+fn diagnostic_gh_token() -> Result<GitHubToken, &'static str> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let metadata = fs::metadata(GH_EXECUTABLE).map_err(|_| "credentials_unavailable")?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err("credentials_unavailable");
+    }
+    let mut child = Command::new(GH_EXECUTABLE)
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "credentials_unavailable")?;
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("credentials_unavailable");
+            }
+        }
+    };
+    if !status.success() {
+        return Err("credentials_unavailable");
+    }
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or("credentials_unavailable")?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "credentials_unavailable")?;
+    if bytes.len() > 4096 {
+        return Err("credentials_unavailable");
+    }
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    GitHubToken::new(bytes).map_err(|_| "credentials_unavailable")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

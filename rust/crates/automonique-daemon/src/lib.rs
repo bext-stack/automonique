@@ -206,6 +206,7 @@ pub mod cancel_custody;
 pub mod candidate;
 pub mod codex_usage;
 pub mod compose;
+pub mod connection_checks;
 mod control_lock;
 pub mod deepseek_balance;
 pub mod egress;

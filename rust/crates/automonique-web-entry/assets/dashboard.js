@@ -384,6 +384,30 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "Test": "Tester",
+  "Test again": "Retester",
+  "Testing…": "Test en cours…",
+  "Checking connection…": "Vérification de la connexion…",
+  "Checked": "Vérifié à",
+  "servers verified": "serveurs vérifiés",
+  "Bot authentication verified.": "Authentification du bot vérifiée.",
+  "Account authentication verified.": "Authentification du compte vérifiée.",
+  "Support access verified.": "Accès à l’assistance vérifié.",
+  "Tool discovery verified.": "Accès aux outils vérifié.",
+  "Connection is not configured.": "Connexion non configurée.",
+  "Configure an authorized user before testing.": "Configurez un utilisateur autorisé avant de tester.",
+  "Review the connection configuration on the server.": "Vérifiez la configuration de la connexion sur le serveur.",
+  "Reconnect GitHub on the server, then retry.": "Reconnectez GitHub sur le serveur, puis réessayez.",
+  "Authentication rejected. Reconnect and retry.": "Authentification refusée. Reconnectez le compte et réessayez.",
+  "Access refused. Check the connection permissions.": "Accès refusé. Vérifiez les permissions de la connexion.",
+  "Service unavailable. Check access and retry.": "Service indisponible. Vérifiez l’accès et réessayez.",
+  "The connection timed out. Try again.": "Le délai de connexion est dépassé. Réessayez.",
+  "Some MCP servers could not list their tools.": "Certains serveurs MCP n’ont pas pu lister leurs outils.",
+  "MCP discovery timed out before all servers were checked.": "Le délai est dépassé. Certains serveurs MCP n’ont pas été vérifiés.",
+  "The check could not finish. Try again.": "Le test n’a pas pu aboutir. Réessayez.",
+  "Another connection test is running. Try again shortly.": "Un autre test est en cours. Réessayez dans un instant.",
+  "Read-only tests · no messages sent": "Tests en lecture seule · aucun message envoyé",
+
   "Dismiss": "Masquer",
   "The connection was lost. These readings may be out of date.": "La connexion a été perdue. Ces relevés peuvent être périmés.",
   "Sign-in required": "Connexion nécessaire",
@@ -5423,6 +5447,100 @@ function configurationValue(key, value) {
   return String(value);
 }
 
+const connectionTestResults = new Map();
+let connectionTestActive = false;
+const connectionTestReasons = {
+  bot_authenticated: "Bot authentication verified.",
+  account_authenticated: "Account authentication verified.",
+  support_read_verified: "Support access verified.",
+  tools_discovered: "Tool discovery verified.",
+  not_configured: "Connection is not configured.",
+  not_enabled: "Configure an authorized user before testing.",
+  invalid_configuration: "Review the connection configuration on the server.",
+  credentials_unavailable: "Reconnect GitHub on the server, then retry.",
+  authentication_rejected: "Authentication rejected. Reconnect and retry.",
+  request_rejected: "Access refused. Check the connection permissions.",
+  service_unavailable: "Service unavailable. Check access and retry.",
+  timed_out: "The connection timed out. Try again.",
+  discovery_failed: "Some MCP servers could not list their tools.",
+  discovery_timed_out: "MCP discovery timed out before all servers were checked.",
+};
+
+function renderConnectionResult(key, output) {
+  const result = connectionTestResults.get(key);
+  output.replaceChildren();
+  output.hidden = !result;
+  if (!result) return;
+  output.dataset.state = result.ok ? "success" : "error";
+  const message = document.createElement("span");
+  message.textContent = translatePhrase(connectionTestReasons[result.reason] || "The check could not finish. Try again.");
+  output.append(message);
+  if (Number.isSafeInteger(result.servers_passed) && Number.isSafeInteger(result.servers_total)) {
+    const count = document.createElement("span");
+    count.textContent = `${result.servers_passed}/${result.servers_total} ${translatePhrase("servers verified")}`;
+    output.append(count);
+  }
+  if (Number.isSafeInteger(result.checked_at_ms) && result.checked_at_ms > 0) {
+    const time = document.createElement("time");
+    time.dateTime = new Date(result.checked_at_ms).toISOString();
+    time.textContent = `${translatePhrase("Checked")} ${new Intl.DateTimeFormat(localeTag(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(result.checked_at_ms)}`;
+    time.title = new Date(result.checked_at_ms).toLocaleString(localeTag());
+    output.append(time);
+  }
+}
+
+function addConnectionTest(row, detail, key) {
+  if (!["slack", "telegram", "github", "support", "mcp"].includes(key)) return;
+  row.dataset.connection = key;
+  row.classList.add("connection-row");
+  detail.classList.add("connection-state");
+  const controls = document.createElement("dd");
+  controls.className = "connection-controls";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "connection-test-button";
+  button.dataset.connectionTest = key;
+  button.disabled = connectionTestActive;
+  button.textContent = translatePhrase("Test");
+  const name = { slack: "Slack", telegram: "Telegram", github: "GitHub", support: translatePhrase("Support"), mcp: "MCP" }[key];
+  button.setAttribute("aria-label", `${translatePhrase("Test")} ${name}`);
+  const output = document.createElement("dd");
+  output.className = "connection-test-result";
+  output.setAttribute("role", "status");
+  output.setAttribute("aria-live", "polite");
+  renderConnectionResult(key, output);
+  button.addEventListener("click", async () => {
+    if (connectionTestActive) return;
+    connectionTestActive = true;
+    document.querySelectorAll("[data-connection-test]").forEach((item) => { item.disabled = true; });
+    button.textContent = translatePhrase("Testing…");
+    button.setAttribute("aria-busy", "true");
+    output.hidden = false;
+    output.dataset.state = "pending";
+    output.textContent = translatePhrase("Checking connection…");
+    try {
+      const result = await api("/api/connections/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connector: key }), signal: AbortSignal.timeout(25000),
+      });
+      if (result.connector !== key || typeof result.ok !== "boolean") throw new Error("invalid_response");
+      connectionTestResults.set(key, result);
+      renderConnectionResult(key, output);
+    } catch (error) {
+      connectionTestResults.delete(key);
+      output.dataset.state = "error";
+      output.textContent = translatePhrase(error.message === "connection_test_busy" ? "Another connection test is running. Try again shortly." : "The check could not finish. Try again.");
+    } finally {
+      connectionTestActive = false;
+      document.querySelectorAll("[data-connection-test]").forEach((item) => { item.disabled = false; });
+      button.textContent = translatePhrase("Test again");
+      button.removeAttribute("aria-busy");
+    }
+  });
+  controls.append(button);
+  row.append(controls, output);
+}
+
 function renderConfigSection(title, values) {
   const metadata = configurationSectionMeta[title] || { category: "security", description: "Effective runtime configuration." };
   const card = document.createElement("article");
@@ -5456,7 +5574,7 @@ function renderConfigSection(title, values) {
     const row = document.createElement("div");
     if (/(seconds|bytes|count|depth|limit)/.test(key)) row.dataset.configTechnical = "true";
     const term = document.createElement("dt");
-    term.textContent = label(key);
+    term.textContent = key === "github" ? "GitHub" : label(key);
     const detail = document.createElement("dd");
     detail.textContent = configurationValue(key, value);
     if (typeof value === "boolean") detail.className = value ? "boolean-true" : "boolean-false";
@@ -5464,12 +5582,13 @@ function renderConfigSection(title, values) {
       detail.className = value === "authenticated" ? "auth-good" : value === "configured_unverified" ? "auth-warning" : "auth-danger";
     }
     row.append(term, detail);
+    if (title === "Connectors") addConnectionTest(row, detail, key);
     list.append(row);
   });
   const footer = document.createElement("div");
   footer.className = "config-card-footer";
   const scope = document.createElement("small");
-  scope.textContent = "From the server · no secrets";
+  scope.textContent = title === "Connectors" ? "Read-only tests · no messages sent" : "From the server · no secrets";
   const action = document.createElement("button");
   action.className = "config-inline-action";
   action.type = "button";

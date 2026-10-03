@@ -344,6 +344,14 @@ fn method_url(
     bot_id: i64,
     method: WireMethod,
 ) -> Result<String, HttpFailure> {
+    Ok(format!(
+        "{}/{}",
+        bot_url(authorization, bot_id)?,
+        method.as_str()
+    ))
+}
+
+fn bot_url(authorization: &TelegramAuthorization<'_>, bot_id: i64) -> Result<String, HttpFailure> {
     authorization.with_secret(|secret| {
         let token = std::str::from_utf8(secret).map_err(|_| HttpFailure::Unavailable)?;
         let (token_bot, token_secret) = token.split_once(':').ok_or(HttpFailure::Unavailable)?;
@@ -355,7 +363,7 @@ fn method_url(
         {
             return Err(HttpFailure::Unavailable);
         }
-        Ok(format!("{TELEGRAM_ORIGIN}/bot{token}/{}", method.as_str()))
+        Ok(format!("{TELEGRAM_ORIGIN}/bot{token}"))
     })
 }
 
@@ -1522,6 +1530,66 @@ fn unix_millis() -> Result<i64, HttpFailure> {
         .map_err(|_| HttpFailure::Unavailable)?
         .as_millis();
     i64::try_from(millis).map_err(|_| HttpFailure::Unavailable)
+}
+
+impl TelegramHttpsClient {
+    /// Explicit read-only diagnostic. Does not acquire a poller lease, consume
+    /// updates, or enter the outbound message queue. No identity leaves this call.
+    pub fn check_identity(
+        &mut self,
+        token: &OpaqueBotToken,
+        bot_id: i64,
+    ) -> Result<bool, HttpFailure> {
+        let prepared = PreparedRequest {
+            url: format!(
+                "{}/getMe",
+                bot_url(&TelegramAuthorization(&token.0), bot_id)?
+            ),
+            body: "{}".to_owned(),
+        };
+        let response = self.post(&prepared, Duration::from_secs(8), &CancellationToken::new())?;
+        Ok(identity_matches(&response.body, bot_id))
+    }
+}
+
+fn identity_matches(body: &[u8], bot_id: i64) -> bool {
+    let Ok(value) = automonique_connector_substrate::json::strict_json(body) else {
+        return false;
+    };
+    value.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && value.pointer("/result/id").and_then(|value| value.as_i64()) == Some(bot_id)
+        && value
+            .pointer("/result/is_bot")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+}
+
+#[cfg(test)]
+mod identity_checks {
+    use super::*;
+    #[test]
+    fn requires_success_and_the_expected_bot() {
+        let body = br#"{"ok":true,"result":{"id":123,"is_bot":true,"username":"private"}}"#;
+        assert!(identity_matches(body, 123));
+        assert!(!identity_matches(body, 456));
+        assert!(!identity_matches(
+            br#"{"ok":false,"result":{"id":123,"is_bot":true}}"#,
+            123
+        ));
+        assert!(!identity_matches(
+            br#"{"ok":true,"result":{"id":123,"is_bot":false}}"#,
+            123
+        ));
+        assert!(!identity_matches(b"invalid", 123));
+    }
+    #[test]
+    fn rejects_mismatched_credentials_before_network() {
+        let token = OpaqueBotToken::new(b"123:synthetic".to_vec()).unwrap();
+        assert_eq!(
+            TelegramHttpsClient::new().check_identity(&token, 456),
+            Err(HttpFailure::Unavailable)
+        );
+    }
 }
 
 #[cfg(test)]

@@ -6754,6 +6754,25 @@ fn streaming_is_unsupported(rejection: &SlackRejection) -> bool {
     )
 }
 
+/// Authenticate the configured bot without posting or opening a socket.
+pub(crate) fn test_connection(state_dir: &Path) -> crate::connection_checks::CheckResult {
+    let config = SlackConfig::load(state_dir)
+        .map_err(|_| "invalid_configuration")?
+        .ok_or("not_configured")?;
+    let client = SlackClient::with_request_timeout(
+        SlackBase::production(),
+        config.token,
+        Duration::from_secs(8),
+    );
+    match client.auth_test() {
+        Ok(SlackOutcome::Accepted(_)) => Ok("bot_authenticated"),
+        Ok(SlackOutcome::Rejected(_)) => Err("authentication_rejected"),
+        Err(SlackFailure::TimedOut) => Err("timed_out"),
+        Err(SlackFailure::Unauthorized) => Err("authentication_rejected"),
+        Err(_) => Err("service_unavailable"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;

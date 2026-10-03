@@ -1169,6 +1169,16 @@ html[data-health="unavailable"] .attention-bar { background: color-mix(in srgb, 
 .config-list dd.boolean-false { color: var(--quiet); }
 .config-list dd.auth-warning { color: var(--amber); }
 .config-list dd.auth-danger { color: var(--red); }
+.config-list > .connection-row { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; column-gap: 12px; row-gap: 5px; padding: 8px 0; }
+.connection-test-button { padding: 4px 9px; min-height: 30px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--text); font-size: var(--font-xs); white-space: nowrap; }
+.connection-test-button:hover:enabled { background: var(--hover-surface); }
+.connection-test-button:disabled { opacity: .55; cursor: wait; }
+.config-list .connection-test-result { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px 10px; white-space: normal; line-height: 1.5; font-weight: 400; }
+.config-list .connection-test-result[hidden] { display: none; }
+.connection-test-result[data-state="success"] { color: var(--green); }
+.connection-test-result[data-state="error"] { color: var(--red); }
+.connection-test-result[data-state="pending"], .connection-test-result time { color: var(--muted); }
+.connection-test-result time { margin-left: auto; font-variant-numeric: tabular-nums; }
 html[data-config-details="concise"] .config-list [data-config-technical="true"] { display: none; }
 .config-card-footer { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin: 0 -16px; padding: 8px 16px; border-top: 1px solid var(--line); }
 .config-card-footer small { color: var(--quiet); font-size: var(--font-2xs); }
