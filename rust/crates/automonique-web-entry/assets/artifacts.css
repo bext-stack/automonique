@@ -3,3 +3,5 @@
 .aw select{height:auto;min-height:40px;line-height:1.4}.aw-details-title{max-width:none}.aw-details-title>div:first-child{max-width:900px}
 
 .aw-aside input[type=search]{width:100%;margin-bottom:8px}
+
+.aw h1[tabindex="-1"]:focus{outline:none}

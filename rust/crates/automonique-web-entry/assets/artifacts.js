@@ -30,7 +30,7 @@ function mount(root,options){
  if(projects.length)toolbar.append(select([['all','Tous les projets'],...projects.map(v=>[v,v])],projectFilter,v=>{projectFilter=v;draw();},'Projet'));
  if(types.length>1)toolbar.append(select([['all','Tous les formats'],...types.map(v=>[v,v])],typeFilter,v=>{typeFilter=v;draw();},'Format'));
  toolbar.append(count,button('Actualiser',reload));root.append(toolbar,list);draw();}
- async function load(id){cleanup();const d=await api({action:'get',id});current=d.artifact;version=current.versions.at(-1).number;selected=current.versions.at(-1).entry;detail();options.onOpen?.(current);}
+ async function load(id){cleanup();const d=await api({action:'get',id});current=d.artifact;version=current.versions.at(-1).number;selected=current.versions.at(-1).entry;detail();const heading=root.querySelector("h1");if(heading){heading.tabIndex=-1;heading.focus({preventScroll:true});}const dialog=root.closest("dialog");if(dialog)dialog.scrollTop=0;else window.scrollTo({top:0,behavior:"instant"});options.onOpen?.(current);}
  async function fileBytes(a,v,f){const pieces=[];for(let i=0;i<f.chunks;i++){const d=await api({action:'read',id:a.id,version:v,path:f.path,index:i});const raw=atob(d.content_base64);const b=Uint8Array.from(raw,c=>c.charCodeAt(0));if(b.length!==d.bytes)throw new Error('request_failed');if(globalThis.crypto?.subtle){const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',b))).map(x=>x.toString(16).padStart(2,'0')).join('');if(hash!==d.sha256)throw new Error('request_failed');}pieces.push(b);}return new Blob(pieces,{type:f.type});}
  async function downloadBundle(a,v){
   // Store-mode ZIP: no dependency or server-side public copy is needed.
@@ -64,6 +64,7 @@ function mount(root,options){
  if(a.can_manage)actions.append(button('Nouvelle version',()=>uploadForm(a)));
  const shareUrl=(options.publicBase||'')+a.url;
  if(options.publicBase && options.publicBase!==location.origin)actions.append(link('Ouvrir dans Share ↗',shareUrl));
+ if(a.legacy_url && a.visibility==='public')actions.append(link('Original historique ↗',(options.publicBase||'')+a.legacy_url+a.versions[0].entry));
  actions.append(button('Télécharger le bundle',()=>downloadBundle(a,v)));
  actions.append(button('Copier le lien',async()=>{await navigator.clipboard.writeText(shareUrl);const n=el('p',a.visibility==='private'?'Lien copié · connexion requise':'Lien public copié','aw-progress');root.prepend(n);}));
  if(options.onRevise)actions.append(button('Demander des modifications',()=>options.onRevise(a,v)));
