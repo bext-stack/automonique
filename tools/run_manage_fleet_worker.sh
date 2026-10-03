@@ -717,8 +717,8 @@ publish_process_snapshot() {
         --arg provider "$selected_provider" \
         --arg auth "$(auth_health_status)" \
         --arg fleet_base "${fleet_base%/}" \
-        --argjson issue_links "$issue_links" \
-        --argjson output_map "$output_map" \
+        --slurpfile issue_links <(printf '%s' "$issue_links") \
+        --slurpfile output_map <(printf '%s' "$output_map") \
         --argjson concurrency "$max_concurrency" \
         --argjson observed "$observed_at" '
         def safe_text($limit):
@@ -773,7 +773,7 @@ publish_process_snapshot() {
                 status: (.status | safe_state),
                 source: (.source | safe_state),
                 issue_id: (.issue_id | safe_id),
-                issue_url: $issue_links[.id],
+                issue_url: $issue_links[0][.id],
                 manage_url: (if (.issue_id | type) == "string"
                     and (.issue_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
                     then ($fleet_base + "/manage/ai-operations/issues?issue=" + .issue_id)
@@ -790,15 +790,15 @@ publish_process_snapshot() {
                 decision_count: (if (.decisions | type) == "array" then (.decisions | length) else 0 end),
                 created_at: (.created_at | safe_text(64)),
                 updated_at: (.updated_at | safe_text(64)),
-                output: (($output_map[.id] // []) as $live
+                output: (($output_map[0][.id] // []) as $live
                     | (.result | output_text) as $final
-                    | if ($live | length) > 0 then $live[-12:]
-                      elif $final != null then [{
-                        at_ms: $observed,
+                    | if (.status == "done" or .status == "failed" or .status == "cancelled") and $final != null then ($live[-11:] + [{
+                        at_ms: (try (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 * 1000) catch $observed),
                         kind: "final",
                         text: $final,
                         truncated: ((.result | length) > 1000)
-                      }]
+                      }])
+                      elif ($live | length) > 0 then $live[-12:]
                       else [] end)
             } | select(.id != null)]
                 | sort_by(.updated_at // "") | reverse | .[:100]

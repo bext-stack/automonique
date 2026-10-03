@@ -30,6 +30,28 @@ provenance is `modified` or `unknown` unless `--allow-unattributable` is given.
 permissive mode and stops at `release.permissive-mode` before it reaches the
 digest cross-check that makes it useful.
 
+## Fleet worker only
+
+For a change confined to `tools/run_manage_fleet_worker.sh`, deploy the worker
+independently of the daemon. Require a clean committed source tree, passing
+worker tests, and a fresh Manage snapshot with no running jobs assigned to the
+worker. Cross-check its service cgroup before restarting it.
+
+Install the script as `bin/automonique-manage-worker` under a new immutable
+`<state>/manage-worker/releases/<source-sha>-<script-sha>/` directory, mode 0700.
+Write a mode-0600 `manifest.json` containing `source_sha` and `script_sha256`.
+Verify the installed digest, retain the previous service command and any
+existing drop-in, then atomically replace `current` with the new release link.
+Set a user-service `ExecStart` override to
+`<state>/manage-worker/current/bin/automonique-manage-worker`; reload systemd
+and restart only the fleet worker. Keep its environment and drain policy.
+
+Require the worker to remain active and to publish a new `processes.json`
+with a recent observation timestamp and the expected Manage job states.
+Check the journal for publisher errors. If either check fails, restore the
+previous link and service override and restart the worker. This procedure
+does not reload or restart the Automonique daemon.
+
 ## Daemon
 
 ```

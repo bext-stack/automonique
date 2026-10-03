@@ -19,8 +19,14 @@ let memorySort = "updated_desc";
 let memoryMode = storedPreference("monique-memory-view", ["graph", "list", "timeline"], "list");
 let selectedMemoryReference = null;
 let memoryQuery = null;
+let memoryReview = "all";
+let memoryLoadSequence = 0;
+let memoryEditorEntry = null;
+let memoryConfirmation = null;
+let memorySaving = false;
 let operationsSnapshot = null;
 let processesSnapshot = null;
+let processesLoadSequence = 0;
 let platformSnapshot = null;
 let cockpitSnapshot = null;
 let platformSelectedSession = null;
@@ -128,7 +134,7 @@ function consoleCapList(root, key, attribute, selectedValue, limit = 20) {
 // running agent job on that session, or its workspace reporting "working".
 function consoleSessionWorking(sessionId) {
   if (!sessionId) return false;
-  const running = (processesSnapshot?.jobs || []).some((job) => job.status === "running" && job.session_id === sessionId);
+  const running = (processesSnapshot?.jobs || []).some((job) => processDisplayStatus(job) === "running" && job.session_id === sessionId);
   const workspace = (cockpitPresentation?.workspaces || []).some((item) => item.attention === "working" && (item.session_ids || []).includes(sessionId));
   return running || workspace;
 }
@@ -687,6 +693,48 @@ const frenchUi = Object.freeze({
   "Next review": "Prochain réexamen",
   "No review scheduled": "Aucun réexamen planifié",
   "Review due": "Réexamen requis",
+  "Add memory": "Ajouter un souvenir",
+  "Edit memory": "Modifier le souvenir",
+  "Save memory": "Enregistrer le souvenir",
+  "Export results": "Exporter les résultats",
+  "Any review date": "Toutes les dates de réexamen",
+  "Needs review": "À réexaminer",
+  "Unscheduled": "Non planifié",
+  "Close editor": "Fermer l’éditeur",
+  "Content": "Contenu",
+  "Certainty (%)": "Certitude (%)",
+  "User preference": "Préférence utilisateur",
+  "Event": "Événement",
+  "Personal": "Personnel",
+  "Restricted": "Restreint",
+  "Only me": "Moi uniquement",
+  "Everyone in this tenant": "Tout le monde dans cet espace",
+  "Forget": "Oublier",
+  "Expires": "Expiration",
+  "Never": "Jamais",
+  "Replaced by": "Remplacé par",
+  "What should Monique remember?": "Que doit retenir Monique ?",
+  "Save a stable fact or preference for future conversations.": "Enregistrez un fait stable ou une préférence pour les prochaines conversations.",
+  "Save a stable fact or preference for future conversations. It will be active immediately.": "Enregistrez un fait stable ou une préférence pour les prochaines conversations. Il sera actif immédiatement.",
+  "Saving keeps the previous version as a replaced record. Approval status is preserved. Choose a future review date or leave it empty.": "L’enregistrement conserve la version précédente et l’état d’approbation. Choisissez une date de réexamen future ou laissez ce champ vide.",
+  "This proposal will become active and available in future conversations.": "Cette proposition deviendra active et disponible dans les prochaines conversations.",
+  "This memory will be excluded from future recall. Its content and audit history remain available as a deleted record.": "Ce souvenir ne sera plus utilisé. Son contenu et son historique restent disponibles dans les éléments supprimés.",
+  "This memory changed elsewhere. Your draft is still here. Cancel and refresh before trying again.": "Ce souvenir a été modifié ailleurs. Votre brouillon est conservé. Annulez et actualisez avant de réessayer.",
+  "This memory is unavailable or belongs to another author. Refresh the list.": "Ce souvenir est indisponible ou appartient à un autre auteur. Actualisez la liste.",
+  "Check the content, certainty, and future review date. Content must fit within 8 KB.": "Vérifiez le contenu, la certitude et la date de réexamen future. Le contenu est limité à 8 Ko.",
+  "The change could not be confirmed. Your draft is still here. Refresh the list before retrying.": "La modification n’a pas pu être confirmée. Votre brouillon est conservé. Actualisez la liste avant de réessayer.",
+  "Memory unavailable. Refresh to try again.": "Mémoire indisponible. Actualisez pour réessayer.",
+  "Status unconfirmed": "État non confirmé",
+  "Out-of-date snapshot": "Données périmées",
+  "Saved agent output": "Sortie de l’agent conservée",
+  "Last reported status": "Dernier état signalé",
+  "Snapshot": "Relevé",
+  "This snapshot is out of date. The last reported status is shown in Details; current execution is unconfirmed.": "Ce relevé est périmé. Le dernier état signalé figure dans les détails ; l’exécution actuelle n’est pas confirmée.",
+  "Memory added.": "Souvenir ajouté.",
+  "Memory updated. Previous version retained.": "Souvenir modifié. Version précédente conservée.",
+  "Memory approved.": "Souvenir approuvé.",
+  "Proposal rejected.": "Proposition rejetée.",
+  "Memory removed from recall.": "Souvenir retiré du rappel.",
   "Copy content": "Copier le contenu",
   "Ask Monique": "Demander à Monique",
   "Memory content copied.": "Contenu de la mémoire copié.",
@@ -1736,6 +1784,11 @@ function translatePhraseForFrench(value) {
   const source = String(value);
   if (frenchUi[source]) return frenchUi[source];
   const replacements = [
+    [/^Saved output · (.+) events$/, (match) => `Sortie conservée · ${match[1]} événements`],
+    [/^Edit (M-\d+)$/, (match) => `Modifier ${match[1]}`],
+    [/^(Approve|Reject|Forget) (M-\d+)\?$/, (match) => `${{ Approve: "Approuver", Reject: "Rejeter", Forget: "Oublier" }[match[1]]} ${match[2]} ?`],
+    [/^(\d+) memories exported\. This is a filtered export, not a database backup\.$/, (match) => `${match[1]} souvenirs exportés. Cet export filtré n’est pas une sauvegarde de la base de données.`],
+
     [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
     [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
@@ -2155,8 +2208,8 @@ function attention(status) {
   if ((status.outbox_ambiguous || 0) > 0) add("ambiguous", "Some messages may not have been sent", `${count(status.outbox_ambiguous)} message(s) have an unclear delivery result.`);
   if (status.provider_available === false) add("provider", "AI provider unavailable", "Monique cannot reach its AI provider.");
   if (status.accepting_intake === false) add("intake", "Not accepting new work", "Monique is not taking new requests right now.");
-  if (processesSnapshot?.health === "stale") add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
-  const manageJobs = Array.isArray(processesSnapshot?.jobs) && ["ready", "degraded"].includes(processesSnapshot.health) ? processesSnapshot.jobs : [];
+  if (processesSnapshot && processesSnapshot.health !== "unavailable" && !processSnapshotIsFresh()) add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
+  const manageJobs = Array.isArray(processesSnapshot?.jobs) && processSnapshotIsFresh() ? processesSnapshot.jobs : [];
   const awaitingApproval = manageJobs.filter((job) => job.status === "pending_approval");
   if (awaitingApproval.length > 0) {
     add(
@@ -2428,6 +2481,13 @@ function selectedMemoryEntries() {
     .filter((entry) => memoryKind === "all" || entry.kind === memoryKind)
     .filter((entry) => memoryStatus === "all" || entry.status === memoryStatus)
     .filter((entry) => memorySensitivity === "all" || entry.sensitivity === memorySensitivity)
+    .filter((entry) => {
+      if (memoryReview === "all") return true;
+      const review = entry.review_at_ms;
+      if (memoryReview === "none") return review == null;
+      if (!["active", "candidate"].includes(entry.status)) return false;
+      return Number.isSafeInteger(review) && (memoryReview === "due" ? review <= Date.now() : review > Date.now());
+    })
     .sort((left, right) => {
       if (memorySort === "confidence_desc") return right.confidence - left.confidence || right.updated_at_ms - left.updated_at_ms;
       if (memorySort === "review_asc") return (left.review_at_ms ?? Number.MAX_SAFE_INTEGER) - (right.review_at_ms ?? Number.MAX_SAFE_INTEGER) || right.updated_at_ms - left.updated_at_ms;
@@ -2485,7 +2545,7 @@ function renderMemory(view) {
   byId("memory-candidates").textContent = count(view.counts?.candidates);
   byId("memory-superseded").textContent = count(view.counts?.superseded);
   byId("memory-deleted").textContent = count(view.counts?.deleted);
-  byId("memory-review-due").textContent = count(entries.filter((entry) => Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
+  byId("memory-review-due").textContent = count(entries.filter((entry) => ["active", "candidate"].includes(entry.status) && Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
   byId("memory-messages").textContent = count(view.counts?.messages);
   memoryKind = updateMemoryFacet("memory-kind", entries, "kind", "All types", memoryKind);
   memoryStatus = updateMemoryFacet("memory-status", entries, "status", "All statuses", memoryStatus);
@@ -2499,12 +2559,13 @@ function renderSelectedMemory() {
   const entries = selectedMemoryEntries();
   if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
   const query = memoryQuery ? ` for “${memoryQuery}”` : "";
-  byId("memory-result-label").textContent = `${count(entries.length)} ${entries.length === 1 ? "memory" : "memories"}${query}`;
+  byId("memory-result-label").textContent = `${count(entries.length)} ${entries.length === 1 ? "memory" : "memories"}${query}${memorySnapshot?.truncated ? " · Limited to 4,096 records. Search to narrow results." : ""}`;
+  byId("memory-export").disabled = entries.length === 0;
   renderMemoryList(entries);
   renderMemoryGraph(entries);
   renderMemoryTimeline(entries);
   renderMemoryInspector(entries.find((entry) => entry.reference === selectedMemoryReference) || null);
-  byId("memory-reset").disabled = memoryKind === "all" && memoryStatus === "all" && memorySensitivity === "all" && memorySort === "updated_desc";
+  byId("memory-reset").disabled = memoryKind === "all" && memoryStatus === "all" && memorySensitivity === "all" && memorySort === "updated_desc" && memoryReview === "all" && !memoryQuery;
 }
 
 function memoryEmpty(message) {
@@ -2695,6 +2756,8 @@ function renderMemoryInspector(entry) {
     ["Privacy", consoleSentence(entry.sensitivity)],
     ["Visible to", consoleSentence(entry.visibility)],
     ["Version", String(entry.revision)],
+    ["Expires", entry.expires_at_ms ? memoryDateLabel(entry.expires_at_ms) : "Never"],
+    ["Replaced by", entry.superseded_by || "—"],
   ].forEach(([labelText, value]) => facts.append(memoryInspectorFact(labelText, value)));
   const actions = document.createElement("div");
   actions.className = "memory-inspector-actions";
@@ -2716,23 +2779,148 @@ function renderMemoryInspector(entry) {
   ask.textContent = "Ask assistant";
   ask.dataset.openChat = `Review memory evidence ${entry.reference}. Explain what it establishes, its provenance and confidence, whether it needs review, and how it should influence current work.`;
   actions.append(copy, ask);
+  if (entry.editable) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "button primary";
+    edit.textContent = "Edit memory";
+    edit.addEventListener("click", () => openMemoryEditor(entry));
+    actions.prepend(edit);
+    for (const action of entry.status === "candidate" ? ["approve", "deny"] : ["forget"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button secondary";
+      button.textContent = { approve: "Approve", deny: "Reject", forget: "Forget" }[action];
+      button.addEventListener("click", () => confirmMemoryAction(entry, action));
+      actions.append(button);
+    }
+  }
   root.append(head, content, confidence, facts, actions);
 }
 
 async function loadMemory(query = null) {
+  const sequence = ++memoryLoadSequence;
   memoryQuery = query?.trim() || null;
   byId("memory-clear").hidden = memoryQuery === null;
   byId("memory-result-label").textContent = memoryQuery ? "Searching…" : "Loading…";
+  byId("memory-export").disabled = true;
   try {
     const view = memoryQuery === null
       ? await api("/api/memory")
       : await api("/api/memory/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: memoryQuery }) });
+    if (sequence !== memoryLoadSequence) return;
     renderMemory(view);
   } catch (error) {
-    byId("memory-result-label").textContent = `Memory unavailable · ${error.message}`;
+    if (sequence !== memoryLoadSequence) return;
+    renderMemory({ entries: [], counts: {} });
+    byId("memory-result-label").textContent = "Memory unavailable. Refresh to try again.";
     toast("Memory retrieval is unavailable.", "error");
   }
 }
+
+function openMemoryEditor(entry = null) {
+  memoryEditorEntry = entry;
+  byId("memory-editor-form").reset();
+  byId("memory-editor-title").textContent = entry ? `Edit ${entry.reference}` : "Add memory";
+  byId("memory-editor-help").textContent = entry
+    ? "Saving keeps the previous version as a replaced record. Approval status is preserved. Choose a future review date or leave it empty."
+    : "Save a stable fact or preference for future conversations. It will be active immediately.";
+  byId("memory-edit-content").value = entry?.content || "";
+  byId("memory-edit-kind").value = entry?.kind || "user_profile";
+  byId("memory-edit-confidence").value = (entry?.confidence ?? 1000) / 10;
+  byId("memory-edit-sensitivity").value = entry?.sensitivity || "personal";
+  byId("memory-edit-visibility").value = entry?.visibility || "private";
+  const tomorrow = new Date(Date.now() + 86400000).toLocaleDateString("en-CA");
+  byId("memory-edit-review").min = tomorrow;
+  if (entry?.review_at_ms > Date.now()) {
+    byId("memory-edit-review").value = new Date(entry.review_at_ms).toLocaleDateString("en-CA");
+  }
+  byId("memory-editor-error").hidden = true;
+  byId("memory-editor").showModal();
+  byId("memory-edit-content").focus();
+}
+
+function confirmMemoryAction(entry, action) {
+  memoryConfirmation = { entry, action };
+  const verb = { approve: "Approve", deny: "Reject", forget: "Forget" }[action];
+  byId("memory-confirm-title").textContent = `${verb} ${entry.reference}?`;
+  byId("memory-confirm-submit").textContent = verb;
+  byId("memory-confirm-help").textContent = action === "approve"
+    ? "This proposal will become active and available in future conversations."
+    : "This memory will be excluded from future recall. Its content and audit history remain available as a deleted record.";
+  byId("memory-confirm-content").textContent = entry.content;
+  byId("memory-confirm-error").hidden = true;
+  byId("memory-confirm").showModal();
+}
+
+function memoryActionError(error) {
+  if (error.message === "memory_revision_stale" || error.message === "memory_conflict") return "This memory changed elsewhere. Your draft is still here. Cancel and refresh before trying again.";
+  if (error.message === "memory_not_found") return "This memory is unavailable or belongs to another author. Refresh the list.";
+  if (error.message === "memory_field_invalid") return "Check the content, certainty, and future review date. Content must fit within 8 KB.";
+  return "The change could not be confirmed. Your draft is still here. Refresh the list before retrying.";
+}
+
+async function saveMemoryAction(payload, dialogId, errorId) {
+  if (memorySaving) return;
+  memorySaving = true;
+  const dialog = byId(dialogId);
+  dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  byId(errorId).hidden = true;
+  try {
+    const entry = await api("/api/memory/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    dialog.close();
+    selectedMemoryReference = entry.reference;
+    memoryKind = memoryStatus = memorySensitivity = memoryReview = "all";
+    byId("memory-review").value = "all";
+    byId("memory-query").value = "";
+    await loadMemory(null);
+    if (memorySnapshot?.entries.some((item) => item.reference === entry.reference)) consoleOpenMemory(entry.reference);
+    toast({ create: "Memory added.", edit: "Memory updated. Previous version retained.", approve: "Memory approved.", deny: "Proposal rejected.", forget: "Memory removed from recall." }[payload.action]);
+  } catch (error) {
+    byId(errorId).textContent = memoryActionError(error);
+    byId(errorId).hidden = false;
+  } finally {
+    memorySaving = false;
+    dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+byId("memory-editor-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const review = byId("memory-edit-review").value;
+  saveMemoryAction({
+    action: memoryEditorEntry ? "edit" : "create",
+    ...(memoryEditorEntry ? { reference: memoryEditorEntry.reference, revision: memoryEditorEntry.revision } : {}),
+    content: byId("memory-edit-content").value,
+    kind: byId("memory-edit-kind").value,
+    confidence: Math.round(Number(byId("memory-edit-confidence").value) * 10),
+    sensitivity: byId("memory-edit-sensitivity").value,
+    visibility: byId("memory-edit-visibility").value,
+    review_at_ms: review ? new Date(`${review}T00:00:00`).getTime() : null,
+  }, "memory-editor", "memory-editor-error");
+});
+byId("memory-confirm-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!memoryConfirmation) return;
+  const { entry, action } = memoryConfirmation;
+  saveMemoryAction({ action, reference: entry.reference, revision: entry.revision }, "memory-confirm", "memory-confirm-error");
+});
+document.querySelectorAll("[data-memory-close]").forEach((button) => button.addEventListener("click", () => byId(button.dataset.memoryClose).close()));
+["memory-editor", "memory-confirm"].forEach((id) => byId(id).addEventListener("cancel", (event) => { if (memorySaving) event.preventDefault(); }));
+byId("memory-create").addEventListener("click", () => openMemoryEditor());
+byId("memory-refresh").addEventListener("click", () => loadMemory(memoryQuery));
+byId("memory-review").addEventListener("change", (event) => { memoryReview = event.target.value; renderSelectedMemory(); });
+byId("memory-export").addEventListener("click", () => {
+  const entries = selectedMemoryEntries();
+  const blob = new Blob([JSON.stringify({ schema: "automonique.memory-export/v1", exported_at: new Date().toISOString(), query: memoryQuery, truncated: Boolean(memorySnapshot?.truncated), filters: { kind: memoryKind, status: memoryStatus, sensitivity: memorySensitivity, review: memoryReview }, entries }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `monique-memory-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`${entries.length} memories exported. This is a filtered export, not a database backup.`);
+});
 
 byId("memory-search").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -2767,11 +2955,14 @@ byId("memory-reset").addEventListener("click", () => {
   memoryStatus = "all";
   memorySensitivity = "all";
   memorySort = "updated_desc";
+  memoryReview = "all";
+  byId("memory-review").value = "all";
+  byId("memory-query").value = "";
   byId("memory-kind").value = memoryKind;
   byId("memory-status").value = memoryStatus;
   byId("memory-sensitivity").value = memorySensitivity;
   byId("memory-sort").value = memorySort;
-  renderSelectedMemory();
+  loadMemory(null);
 });
 document.querySelectorAll("[data-memory-mode]").forEach((button) => button.addEventListener("click", () => {
   setMemoryMode(button.dataset.memoryMode);
@@ -2793,13 +2984,25 @@ function operationsMessage(health) {
 }
 
 function processStatusLabel(status) {
-  const labels = { pending: "Queued in Manage", pending_approval: "Waiting for approval", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", authenticated: "Signed in" };
+  const labels = { pending: "Queued in Manage", pending_approval: "Waiting for approval", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", unconfirmed: "Status unconfirmed", authenticated: "Signed in" };
   return labels[status] || operationLabel(status);
+}
+
+function processSnapshotIsFresh(view = processesSnapshot) {
+  return ["ready", "degraded"].includes(view?.health)
+    && Number.isSafeInteger(view?.observed_at_ms)
+    && view.observed_at_ms <= Date.now() + 5000
+    && Date.now() - view.observed_at_ms <= 90000;
+}
+
+function processDisplayStatus(job) {
+  return !processSnapshotIsFresh() && !["done", "failed", "cancelled"].includes(job.status)
+    ? "unconfirmed" : job.status;
 }
 
 function processMatches(job, filter) {
   if (filter === "all") return true;
-  if (filter === "active") return job.status === "running";
+  if (filter === "active") return processDisplayStatus(job) === "running";
   if (filter === "queued") return job.status === "pending";
   if (filter === "approval") return job.status === "pending_approval";
   if (filter === "completed") return job.status === "done";
@@ -2866,12 +3069,12 @@ function renderProcessWorker(worker, health) {
   identity.append(orb, copy);
   const status = document.createElement("span");
   status.className = `process-worker-status status-${worker.status}`;
-  status.textContent = worker.status.toUpperCase();
+  status.textContent = health === "stale" ? "OUT OF DATE" : worker.status.toUpperCase();
   const facts = document.createElement("div");
   facts.className = "process-worker-facts";
   [
     ["Model", worker.model],
-    ["Busy", `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
+    ["Busy", health === "stale" ? translatePhrase("Status unconfirmed") : `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
     ["Seen", processTimeLabel(worker.last_seen_at), worker.last_seen_at],
   ].forEach(([labelText, value, exact]) => facts.append(processDetail(labelText, value, exact)));
   root.append(identity, status, facts);
@@ -2911,7 +3114,8 @@ function renderProcesses(view) {
   processesSnapshot = view;
   const jobs = Array.isArray(view.jobs) ? view.jobs : [];
   if (lastStatusSnapshot) renderAttention(lastStatusSnapshot);
-  const health = String(view.health || "unavailable");
+  const fresh = processSnapshotIsFresh(view);
+  const health = fresh ? String(view.health) : view.health === "unavailable" ? "unavailable" : "stale";
   // No worker report yet is a waiting state, not an outage.
   const waiting = health === "unavailable" && !view.worker && jobs.length === 0;
   byId("processes-health").textContent = waiting ? "NO REPORT YET" : health.toUpperCase();
@@ -2919,8 +3123,8 @@ function renderProcesses(view) {
   const observed = Number.isSafeInteger(view.observed_at_ms) ? new Date(view.observed_at_ms).toISOString() : null;
   byId("process-observed").textContent = observed ? `Updated ${processTimeLabel(observed)}` : "Waiting for the worker";
   byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
-  byId("process-running").textContent = count(view.stats?.running);
-  byId("process-queued").textContent = count(view.stats?.queued);
+  byId("process-running").textContent = count(fresh ? view.stats?.running : null);
+  byId("process-queued").textContent = count(fresh ? view.stats?.queued : null);
   byId("process-approval").textContent = count(jobs.filter((job) => job.status === "pending_approval").length);
   byId("process-completed").textContent = count(view.stats?.completed);
   byId("process-failed").textContent = count(view.stats?.failed);
@@ -2943,6 +3147,7 @@ function renderProcesses(view) {
     empty.className = "integration-empty process-empty";
     empty.textContent = health === "unavailable" ? "No agent runs to show yet." : "No agent runs match this filter.";
     root.append(empty);
+    if (consoleState.opsKind === "process") consoleOpenProcess(consoleState.opsKey, false);
     return;
   }
   visible.forEach(({ job, depth }) => {
@@ -2965,7 +3170,7 @@ function renderProcesses(view) {
     const execution = consoleCell(executionName || "-", "cell");
     const updated = consoleCell(processTimeLabel(job.updated_at), "cell cell-time");
     if (job.updated_at) updated.title = ticketDateLabel(job.updated_at);
-    const status = consoleBadge(processStatusLabel(job.status), processStatusTone(job.status));
+    const status = consoleBadge(processStatusLabel(processDisplayStatus(job)), processStatusTone(processDisplayStatus(job)));
     status.classList.add("process-status", `status-${job.status}`);
     row.append(main, execution, updated, consoleCellWrap(status));
     root.append(row);
@@ -2979,8 +3184,10 @@ function processStatusTone(status) {
 }
 
 function renderProcessDrawer(job) {
+  const displayStatus = processDisplayStatus(job);
+  const fresh = processSnapshotIsFresh();
   const issueReference = processIssueReference(job);
-  byId("ops-drawer-kicker").textContent = `Agent run · ${processStatusLabel(job.status)}`;
+  byId("ops-drawer-kicker").textContent = `Agent run · ${processStatusLabel(displayStatus)}`;
   const title = byId("ops-drawer-title");
   title.setAttribute("data-i18n-skip", "");
   title.textContent = issueReference.label;
@@ -2990,7 +3197,8 @@ function renderProcessDrawer(job) {
   summary.className = "drawer-section";
   const badges = document.createElement("div");
   badges.className = "drawer-badges";
-  badges.append(consoleBadge(processStatusLabel(job.status), processStatusTone(job.status)));
+  badges.append(consoleBadge(processStatusLabel(displayStatus), processStatusTone(displayStatus)));
+  if (!fresh) badges.append(consoleBadge("Out-of-date snapshot", "warn"));
   if (job.approved) badges.append(consoleBadge("Approved", "ok"));
   if (job.parent_id) badges.append(consoleBadge("Part of a larger run", "quiet"));
   const lede = document.createElement("p");
@@ -3002,7 +3210,8 @@ function renderProcessDrawer(job) {
     done: "The agent finished this run.",
     failed: "This run failed. Check the output below, then retry from Manage.",
     cancelled: "This run was cancelled.",
-  }[job.status] || "Agent run.";
+    unconfirmed: "This snapshot is out of date. The last reported status is shown in Details; current execution is unconfirmed.",
+  }[displayStatus] || "Agent run.";
   const actions = document.createElement("div");
   actions.className = "drawer-actions";
   if (issueReference.href) {
@@ -3029,10 +3238,11 @@ function renderProcessDrawer(job) {
   if (actions.childNodes.length) summary.append(actions);
   const output = document.createElement("section");
   output.className = "drawer-section process-output";
-  output.setAttribute("aria-label", "Live agent output");
+  const liveOutput = fresh && job.status === "running";
+  output.setAttribute("aria-label", liveOutput ? "Live agent output" : "Saved agent output");
   const outputTitle = document.createElement("h3");
   const outputLines = Array.isArray(job.output) ? job.output : [];
-  outputTitle.textContent = `Live output · ${outputLines.length.toLocaleString(localeTag())} events`;
+  outputTitle.textContent = `${liveOutput ? "Live output" : "Saved output"} · ${outputLines.length.toLocaleString(localeTag())} events`;
   const outputLog = document.createElement("div");
   outputLog.className = "process-output-log";
   outputLog.setAttribute("role", "log");
@@ -3078,6 +3288,8 @@ function renderProcessDrawer(job) {
     ["Type", job.kind ? translatePhrase(operationLabel(job.kind)) : null],
     ["Came from", job.source && job.source !== "unknown" ? operationLabel(job.source) : null],
     ["On this worker", translatePhrase(job.assigned_to_worker ? "Yes" : "No")],
+    ["Last reported status", processStatusLabel(job.status)],
+    ["Snapshot", Number.isSafeInteger(processesSnapshot?.observed_at_ms) ? ticketDateLabel(new Date(processesSnapshot.observed_at_ms).toISOString()) : null],
     ["Decisions", String(job.decision_count)],
     ["Site", job.site_id],
     ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
@@ -3092,16 +3304,20 @@ function renderProcessDrawer(job) {
 }
 
 async function loadProcesses({ announce = false } = {}) {
+  const sequence = ++processesLoadSequence;
   const button = byId("processes-refresh");
   button.disabled = true;
   try {
-    renderProcesses(await api("/api/processes"));
+    const view = await api("/api/processes");
+    if (sequence !== processesLoadSequence) return;
+    renderProcesses(view);
     if (announce) toast("Process visibility refreshed.");
   } catch (_error) {
+    if (sequence !== processesLoadSequence) return;
     renderProcesses({ health: "unavailable", observed_at_ms: Date.now(), stats: {}, worker: null, jobs: [] });
     if (announce) toast("Process visibility is unavailable.", "error");
   } finally {
-    button.disabled = false;
+    if (sequence === processesLoadSequence) button.disabled = false;
   }
 }
 
@@ -6401,6 +6617,7 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open]")) return;
   const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
   if (event.key === "Escape" && voiceListening) {
     stopVoiceInput();
@@ -6722,6 +6939,7 @@ byId("pairing-copy").addEventListener("click", async () => {
   }
 });
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open]")) return;
   if (event.key === "Escape" && !byId("pairing-panel").hidden) pairingOpen(false);
 });
 document.addEventListener("click", (event) => {
@@ -6880,6 +7098,7 @@ function consoleEditing(target) {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open]")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     consolePaletteOpen(byId("command-palette").hidden);

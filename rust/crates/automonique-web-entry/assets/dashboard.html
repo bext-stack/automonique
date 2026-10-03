@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=5" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=17">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=18">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=19" defer></script>
+    <script src="/assets/dashboard.js?v=20" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -336,11 +336,15 @@
             <form class="search-field memory-search" id="memory-search" role="search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 1 0 4.1 11.5L20 21M10.5 4a6.5 6.5 0 0 1 4.1 11.5"></path></svg><input id="memory-query" maxlength="512" aria-label="Search memory" placeholder="Search what Monique remembers"><button class="search-clear" id="memory-clear" type="button" aria-label="Clear memory search" hidden>×</button><button class="button ghost small" type="submit">Search</button></form>
           </div>
           <div class="toolbar memory-toolbar">
+            <button class="button primary" id="memory-create" type="button">Add memory</button>
+            <button class="button secondary" id="memory-refresh" type="button">Refresh</button>
+            <button class="button secondary" id="memory-export" type="button" disabled>Export results</button>
             <div class="segmented memory-modes" role="group" aria-label="Memory view"><button type="button" data-memory-mode="list">List</button><button type="button" data-memory-mode="timeline">Timeline</button><button type="button" data-memory-mode="graph">Map</button></div>
             <div class="memory-filters">
               <label class="select-field memory-filter"><span>Type</span><select id="memory-kind"><option value="all">All types</option></select></label>
               <label class="select-field memory-filter"><span>Status</span><select id="memory-status"><option value="all">All statuses</option></select></label>
               <label class="select-field memory-filter"><span>Privacy</span><select id="memory-sensitivity"><option value="all">All levels</option></select></label>
+              <label class="select-field memory-filter"><span>Review</span><select id="memory-review"><option value="all">Any review date</option><option value="due">Needs review</option><option value="scheduled">Scheduled</option><option value="none">Unscheduled</option></select></label>
               <label class="select-field memory-filter"><span>Sort</span><select id="memory-sort"><option value="updated_desc">Recently updated</option><option value="confidence_desc">Most certain</option><option value="review_asc">Recheck date</option><option value="reference">Reference</option></select></label>
               <button class="text-button" id="memory-reset" type="button">Reset</button>
             </div>
@@ -361,6 +365,32 @@
             </aside>
           </div>
         </section>
+
+        <dialog class="memory-dialog" id="memory-editor" aria-labelledby="memory-editor-title">
+          <form id="memory-editor-form">
+            <header><h2 id="memory-editor-title">Add memory</h2><button class="drawer-close" type="button" data-memory-close="memory-editor" aria-label="Close editor">×</button></header>
+            <p id="memory-editor-help">Save a stable fact or preference for future conversations.</p>
+            <label>Content<textarea id="memory-edit-content" rows="5" maxlength="8192" required placeholder="What should Monique remember?"></textarea></label>
+            <div class="memory-editor-fields">
+              <label>Type<select id="memory-edit-kind"><option value="user_profile">User preference</option><option value="workspace">Workspace</option><option value="team">Team</option><option value="task">Task</option><option value="episodic">Event</option><option value="procedure">Procedure</option></select></label>
+              <label>Certainty (%)<input id="memory-edit-confidence" type="number" min="0" max="100" step="0.1" value="100" required></label>
+              <label>Privacy<select id="memory-edit-sensitivity"><option value="personal">Personal</option><option value="restricted">Restricted</option><option value="internal">Internal</option><option value="public">Public</option></select></label>
+              <label>Visible to<select id="memory-edit-visibility"><option value="private">Only me</option><option value="team">Team</option><option value="tenant">Everyone in this tenant</option></select></label>
+              <label>Next review<input id="memory-edit-review" type="date"></label>
+            </div>
+            <p class="memory-form-error" id="memory-editor-error" role="alert" hidden></p>
+            <footer><button class="button secondary" type="button" data-memory-close="memory-editor">Cancel</button><button class="button primary" type="submit" id="memory-save">Save memory</button></footer>
+          </form>
+        </dialog>
+        <dialog class="memory-dialog" id="memory-confirm" aria-labelledby="memory-confirm-title">
+          <form id="memory-confirm-form">
+            <h2 id="memory-confirm-title">Forget memory?</h2>
+            <p id="memory-confirm-help"></p>
+            <blockquote id="memory-confirm-content" data-i18n-skip></blockquote>
+            <p class="memory-form-error" id="memory-confirm-error" role="alert" hidden></p>
+            <footer><button class="button secondary" type="button" data-memory-close="memory-confirm">Cancel</button><button class="button primary" type="submit" id="memory-confirm-submit">Confirm</button></footer>
+          </form>
+        </dialog>
 
         <!-- HEALTH -->
         <section class="view" data-panel="overview" aria-labelledby="overview-title">

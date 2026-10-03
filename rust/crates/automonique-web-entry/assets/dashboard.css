@@ -1002,6 +1002,25 @@ input[type="text"], input:not([type]), textarea { border-radius: 7px; }
 
 /* ----------------------------------------------------------------- memory */
 .memory-toolbar { gap: 8px 12px; }
+.memory-dialog { width: min(600px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 24px; overflow: auto; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+.memory-dialog::backdrop { background: rgb(0 0 0 / .55); }
+.memory-dialog form { display: grid; gap: 18px; }
+.memory-dialog header, .memory-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.memory-dialog footer { justify-content: flex-end; }
+.memory-dialog h2 { font-size: var(--font-lg); }
+.memory-dialog p { color: var(--muted); font-size: var(--font-sm); }
+.memory-dialog label { display: grid; gap: 6px; font-size: var(--font-sm); }
+.memory-dialog textarea, .memory-dialog input, .memory-dialog select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--field-surface); font: inherit; }
+.memory-dialog textarea { resize: vertical; }
+.memory-dialog select { height: auto; min-height: 40px; line-height: 1.4; }
+.memory-editor-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.memory-dialog blockquote { max-height: 200px; overflow: auto; padding: 12px; background: var(--panel-2); border-left: 3px solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-dialog .memory-form-error { color: var(--red); }
+.memory-inspector-content { overflow-wrap: anywhere; white-space: pre-wrap; }
+@media (max-width: 480px) {
+  .memory-dialog { padding: 18px; }
+  .memory-editor-fields { grid-template-columns: 1fr; }
+}
 .memory-filters { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .memory-filters select { height: 28px; font-size: var(--font-xs); }
 .memory-row-content { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }

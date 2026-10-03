@@ -1159,66 +1159,58 @@ impl AgentMemoryStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = read_memory_by_source(
-            &transaction,
-            input.tenant,
-            input.source_transport,
-            input.source_key,
-            input.kind,
-            input.scope,
-        )?;
-        if let Some(record) = existing {
-            return if same_memory(&record, input) {
-                Ok(record)
-            } else {
-                Err(AgentMemoryError::Conflict)
-            };
+        let record = insert_memory(&transaction, input)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Replace content and metadata atomically while preserving the previous record.
+    pub fn replace_memory(
+        &mut self,
+        id: i64,
+        expected_revision: u32,
+        input: &MemoryInput<'_>,
+    ) -> Kept<MemoryRecord> {
+        validate_memory_input(input)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = read_memory(&transaction, input.tenant, id)?.ok_or(AgentMemoryError::NotFound)?;
+        if old.actor != input.actor {
+            return Err(AgentMemoryError::NotFound);
+        }
+        if old.revision != expected_revision {
+            return Err(AgentMemoryError::StaleRevision);
+        }
+        if !matches!(old.status, MemoryStatus::Active | MemoryStatus::Candidate)
+            || input.status != old.status
+            || input.scope != old.scope
+            || input.expires_at_ms != old.expires_at_ms
+        {
+            return Err(AgentMemoryError::Conflict);
+        }
+        let replacement = insert_memory(&transaction, input)?;
+        if replacement.id == id {
+            return Err(AgentMemoryError::Conflict);
         }
         transaction.execute(
-            "INSERT INTO memories
-             (tenant,actor,scope,kind,content,status,confidence,sensitivity,visibility,
-              source_transport,source_key,valid_from_ms,expires_at_ms,review_at_ms,
-              created_at_ms,updated_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
-            params![
-                input.tenant,
-                input.actor,
-                input.scope,
-                input.kind.as_str(),
-                input.content,
-                input.status.as_str(),
-                input.confidence,
-                input.sensitivity.as_str(),
-                input.visibility.as_str(),
-                input.source_transport,
-                input.source_key,
-                input.valid_from_ms,
-                input.expires_at_ms,
-                input.review_at_ms,
-                input.created_at_ms
-            ],
+            "UPDATE memories SET status='superseded',superseded_by=?1,
+             updated_at_ms=?2,revision=revision+1 WHERE memory_id=?3 AND tenant=?4",
+            params![replacement.id, input.created_at_ms, id, input.tenant],
         )?;
-        let id = transaction.last_insert_rowid();
         transaction.execute(
-            "INSERT INTO memory_audit
-             (memory_id,tenant,actor,action,cause,at_ms,revision)
-             VALUES (?1,?2,?3,?4,'capture',?5,1)",
+            "INSERT INTO memory_audit (memory_id,tenant,actor,action,cause,at_ms,revision)
+             VALUES (?1,?2,?3,'superseded','dashboard_edit',?4,?5)",
             params![
                 id,
                 input.tenant,
                 input.actor,
-                if input.status == MemoryStatus::Active {
-                    "activated"
-                } else {
-                    "proposed"
-                },
-                input.created_at_ms
+                input.created_at_ms,
+                expected_revision + 1
             ],
         )?;
-        let record = read_memory(&transaction, input.tenant, id)?
-            .ok_or(AgentMemoryError::Corrupt("inserted_memory"))?;
         transaction.commit()?;
-        Ok(record)
+        Ok(replacement)
     }
 
     pub fn activate(
@@ -1397,6 +1389,25 @@ impl AgentMemoryStore {
     pub fn item(&self, tenant: &str, actor: &str, id: i64) -> Kept<Option<MemoryRecord>> {
         let item = read_memory(&self.connection, tenant, id)?;
         Ok(item.filter(|item| item.actor == actor || item.visibility != MemoryVisibility::Private))
+    }
+
+    /// Management inventory includes every lifecycle state; recall remains active-only.
+    pub fn inventory(&self, tenant: &str, actor: &str, query: &str) -> Kept<Vec<MemoryRecord>> {
+        validate_field(tenant, "tenant")?;
+        validate_field(actor, "actor")?;
+        if query.len() > MAX_MEMORY_FIELD_BYTES {
+            return Err(AgentMemoryError::InvalidField("query"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT memory_id,tenant,actor,scope,kind,content,status,confidence,
+                    sensitivity,visibility,source_transport,source_key,valid_from_ms,
+                    expires_at_ms,review_at_ms,superseded_by,created_at_ms,updated_at_ms,revision
+             FROM memories WHERE tenant=?1 AND (visibility!='private' OR actor=?2)
+               AND (?3='' OR instr(lower(content),lower(?3))>0 OR 'M-'||memory_id=?3)
+             ORDER BY updated_at_ms DESC,memory_id DESC LIMIT 4097",
+        )?;
+        let rows = statement.query_map(params![tenant, actor, query], read_memory_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
     }
 
     pub fn search(
@@ -1815,6 +1826,71 @@ fn read_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
     })
 }
 
+fn insert_memory(
+    transaction: &rusqlite::Transaction<'_>,
+    input: &MemoryInput<'_>,
+) -> Kept<MemoryRecord> {
+    let existing = read_memory_by_source(
+        transaction,
+        input.tenant,
+        input.source_transport,
+        input.source_key,
+        input.kind,
+        input.scope,
+    )?;
+    if let Some(record) = existing {
+        return if same_memory(&record, input) {
+            Ok(record)
+        } else {
+            Err(AgentMemoryError::Conflict)
+        };
+    }
+    transaction.execute(
+        "INSERT INTO memories
+             (tenant,actor,scope,kind,content,status,confidence,sensitivity,visibility,
+              source_transport,source_key,valid_from_ms,expires_at_ms,review_at_ms,
+              created_at_ms,updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+        params![
+            input.tenant,
+            input.actor,
+            input.scope,
+            input.kind.as_str(),
+            input.content,
+            input.status.as_str(),
+            input.confidence,
+            input.sensitivity.as_str(),
+            input.visibility.as_str(),
+            input.source_transport,
+            input.source_key,
+            input.valid_from_ms,
+            input.expires_at_ms,
+            input.review_at_ms,
+            input.created_at_ms
+        ],
+    )?;
+    let id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO memory_audit
+             (memory_id,tenant,actor,action,cause,at_ms,revision)
+             VALUES (?1,?2,?3,?4,'capture',?5,1)",
+        params![
+            id,
+            input.tenant,
+            input.actor,
+            if input.status == MemoryStatus::Active {
+                "activated"
+            } else {
+                "proposed"
+            },
+            input.created_at_ms
+        ],
+    )?;
+    let record = read_memory(transaction, input.tenant, id)?
+        .ok_or(AgentMemoryError::Corrupt("inserted_memory"))?;
+    Ok(record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,6 +1923,141 @@ mod tests {
             review_at_ms: Some(2_000),
             created_at_ms: 1_000,
         }
+    }
+
+    #[test]
+    fn management_inventory_includes_lifecycle_states_without_changing_recall() {
+        let (_root, mut store) = store();
+        let active = store
+            .record_memory(&memory("active", "Visible fact", MemoryStatus::Active))
+            .unwrap();
+        store
+            .record_memory(&memory("proposal", "Pending fact", MemoryStatus::Candidate))
+            .unwrap();
+        let deleted = store
+            .record_memory(&memory("deleted", "Forgotten fact", MemoryStatus::Active))
+            .unwrap();
+        store
+            .forget("primary", "ben", deleted.id, 1, "test", 1500)
+            .unwrap();
+        let mut other = memory("private", "Other private fact", MemoryStatus::Active);
+        other.actor = "other";
+        store.record_memory(&other).unwrap();
+        assert_eq!(store.inventory("primary", "ben", "").unwrap().len(), 3);
+        assert_eq!(
+            store.inventory("primary", "ben", "PENDING").unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .inventory("primary", "ben", &active.reference())
+                .unwrap(),
+            vec![active.clone()]
+        );
+        assert!(store.inventory("another", "ben", "").unwrap().is_empty());
+        assert_eq!(
+            store.search("primary", "ben", "fact", 1500, 32).unwrap(),
+            vec![active]
+        );
+    }
+
+    #[test]
+    fn replacement_is_atomic_revision_checked_and_keeps_history() {
+        let (_root, mut store) = store();
+        let old = store
+            .record_memory(&memory("original", "Original fact", MemoryStatus::Active))
+            .unwrap();
+        let replacement = memory("replacement", "Corrected fact", MemoryStatus::Active);
+        assert!(matches!(
+            store.replace_memory(old.id, 8, &replacement),
+            Err(AgentMemoryError::StaleRevision)
+        ));
+        assert_eq!(store.inventory("primary", "ben", "").unwrap().len(), 1);
+        let mut foreign = replacement.clone();
+        foreign.actor = "other";
+        assert!(matches!(
+            store.replace_memory(old.id, 1, &foreign),
+            Err(AgentMemoryError::NotFound)
+        ));
+        let new = store.replace_memory(old.id, 1, &replacement).unwrap();
+        let history = store.item("primary", "ben", old.id).unwrap().unwrap();
+        assert_eq!(history.content, "Original fact");
+        assert_eq!(history.status, MemoryStatus::Superseded);
+        assert_eq!(history.superseded_by, Some(new.id));
+        assert_eq!(history.revision, 2);
+        assert_eq!(
+            store.search("primary", "ben", "fact", 1500, 32).unwrap(),
+            vec![new]
+        );
+        assert!(matches!(
+            store.replace_memory(old.id, 1, &replacement),
+            Err(AgentMemoryError::StaleRevision)
+        ));
+        assert_eq!(store.inventory("primary", "ben", "").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_replacement_rolls_back_the_new_record_and_its_audit() {
+        let (_root, mut store) = store();
+        let old = store
+            .record_memory(&memory("original", "Original fact", MemoryStatus::Active))
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_supersession BEFORE UPDATE ON memories
+             WHEN new.status='superseded' BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .replace_memory(
+                    old.id,
+                    1,
+                    &memory("replacement", "Correction", MemoryStatus::Active)
+                )
+                .is_err()
+        );
+        assert_eq!(store.inventory("primary", "ben", "").unwrap(), vec![old]);
+        let audit_count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM memory_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[test]
+    fn management_inventory_is_not_limited_to_the_recall_page_size() {
+        let (_root, mut store) = store();
+        for index in 0..40 {
+            store
+                .record_memory(&memory(
+                    &format!("fact-{index}"),
+                    "A stable fact",
+                    MemoryStatus::Active,
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.inventory("primary", "ben", "").unwrap().len(), 40);
+        assert_eq!(store.recent("primary", "ben", 1500, 32).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn editing_candidate_does_not_activate_it() {
+        let (_root, mut store) = store();
+        let old = store
+            .record_memory(&memory("original", "Draft", MemoryStatus::Candidate))
+            .unwrap();
+        let replacement = memory("replacement", "Corrected draft", MemoryStatus::Candidate);
+        let new = store
+            .replace_memory(old.id, old.revision, &replacement)
+            .unwrap();
+        assert_eq!(new.status, MemoryStatus::Candidate);
+        assert!(store.recent("primary", "ben", 1500, 32).unwrap().is_empty());
+        store
+            .activate("primary", "ben", new.id, new.revision, "test", 1500)
+            .unwrap();
+        assert_eq!(store.recent("primary", "ben", 1500, 32).unwrap().len(), 1);
     }
 
     #[test]

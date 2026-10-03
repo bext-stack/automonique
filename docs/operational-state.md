@@ -70,6 +70,17 @@ Manage terminal job must not be presented as GitHub delivery evidence.
 - snapshot `stale`: the projection is too old for a current-state conclusion.
   Retain it for context but do not present it as live evidence.
 
+The Agents drawer treats snapshots older than 90 seconds as historical. A
+nonterminal run then shows `Status unconfirmed` with its last reported status
+in Details, and its output is labelled saved. A refreshed terminal receipt
+updates an already open drawer. If refreshing fails, the previous drawer is
+closed so it cannot continue asserting a live run.
+
+The fleet publisher passes accumulated output to jq through file descriptors,
+not command arguments: a long output history must not exceed the operating
+system's per-argument limit and silently freeze the dashboard projection. A
+terminal job's final result is retained alongside its bounded tool-event tail.
+
 ## What a question sees
 
 Every conversational question, on Telegram, Slack or the dashboard lane that

@@ -19,6 +19,30 @@ source-of-truth map is documented in
 
 FTS5 is the initial retrieval projection. It requires no resident embedding model and keeps idle memory use low. A semantic adapter should only be added after an evaluation corpus demonstrates a material recall improvement that justifies its RAM, latency, and operational cost.
 
+## Dashboard management
+
+The Memory page lets an authenticated operator add memories, edit their content
+and metadata, approve or reject proposals, and forget active memories. Only a
+memory's author can change it; shared memories from other actors remain readable.
+New memories default to personal and private and become active when saved.
+
+Edits atomically create a replacement and retain the original content as a
+superseded record. Editing a proposal keeps it pending approval. Every change
+checks the displayed revision, so stale edits cannot overwrite newer decisions.
+Forgetting excludes a record from recall while retaining its content and audit
+history; it is not permanent erasure.
+
+The management inventory includes active, candidate, superseded, deleted, and
+expired records. Search matches content substrings or exact `M-…` references.
+This is separate from the assistant's FTS5 retrieval, which still uses only
+active, unexpired memories. The page loads up to 4,096 matching records and shows
+a truncation notice if more exist; narrow the search to find older records.
+Type, status, privacy, and review-date filters apply to the loaded results.
+
+Export results downloads those filtered records and their metadata as JSON.
+It does not export conversations, identity bindings, or the complete audit
+ledger, and is not a database backup. There is no automatic import.
+
 ## The tenant
 
 Every durable key carries a tenant, so the daemon and the operator commands must agree on one. It is configured in `<state>/memory/memory.conf`, owned by the daemon user, mode `0600`:

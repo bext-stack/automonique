@@ -166,6 +166,7 @@ pub enum Route {
     ApiBuild,
     ApiMemory,
     ApiMemorySearch,
+    ApiMemoryAction,
     ApiConfiguration,
     ApiAgentAccounts,
     ApiAgentAccountsAction,
@@ -949,6 +950,7 @@ struct MemoryView {
     representation: &'static str,
     counts: MemoryCountsView,
     entries: Vec<MemoryEntryView>,
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -962,6 +964,9 @@ struct MemoryCountsView {
 
 #[derive(Serialize)]
 struct MemoryEntryView {
+    editable: bool,
+    expires_at_ms: Option<i64>,
+    superseded_by: Option<String>,
     reference: String,
     kind: &'static str,
     content: String,
@@ -1831,6 +1836,20 @@ struct TicketView {
 #[derive(Deserialize)]
 struct MemorySearchRequest {
     query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryActionRequest {
+    action: String,
+    reference: Option<String>,
+    revision: Option<u32>,
+    content: Option<String>,
+    kind: Option<String>,
+    sensitivity: Option<String>,
+    visibility: Option<String>,
+    confidence: Option<u16>,
+    review_at_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -2979,23 +2998,23 @@ impl WebIntegration {
 
     fn memory(&self, query: Option<&str>) -> Result<MemoryView, &'static str> {
         let store = AgentMemoryStore::open(&self.memory_path).map_err(|_| "memory_unavailable")?;
-        let now = now_ms_i64();
         let counts = store
             .counts(&self.config.tenant, &self.config.actor)
             .map_err(|_| "memory_counts_unavailable")?;
-        let records = match query.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(query) if query.len() <= 512 => store
-                .search(&self.config.tenant, &self.config.actor, query, now, 32)
-                .map_err(memory_error_category)?,
-            Some(_) => return Err("memory_query_refused"),
-            None => store
-                .recent(&self.config.tenant, &self.config.actor, now, 32)
-                .map_err(memory_error_category)?,
-        };
+        let mut records = store
+            .inventory(
+                &self.config.tenant,
+                &self.config.actor,
+                query.unwrap_or("").trim(),
+            )
+            .map_err(memory_error_category)?;
+        let truncated = records.len() > 4096;
+        records.truncate(4096);
         Ok(MemoryView {
             schema: "automonique.dashboard.memory/v1",
             health: "readable",
-            representation: "typed_evidence_graph_fts5",
+            representation: "management_inventory",
+            truncated,
             counts: MemoryCountsView {
                 active: counts.active,
                 candidates: counts.candidates,
@@ -3003,8 +3022,142 @@ impl WebIntegration {
                 deleted: counts.deleted,
                 messages: counts.messages,
             },
-            entries: records.into_iter().map(memory_entry).collect(),
+            entries: records
+                .into_iter()
+                .map(|record| {
+                    let editable = record.actor == self.config.actor
+                        && matches!(
+                            record.status,
+                            automonique_store::agent_memory::MemoryStatus::Active
+                                | automonique_store::agent_memory::MemoryStatus::Candidate
+                        );
+                    let mut entry = memory_entry(record);
+                    entry.editable = editable;
+                    entry
+                })
+                .collect(),
         })
+    }
+
+    fn memory_action(&self, request: MemoryActionRequest) -> Result<MemoryEntryView, &'static str> {
+        use automonique_store::agent_memory::{
+            MemoryInput, MemoryKind, MemorySensitivity, MemoryStatus, MemoryVisibility,
+            redact_content,
+        };
+        let mut store =
+            AgentMemoryStore::open(&self.memory_path).map_err(|_| "memory_unavailable")?;
+        let tenant = self.config.tenant.as_str();
+        let actor = self.config.actor.as_str();
+        let now = now_ms_i64();
+        let current = if request.action == "create" {
+            if request.reference.is_some() || request.revision.is_some() {
+                return Err("memory_field_invalid");
+            }
+            None
+        } else {
+            let id = request
+                .reference
+                .as_deref()
+                .and_then(|r| r.strip_prefix("M-"))
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or("memory_field_invalid")?;
+            let record = store
+                .item(tenant, actor, id)
+                .map_err(memory_error_category)?
+                .ok_or("memory_not_found")?;
+            if record.actor != actor {
+                return Err("memory_not_found");
+            }
+            if Some(record.revision) != request.revision {
+                return Err("memory_revision_stale");
+            }
+            Some(record)
+        };
+        let record = match request.action.as_str() {
+            "create" | "edit" => {
+                let content = request.content.as_deref().ok_or("memory_field_invalid")?;
+                if content.len() > automonique_store::agent_memory::MAX_MEMORY_CONTENT_BYTES {
+                    return Err("memory_field_invalid");
+                }
+                let content = redact_content(content);
+                let kind = request
+                    .kind
+                    .as_deref()
+                    .and_then(MemoryKind::parse)
+                    .ok_or("memory_field_invalid")?;
+                let sensitivity = match request.sensitivity.as_deref() {
+                    Some("public") => MemorySensitivity::Public,
+                    Some("internal") => MemorySensitivity::Internal,
+                    Some("personal") => MemorySensitivity::Personal,
+                    Some("restricted") => MemorySensitivity::Restricted,
+                    _ => return Err("memory_field_invalid"),
+                };
+                let visibility = match request.visibility.as_deref() {
+                    Some("private") => MemoryVisibility::Private,
+                    Some("team") => MemoryVisibility::Team,
+                    Some("tenant") => MemoryVisibility::Tenant,
+                    _ => return Err("memory_field_invalid"),
+                };
+                let source_key = format!("dashboard-{}", self.next_sequence()?);
+                let input = MemoryInput {
+                    tenant,
+                    actor,
+                    scope: current.as_ref().map_or("actor", |r| r.scope.as_str()),
+                    kind,
+                    content: &content,
+                    status: current.as_ref().map_or(MemoryStatus::Active, |r| r.status),
+                    confidence: request.confidence.ok_or("memory_field_invalid")?,
+                    sensitivity,
+                    visibility,
+                    source_transport: "dashboard",
+                    source_key: &source_key,
+                    valid_from_ms: current.as_ref().map_or(now, |r| r.valid_from_ms),
+                    expires_at_ms: current.as_ref().and_then(|r| r.expires_at_ms),
+                    review_at_ms: request.review_at_ms,
+                    created_at_ms: now,
+                };
+                if let Some(old) = current.as_ref() {
+                    store.replace_memory(old.id, old.revision, &input)
+                } else {
+                    store.record_memory(&input)
+                }
+            }
+            "approve" | "deny" | "forget" => {
+                let record = current.ok_or("memory_not_found")?;
+                match request.action.as_str() {
+                    "approve" => store.activate(
+                        tenant,
+                        actor,
+                        record.id,
+                        record.revision,
+                        "dashboard_approval",
+                        now,
+                    ),
+                    "deny" => store.deny(
+                        tenant,
+                        actor,
+                        record.id,
+                        record.revision,
+                        "dashboard_denial",
+                        now,
+                    ),
+                    _ => store.forget(
+                        tenant,
+                        actor,
+                        record.id,
+                        record.revision,
+                        "dashboard_forget",
+                        now,
+                    ),
+                }
+            }
+            _ => return Err("memory_field_invalid"),
+        }
+        .map_err(memory_error_category)?;
+        let mut entry = memory_entry(record);
+        entry.editable = matches!(entry.status, "active" | "candidate");
+        Ok(entry)
     }
 
     fn configuration(&self) -> ConfigurationView {
@@ -5034,6 +5187,9 @@ fn memory_error_category(error: automonique_store::agent_memory::AgentMemoryErro
 
 fn memory_entry(record: MemoryRecord) -> MemoryEntryView {
     MemoryEntryView {
+        editable: false,
+        expires_at_ms: record.expires_at_ms,
+        superseded_by: record.superseded_by.map(|id| format!("M-{id}")),
         reference: record.reference(),
         kind: record.kind.as_str(),
         content: record.content,
@@ -7015,6 +7171,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/build" => Route::ApiBuild,
                 "/api/memory" => Route::ApiMemory,
                 "/api/memory/search" => Route::ApiMemorySearch,
+                "/api/memory/action" => Route::ApiMemoryAction,
                 "/api/configuration" => Route::ApiConfiguration,
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
@@ -7059,6 +7216,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
             let post_route = matches!(
                 route,
                 Route::ApiMemorySearch
+                    | Route::ApiMemoryAction
                     | Route::ApiAgentAccountsAction
                     | Route::ApiTicketDetail
                     | Route::ApiPlatformCockpit
@@ -7520,6 +7678,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         },
         Route::ApiMemory
         | Route::ApiMemorySearch
+        | Route::ApiMemoryAction
         | Route::ApiConfiguration
         | Route::ApiAgentAccounts
         | Route::ApiAgentAccountsAction
@@ -7619,6 +7778,21 @@ fn api_response(
         Route::ApiMemory => match integration.memory(None) {
             Ok(view) => json_response("200 OK", &view),
             Err(category) => json_error("503 Service Unavailable", category),
+        },
+        Route::ApiMemoryAction => match serde_json::from_slice::<MemoryActionRequest>(body) {
+            Ok(request) => match integration.memory_action(request) {
+                Ok(entry) => json_response("200 OK", &entry),
+                Err(category) => json_error(
+                    match category {
+                        "memory_field_invalid" => "400 Bad Request",
+                        "memory_not_found" => "404 Not Found",
+                        "memory_conflict" | "memory_revision_stale" => "409 Conflict",
+                        _ => "503 Service Unavailable",
+                    },
+                    category,
+                ),
+            },
+            Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiMemorySearch => {
             let request = serde_json::from_slice::<MemorySearchRequest>(body);
@@ -8351,6 +8525,7 @@ fn handle(
         route,
         Route::ApiMemory
             | Route::ApiMemorySearch
+            | Route::ApiMemoryAction
             | Route::ApiConfiguration
             | Route::ApiAgentAccounts
             | Route::ApiAgentAccountsAction
@@ -8677,6 +8852,125 @@ mod tests {
             );
         }
         assert!(DashboardHosts::new(CANONICAL_HOST, CANONICAL_HOST).is_err());
+    }
+
+    #[test]
+    fn memory_management_preserves_history_and_rejects_stale_or_foreign_edits() {
+        let state = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        for dir in [state.path(), runtime.path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let integration = WebIntegration::open(
+            IntegrationConfig {
+                tenant: "operator".into(),
+                actor: "operator:fixture".into(),
+                hosts: fixture_hosts(),
+            },
+            state.path(),
+            runtime.path(),
+        )
+        .unwrap();
+        let action = |value: serde_json::Value| {
+            integration.memory_action(serde_json::from_value(value).unwrap())
+        };
+        let fields = serde_json::json!({
+            "action": "create", "content": "Use concise summaries", "kind": "procedure",
+            "confidence": 900, "sensitivity": "internal", "visibility": "private", "review_at_ms": null,
+        });
+        let first = action(fields.clone()).unwrap();
+        assert!(first.editable);
+        let mut edit = fields.clone();
+        edit["action"] = "edit".into();
+        edit["reference"] = first.reference.clone().into();
+        edit["revision"] = 1.into();
+        edit["content"] = "Use clear summaries".into();
+        let replacement = action(edit.clone()).unwrap();
+        assert!(matches!(action(edit), Err("memory_revision_stale")));
+        let view = integration.memory(None).unwrap();
+        assert_eq!(view.entries.len(), 2);
+        let old = view
+            .entries
+            .iter()
+            .find(|e| e.reference == first.reference)
+            .unwrap();
+        assert_eq!(old.status, "superseded");
+        assert_eq!(
+            old.superseded_by.as_deref(),
+            Some(replacement.reference.as_str())
+        );
+        assert!(!old.editable);
+        let forgotten = action(serde_json::json!({ "action":"forget", "reference":replacement.reference, "revision":1 })).unwrap();
+        assert_eq!(forgotten.status, "deleted");
+        assert_eq!(integration.memory(Some("clear")).unwrap().entries.len(), 1);
+        let foreign = WebIntegration::open(
+            IntegrationConfig {
+                tenant: "operator".into(),
+                actor: "operator:other".into(),
+                hosts: fixture_hosts(),
+            },
+            state.path(),
+            runtime.path(),
+        )
+        .unwrap();
+        // Shared records are visible, but only their author can change them.
+        let mut shared = fields.clone();
+        shared["visibility"] = "team".into();
+        let record = action(shared).unwrap();
+        assert!(!foreign.memory(None).unwrap().entries[0].editable);
+        assert!(matches!(
+            foreign.memory_action(
+                serde_json::from_value(serde_json::json!({
+                    "action":"forget", "reference": record.reference, "revision": 1,
+                }))
+                .unwrap()
+            ),
+            Err("memory_not_found")
+        ));
+        let mut invalid = fields.clone();
+        invalid["confidence"] = 1001.into();
+        assert!(matches!(action(invalid), Err("memory_field_invalid")));
+        let mut invalid = fields;
+        invalid["review_at_ms"] = 1.into();
+        assert!(matches!(action(invalid), Err("memory_field_invalid")));
+    }
+
+    #[test]
+    fn memory_action_route_requires_operator_authentication_and_json_post() {
+        assert_eq!(
+            route(
+                &parse_request(&request("GET", "/api/memory/action", CANONICAL_HOST)).unwrap(),
+                &fixture_hosts()
+            ),
+            Route::MethodNotAllowed
+        );
+        let body = r#"{"action":"forget","reference":"M-1","revision":1}"#;
+        for authorization in [
+            "",
+            "Authorization: Bearer fixture-manage-chat-token-0123456789\r\n",
+        ] {
+            let request = format!(
+                "POST /api/memory/action HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response = exchange_without_integration(request.as_bytes());
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .starts_with("HTTP/1.1 401 Unauthorized")
+            );
+        }
+        let basic = BASE64_STANDARD.encode("ops:fixture-password");
+        let request = format!(
+            "POST /api/memory/action HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: Basic {basic}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = exchange_without_integration(request.as_bytes());
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
     }
 
     #[test]
