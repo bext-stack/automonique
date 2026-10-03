@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_auth;
+mod artifacts;
 mod chat_conversations;
 mod connection_tests;
 mod controls;
@@ -161,6 +162,10 @@ pub enum Route {
     Dashboard,
     Styles,
     Script,
+    ArtifactScript,
+    ArtifactStyles,
+    ArtifactPreview,
+    ApiArtifacts,
     PlatformCockpitScript,
     QrCodeScript,
     Favicon,
@@ -7186,6 +7191,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                 PlatformV2Lane::V2.request_limit(),
                 PlatformV2Lane::request_limit,
             )
+    } else if path.split('?').next() == Some("/api/artifacts") {
+        2 * 1024 * 1024
     } else {
         BODY_LIMIT
     };
@@ -7267,6 +7274,10 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
                 "/api/chat/history" => Route::ApiChatHistory,
+                "/assets/artifacts.js" => Route::ArtifactScript,
+                "/assets/artifacts.css" => Route::ArtifactStyles,
+                "/artifact-preview" => Route::ArtifactPreview,
+                "/api/artifacts" => Route::ApiArtifacts,
                 "/api/chat/conversations" => Route::ApiChatConversations,
                 "/api/chat/conversations/action" => Route::ApiChatConversationAction,
                 "/api/chat/new" => Route::ApiChatNew,
@@ -7302,6 +7313,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::MobilePlatformV2Grant
                     | Route::ApiChat
                     | Route::ApiChatAction
+                    | Route::ApiArtifacts
                     | Route::ApiChatConversationAction
                     | Route::ApiChatNew
                     | Route::ApiManageChatHistory
@@ -7712,6 +7724,18 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
             retry_after: None,
             body: DASHBOARD_HTML.as_bytes().to_vec(),
         },
+        Route::ArtifactScript => Response::static_asset(
+            "text/javascript; charset=utf-8",
+            include_str!("../assets/artifacts.js"),
+        ),
+        Route::ArtifactStyles => Response::static_asset(
+            "text/css; charset=utf-8",
+            include_str!("../assets/artifacts.css"),
+        ),
+        Route::ArtifactPreview => Response::static_asset(
+            "text/html; charset=utf-8",
+            include_str!("../assets/artifact-preview.html"),
+        ),
         Route::Styles => Response::static_asset("text/css; charset=utf-8", DASHBOARD_CSS),
         Route::Script => Response::static_asset("text/javascript; charset=utf-8", DASHBOARD_JS),
         Route::PlatformCockpitScript => {
@@ -7767,6 +7791,7 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiChatAction
         | Route::ApiChatHistory
         | Route::ApiChatConversations
+        | Route::ApiArtifacts
         | Route::ApiChatConversationAction
         | Route::ApiChatNew
         | Route::ApiManageChatHistory
@@ -8143,6 +8168,7 @@ fn api_response(
             },
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
+        Route::ApiArtifacts => integration.artifact_action(body),
         Route::ApiChatConversations => match integration.chat_conversations() {
             Ok(view) => json_response("200 OK", &view),
             Err(reason) => json_error("503 Service Unavailable", reason),
@@ -8320,8 +8346,10 @@ fn response_bytes(
     session_cookie: Option<&str>,
     route: Route,
 ) -> Vec<u8> {
-    let content_security_policy = if response.content_type == Some("text/html; charset=utf-8") {
-        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    let content_security_policy = if route == Route::ArtifactPreview {
+        "default-src 'none'; script-src 'unsafe-inline' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; media-src data: blob:; font-src data: blob:; frame-src blob: 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+    } else if response.content_type == Some("text/html; charset=utf-8") {
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src blob:; frame-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
     } else {
         "default-src 'none'; frame-ancestors 'none'"
     };
@@ -8334,12 +8362,16 @@ fn response_bytes(
          Permissions-Policy: camera=(), microphone=(self), geolocation=(), payment=(), usb=()\r\n\
          Referrer-Policy: no-referrer\r\n\
          X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: DENY\r\n\
          X-Robots-Tag: noindex, nofollow\r\n\
          Strict-Transport-Security: max-age=31536000\r\n\
          Connection: close\r\n",
         response.status, response.cache_control, content_security_policy
     );
+    headers.push_str(if route == Route::ArtifactPreview {
+        "X-Frame-Options: SAMEORIGIN\r\n"
+    } else {
+        "X-Frame-Options: DENY\r\n"
+    });
     if let Some(content_type) = response.content_type {
         headers.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
@@ -8664,6 +8696,7 @@ fn handle(
             | Route::ApiChatAction
             | Route::ApiChatHistory
             | Route::ApiChatConversations
+            | Route::ApiArtifacts
             | Route::ApiChatConversationAction
             | Route::ApiChatNew
             | Route::ApiManageChatHistory
@@ -12036,6 +12069,57 @@ mod tests {
             .as_bytes(),
         );
         assert!(wrong_lane.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn artifacts_require_authenticated_json_and_keep_preview_isolated() {
+        let basic = format!("Basic {}", BASE64_STANDARD.encode("ops:fixture-password"));
+        for (method, auth, content_type, expected) in [
+            (
+                "GET",
+                basic.as_str(),
+                "application/json",
+                "405 Method Not Allowed",
+            ),
+            ("POST", "", "application/json", "401 Unauthorized"),
+            ("POST", basic.as_str(), "text/plain", "400 Bad Request"),
+            (
+                "POST",
+                basic.as_str(),
+                "application/json",
+                "503 Service Unavailable",
+            ),
+        ] {
+            let request = format!(
+                "{method} /api/artifacts HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: {auth}\r\nContent-Type: {content_type}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let response = exchange_without_integration(request.as_bytes());
+            assert!(
+                response.starts_with(format!("HTTP/1.1 {expected}\r\n").as_bytes()),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+        let preview = String::from_utf8(response_bytes(
+            Response::static_asset("text/html; charset=utf-8", "preview"),
+            false,
+            None,
+            Route::ArtifactPreview,
+        ))
+        .unwrap();
+        assert!(preview.contains("sandbox allow-scripts"));
+        assert!(!preview.contains("allow-same-origin"));
+        assert!(preview.contains("connect-src 'none'"));
+        assert!(preview.contains("X-Frame-Options: SAMEORIGIN"));
+        let dashboard = String::from_utf8(response_bytes(
+            Response::static_asset("text/html; charset=utf-8", "dashboard"),
+            false,
+            None,
+            Route::Dashboard,
+        ))
+        .unwrap();
+        assert!(!dashboard.contains("unsafe-inline"));
+        assert!(dashboard.contains("X-Frame-Options: DENY"));
     }
 
     #[test]

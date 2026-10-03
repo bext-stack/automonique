@@ -1431,6 +1431,17 @@ run_job() {
     else
         provider_prompt=$(printf '%s\n\n%s\n' "$prompt" "$completion_receipt")
     fi
+    # Every provider receives the same artifact tool and provenance. Secrets stay
+    # in the private state frame; prompt text contains no credentials.
+    export MONIQUE_ARTIFACT_RUN_ID="$job_id"
+    export MONIQUE_ARTIFACT_ISSUE_URL="$expected_issue_url"
+    export MONIQUE_ARTIFACT_AGENT="$selected_provider"
+    artifact_tool="${AUTOMONIQUE_ARTIFACT_TOOL:-$(dirname -- "${BASH_SOURCE[0]}")/monique_artifact.py}"
+    if [[ -x "$artifact_tool" && -r "$state_dir/share/share.conf" ]]; then
+        export MONIQUE_ARTIFACT_TOOL="$artifact_tool"
+        artifact_brief=$'Monique deliverables: the executable at $MONIQUE_ARTIFACT_TOOL publishes report/file bundles using the private configured Share service. Use publish <directory> --title <title> for a new private bundle. Use download <id> <new-directory> to retrieve an existing bundle for revision. Use --artifact-id <id> to retain the same bundle and add a version. The run, ticket and agent are attached automatically. Include MONIQUE_ARTIFACT_ID and MONIQUE_ARTIFACT_URL from the receipt in your final answer. Do not make it public unless the user requested public sharing. Use template <path> --title <title> for a report scaffold; replace placeholders with verified results. Never put credentials in reports. Publishing a bundle does not complete the ticket or replace its completion receipt.'
+        provider_prompt=$(printf '%s\n\n%s\n' "$provider_prompt" "$artifact_brief")
+    fi
     requested_cwd=$(jq -r '.cwd // ""' <<<"$job")
     cwd=$(workspace_for "$requested_cwd") || {
         report_job "$job_id" failed 'Manage returned a workspace outside the configured execution roots.' || true

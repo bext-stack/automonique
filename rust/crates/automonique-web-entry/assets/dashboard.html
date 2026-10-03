@@ -8,10 +8,12 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=29">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=30">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=29" defer></script>
+    <link rel="stylesheet" href="/assets/artifacts.css?v=1">
+    <script src="/assets/artifacts.js?v=1" defer></script>
+    <script src="/assets/dashboard.js?v=30" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -26,6 +28,7 @@
             <button class="tab is-active" type="button" data-view="sessions">Tasks<b class="tab-badge" id="tab-badge-sessions" hidden></b></button>
             <button class="tab" type="button" data-view="tickets">Tickets<b class="tab-badge" id="tab-badge-tickets" hidden></b></button>
             <button class="tab" type="button" data-view="operations">Agents<b class="tab-badge" id="tab-badge-operations" hidden></b></button>
+            <button class="tab" type="button" data-view="artifacts">Deliverables</button>
             <button class="tab" type="button" data-view="memory">Memory</button>
             <button class="tab" type="button" data-view="overview">Health<b class="tab-badge" id="tab-badge-overview" hidden></b></button>
             <button class="tab" type="button" data-view="configuration">Settings</button>
@@ -186,6 +189,7 @@
                 <button class="chat-icon-button" id="chat-history-toggle" type="button" aria-controls="chat-history" aria-expanded="true" aria-label="Toggle conversation history" title="Conversation history"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M9 4v16"></path></svg></button>
                 <div class="chat-heading"><h1 id="chat-title">Monique</h1><p id="chat-conversation-title" data-i18n-skip></p></div>
                 <div class="chat-model-actions">
+                  <button class="chat-icon-button" id="chat-artifacts-open" type="button" aria-label="Conversation deliverables" title="Conversation deliverables">▧</button>
                   <button class="chat-icon-button" id="chat-find-toggle" type="button" aria-label="Find in conversation" title="Find in conversation" aria-controls="chat-navigator" aria-expanded="false">⌕</button>
                   <button class="chat-icon-button" id="chat-new-shortcut" type="button" aria-label="New chat" title="New chat">＋</button>
                   <details class="chat-options" id="chat-options"><summary aria-label="Conversation options" title="Conversation options">···</summary><div class="chat-options-menu">
@@ -491,6 +495,7 @@
         </section>
 
         <!-- SETTINGS -->
+        <section class="view" data-panel="artifacts" aria-label="Deliverables"><div id="artifact-library" data-i18n-skip></div></section>
         <section class="view" data-panel="configuration" aria-labelledby="configuration-title">
           <div class="view-head">
             <div class="view-title"><h1 id="configuration-title">Settings</h1><span class="tag success">NO SECRETS SHOWN</span></div>
@@ -633,5 +638,6 @@
       <p class="appearance-note">Saved only in this browser.</p>
     </section>
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <dialog id="artifact-dialog" class="artifact-dialog" aria-label="Deliverable preview"><button id="artifact-dialog-close" class="button ghost artifact-dialog-close" type="button" aria-label="Close preview">×</button><div id="artifact-dialog-content" data-i18n-skip></div></dialog>
   </body>
 </html>

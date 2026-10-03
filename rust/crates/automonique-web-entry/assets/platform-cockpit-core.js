@@ -666,7 +666,7 @@
   function parseDeepLink(hash) {
     const source = typeof hash === "string" ? hash.replace(/^#/, "") : "";
     const [rawView, rawQuery = ""] = source.split("?", 2);
-    const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration"];
+    const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration", "artifacts"];
     const result = { view: allowed.includes(rawView) ? rawView : "sessions" };
     const params = new URLSearchParams(rawQuery);
     LINK_KEYS.forEach((key) => {

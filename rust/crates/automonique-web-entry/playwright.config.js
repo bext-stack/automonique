@@ -2,7 +2,7 @@
 
 import { defineConfig, devices } from "@playwright/test";
 
-const FIXTURE_SPECS = ["**/chat.spec.js", "**/controls.spec.js", "**/connections.spec.js", "**/agent-accounts.spec.js", "**/platform-cockpit.spec.js", "**/pairing.spec.js", "**/memory.spec.js", "**/processes.spec.js"];
+const FIXTURE_SPECS = ["**/artifacts.spec.js", "**/chat.spec.js", "**/controls.spec.js", "**/connections.spec.js", "**/agent-accounts.spec.js", "**/platform-cockpit.spec.js", "**/pairing.spec.js", "**/memory.spec.js", "**/processes.spec.js"];
 const LIVE_SPEC = "**/live-cockpit-attention.spec.js";
 
 export default defineConfig({

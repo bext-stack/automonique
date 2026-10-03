@@ -90,7 +90,7 @@ let lastNotifiedAttentionKey = null;
 const consoleState = { expandedLists: new Set(), taskDrawerDismissed: false, ticketId: null, opsKind: null, opsKey: null, memoryOpen: false };
 
 function consoleViewName(name) {
-  return { sessions: "Tasks", tickets: "Tickets", operations: "Agents", memory: "Memory", overview: "Health", configuration: "Settings", chat: "Assistant" }[name] || name;
+  return { sessions: "Tasks", tickets: "Tickets", operations: "Agents", memory: "Memory", artifacts: "Deliverables", overview: "Health", configuration: "Settings", chat: "Assistant" }[name] || name;
 }
 
 function consoleRow(className, onSelect) {
@@ -385,6 +385,12 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "Deliverables": "Livrables",
+  "No deliverables attached to this run yet.": "Aucun livrable rattaché à cette exécution pour le moment.",
+  "Deliverables are unavailable.": "Les livrables sont indisponibles.",
+  "Open deliverable": "Ouvrir le livrable",
+  "Conversation deliverables": "Livrables de la conversation",
+  "Close preview": "Fermer l’aperçu",
   "archived": "archivés",
   "Model not reported": "Modèle non communiqué",
   "active jobs": "tâches actives",
@@ -2737,8 +2743,32 @@ async function refreshStatus({ announce = false } = {}) {
   }
 }
 
+let artifactLibrary = null, artifactModal = null, artifactPublicBase = "";
+async function artifactApi(body) {
+  const result = await api("/api/artifacts", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(result.public_base)artifactPublicBase=result.public_base;
+  return result;
+}
+function artifactOptions(context={}) {
+  const options={context,previewUrl:"/artifact-preview",publicBase:artifactPublicBase,
+    api:async body=>{const result=await artifactApi(body);options.publicBase=artifactPublicBase;if(body.action==="list" && (context.run_id || context.conversation_id))result.items=(result.items||[]).filter(a=>context.run_id?a.run_id===context.run_id:a.conversation_id===context.conversation_id);return result;},
+    onRevise:(artifact,version)=>{byId("artifact-dialog").close();showView("chat");const prompt=`Please revise the deliverable "${artifact.title}" (artifact ${artifact.id}, version ${version.number}). Preserve its bundle ID and publish a new version. Requested changes: `;const input=byId("chat-input");input.value=prompt;if(chatUi.loading || !chatUi.ready)chatUi.seededPrompt=prompt;updateChatComposer();input.focus();}};
+  return options;
+}
+function mountArtifactLibrary(){artifactLibrary?.destroy();artifactLibrary=window.ArtifactWorkspace.mount(byId("artifact-library"),artifactOptions());}
+function openArtifact(id,context={}){artifactModal?.destroy();const dialog=byId("artifact-dialog");if(!dialog.open)dialog.showModal();artifactModal=window.ArtifactWorkspace.mount(byId("artifact-dialog-content"),{...artifactOptions(context),...(id?{id}:{})});}
+function artifactCard(a){const root=controlNode("div",undefined,"aw aw-inline");root.dataset.i18nSkip="";const button=controlButton("",()=>openArtifact(a.id));button.append(controlData("strong",a.title),controlData("small",` · v${a.version_count} · ${a.visibility==="public"?"Public":"Privé"}`));root.append(button);return root;}
+function artifactRunPane(job){const root=controlNode("section",undefined,"run-section");root.append(controlNode("h3","Deliverables"));const list=controlNode("div");root.append(list,controlButton("Deliverables",()=>openArtifact(null,{run_id:job.id,issue_url:processIssueReference(job).href||"",agent:job.provider||""})));
+  artifactApi({action:"list"}).then(data=>{if(!root.isConnected)return;const items=(data.items||[]).filter(a=>a.run_id===job.id);list.replaceChildren(...items.map(artifactCard));if(!items.length)list.append(controlNode("p","No deliverables attached to this run yet.","inline-hint"));}).catch(()=>{if(root.isConnected)list.append(controlNode("p","Deliverables are unavailable.","inline-hint"));});return root;
+}
+function appendArtifactReferences(root,content){const ids=new Set([...String(content).matchAll(/(?:MONIQUE_ARTIFACT_ID:\s*|\/artifacts\?id=)([A-Za-z0-9_-]{24})(?![A-Za-z0-9_-])/g)].map(m=>m[1]));for(const id of ids){const card=controlNode("div",undefined,"aw aw-inline");card.append(controlButton("Open deliverable",()=>openArtifact(id)));root.append(card);}}
+async function loadConversationArtifacts(){const id=chatUi.id;if(!id)return;try{const data=await artifactApi({action:"list"});if(id!==chatUi.id)return;byId("chat-linked-artifacts")?.remove();const items=(data.items||[]).filter(a=>a.conversation_id===id);if(items.length){const root=controlNode("div",undefined,"chat-linked-artifacts");root.id="chat-linked-artifacts";root.append(...items.map(artifactCard));byId("chat-thread").append(root);}}catch(_error){/* A separate service outage must not interrupt a conversation. */}}
+byId("artifact-dialog-close").addEventListener("click",()=>byId("artifact-dialog").close());
+byId("artifact-dialog").addEventListener("close",()=>artifactModal?.destroy());
+byId("chat-artifacts-open").addEventListener("click",()=>openArtifact(null,{conversation_id:chatUi.id||""}));
+
 function showView(name) {
-  const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration"];
+  const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration", "artifacts"];
   const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(typeof name === "string" && name.startsWith("#") ? name : `#${name || ""}`);
   name = allowed.includes(link.view) ? link.view : "sessions";
   if (link.workspace || link.session || link.pane) {
@@ -2757,6 +2787,7 @@ function showView(name) {
   const linkedSessions = name === "sessions" && (link.workspace || link.session || link.pane || link.file);
   const targetHash = linkedSessions ? globalThis.AutomoniquePlatformCockpit.buildDeepLink(link) : `#${name}`;
   if (window.location.hash !== targetHash) history.replaceState(null, "", targetHash);
+  if (name === "artifacts") mountArtifactLibrary();
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
   if (name === "sessions") loadPlatform();
@@ -3724,12 +3755,12 @@ const processPanel = (() => {
     actions.append(action("Refresh",()=>loadProcesses({announce:true}),"refresh"));
     const updated=text("span",undefined,"run-updated");updated.append(time(job.updated_at));actions.append(updated);summary.append(actions);
     const tabs=text("div",undefined,"drawer-tabs run-tabs");tabs.setAttribute("role","tablist");tabs.setAttribute("aria-label",translatePhrase("Run sections"));
-    for(const [key,label] of [["overview","Overview"],["activity","Activity"],["details","Details"]]){
+    for(const [key,label] of [["overview","Overview"],["activity","Activity"],["artifacts","Deliverables"],["details","Details"]]){
       const button=action(label,()=>switchTab(key,true),`tab-${key}`,state.tab===key?"is-active":"");button.id=`run-tab-${key}`;button.setAttribute("role","tab");button.setAttribute("aria-controls",`run-pane-${key}`);button.setAttribute("aria-selected",String(state.tab===key));button.tabIndex=state.tab===key?0:-1;
-      button.addEventListener("keydown",event=>{const keys=["overview","activity","details"],i=keys.indexOf(key);const target=event.key==="ArrowRight"?keys[(i+1)%3]:event.key==="ArrowLeft"?keys[(i+2)%3]:event.key==="Home"?keys[0]:event.key==="End"?keys[2]:null;if(target){event.preventDefault();switchTab(target,true);}});tabs.append(button);
+      button.addEventListener("keydown",event=>{const keys=["overview","activity","artifacts","details"],i=keys.indexOf(key);const target=event.key==="ArrowRight"?keys[(i+1)%keys.length]:event.key==="ArrowLeft"?keys[(i+keys.length-1)%keys.length]:event.key==="Home"?keys[0]:event.key==="End"?keys[keys.length-1]:null;if(target){event.preventDefault();switchTab(target,true);}});tabs.append(button);
     }
     body.replaceChildren(summary,tabs);
-    for(const [key,build] of [["overview",()=>overview(job,state)],["activity",()=>activity(job,state)],["details",()=>details(job)]]){const pane=build();pane.id=`run-pane-${key}`;pane.classList.add("run-pane");pane.setAttribute("role","tabpanel");pane.setAttribute("aria-labelledby",`run-tab-${key}`);pane.hidden=state.tab!==key;body.append(pane);}
+    for(const [key,build] of [["overview",()=>overview(job,state)],["activity",()=>activity(job,state)],["artifacts",()=>artifactRunPane(job)],["details",()=>details(job)]]){const pane=build();pane.id=`run-pane-${key}`;pane.classList.add("run-pane");pane.setAttribute("role","tabpanel");pane.setAttribute("aria-labelledby",`run-tab-${key}`);pane.hidden=state.tab!==key;body.append(pane);}
     body.scrollTop=scroll;
     if(focusKey){const replacement=[...drawer.querySelectorAll("[data-run-focus]")].find(node=>node.dataset.runFocus===focusKey && !node.closest("[hidden]"));if(replacement){replacement.focus({preventScroll:true});if(selection && replacement.tagName==="INPUT")replacement.setSelectionRange(...selection);}}
   }
@@ -7002,6 +7033,7 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
     head.append(label,copy);pre.replaceWith(wrapper);wrapper.append(head,pre);
   }
   body.append(markdown);
+  appendArtifactReferences(body,content);
   if (role !== "user" && details.action) body.append(createActionCard(details.action));
   if (details.error) body.append(controlButton("Reload conversation",()=>loadChatHistory(true)));
   const meta = document.createElement("div");
@@ -7430,6 +7462,7 @@ function applyChatHistory(history) {
   byId("chat-state").textContent=translatePhrase("Ready");
   byId("chat-memory-count").textContent="-";byId("chat-source-count").textContent="0";byId("chat-latency").textContent="-";
   renderChatConversations();scrollChatLatest();updateChatComposer();
+  loadConversationArtifacts();
 }
 function addOlderChatButton() {
   refreshChatNavigation();
