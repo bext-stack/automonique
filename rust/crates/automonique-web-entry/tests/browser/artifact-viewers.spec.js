@@ -28,6 +28,28 @@ test('PDF renders pixels and selectable text, navigates, searches, zooms and rot
  expect(errors).toEqual([]);expect(requests.filter(u=>!u.startsWith('https://viewer.test/'))).toEqual([]);
  await page.screenshot({path:'/tmp/asset-viewer-pdf-'+test.info().project.name+'.png'});
 });
+test('PDF hover navigation, anchored wheel zoom and touch controls work together',async({page,isMobile})=>{
+ const frame=await open(page),view=frame.locator('.pdf-viewport'),sheet=frame.locator('.pdf-page'),dock=frame.locator('.pdf-dock');
+ await expect(frame.locator('.textLayer')).toContainText('First page');
+ const previous=frame.getByRole('button',{name:'Afficher la page précédente'}),next=frame.getByRole('button',{name:'Afficher la page suivante'});
+ await expect(previous).toBeDisabled();await expect(next).toBeEnabled();
+ if(!isMobile){await page.mouse.move(0,0);await expect(dock).toHaveCSS('opacity','0');await view.hover();}
+ await expect(dock).toHaveCSS('opacity','1');await next.click();await expect(frame.locator('.textLayer')).toContainText('Second page');await expect(next).toBeDisabled();await previous.click();await expect(frame.locator('.textLayer')).toContainText('First page');
+ await frame.getByRole('combobox',{name:'Zoom du PDF'}).selectOption('2');await expect(frame.locator('.page-footer')).toContainText('200 %');
+ const anchor=await view.evaluate(v=>{v.scrollTop=160;v.scrollLeft=100;const r=v.getBoundingClientRect(),s=v.querySelector('.pdf-page').getBoundingClientRect(),x=r.left+v.clientWidth*.4,y=r.top+v.clientHeight*.4;v.dispatchEvent(new WheelEvent('wheel',{deltaY:-120,clientX:x,clientY:y,bubbles:true,cancelable:true}));return {x,y,docX:(x-s.left)/2,docY:(y-s.top)/2};});
+ await expect(frame.locator('.page-footer')).toContainText('254 %');
+ const after=await sheet.evaluate((s,a)=>{const r=s.getBoundingClientRect(),factor=r.width/400;return {x:r.left+a.docX*factor,y:r.top+a.docY*factor};},anchor);
+ expect(Math.abs(after.x-anchor.x)).toBeLessThan(2);expect(Math.abs(after.y-anchor.y)).toBeLessThan(2);
+ const width=await sheet.evaluate(s=>s.clientWidth);const top=await view.evaluate(v=>{const before=v.scrollTop;v.dispatchEvent(new WheelEvent('wheel',{deltaY:90,shiftKey:true,bubbles:true,cancelable:true}));return {before,after:v.scrollTop};});expect(top.after).toBeGreaterThan(top.before);expect(await sheet.evaluate(s=>s.clientWidth)).toBe(width);
+ // Repeated trackpad events accumulate, while render completion cannot exceed the limit.
+ await view.evaluate(v=>{for(let i=0;i<12;i++)v.dispatchEvent(new WheelEvent('wheel',{deltaY:-300,clientX:100,clientY:100,bubbles:true,cancelable:true}));});await expect(frame.locator('.page-footer')).toContainText('400 %');await expect(frame.getByRole('button',{name:'Agrandir le PDF'})).toBeDisabled();
+ await view.focus();await view.press('0');await expect(frame.getByRole('combobox',{name:'Zoom du PDF'})).toHaveValue('page');await expect.poll(()=>sheet.evaluate(s=>s.clientWidth)).toBeLessThan(width);
+ await view.press('+');await expect.poll(()=>frame.getByRole('combobox',{name:'Zoom du PDF'}).inputValue()).not.toBe('page');await view.press('PageDown');await expect(frame.locator('.textLayer')).toContainText('Second page');
+ if(isMobile){await expect(next).toHaveCSS('opacity','0.35');expect(await next.evaluate(b=>b.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);}
+ else {await frame.getByRole('combobox',{name:'Zoom du PDF'}).selectOption('3');await expect(frame.locator('.page-footer')).toContainText('300 %');await frame.getByRole('button',{name:'Déplacer le document'}).click();await view.evaluate(v=>{v.scrollTop=200;v.scrollLeft=120;});const box=await view.boundingBox();await page.mouse.move(box.x+100,box.y+100);await page.mouse.down();await page.mouse.move(box.x+60,box.y+60);await page.mouse.up();expect(await view.evaluate(v=>v.scrollTop)).toBeGreaterThan(220);await frame.getByRole('button',{name:'Déplacer le document'}).click();await expect(view).not.toHaveClass(/pdf-pan/);}
+ expect(errors).toEqual([]);expect(await frame.locator('body').evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ await page.screenshot({path:'/tmp/pdf-interactions-'+test.info().project.name+'.png'});
+});
 test('images zoom, rotate, change backgrounds and navigate without exposing the parent',async({page})=>{
  await open(page);let frame=await choose(page,'one.svg');await expect(frame.locator('.page-footer')).toContainText('800 × 400');await frame.getByRole('combobox',{name:'Zoom de l’image'}).selectOption('2');await expect(frame.locator('.page-footer')).toContainText('200 %');await frame.getByRole('button',{name:'Pivoter'}).click();await expect(frame.locator('.image-wrap img')).toHaveCSS('transform',/matrix\(0, 1, -1, 0/);await frame.getByRole('combobox',{name:'Fond de l’image'}).selectOption('dark');await expect(frame.locator('.image-surface')).toHaveAttribute('data-background','dark');await frame.getByRole('button',{name:'Image suivante'}).click();frame=page.frameLocator('.aw-preview > iframe');await expect(frame.locator('.page-footer')).toContainText('200 × 300');await expect(page.locator('.aw-filename')).toHaveText('two.svg');expect(errors).toEqual([]);
 });

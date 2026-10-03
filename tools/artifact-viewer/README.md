@@ -27,7 +27,13 @@ static-file policy does not permit blob media, so do not use a static HTML URL.
 Monique serves the document at `/artifact-viewer`.
 
 PDFs support page navigation, thumbnails, bookmarks, selectable text, search,
-zoom, rotation and password entry. Passwords remain in the frame. Scanned PDFs
+zoom, rotation and password entry. Hover or keyboard focus reveals page arrows
+and a compact zoom/pan dock; touch devices keep these controls visible. The
+wheel zooms around the pointer (10–400%); Shift + wheel scrolls the document.
+The document accepts +/− to zoom, 0 to fit, and arrow/Page Up/Page Down keys to
+change pages. The optional hand tool pans without changing text selection mode
+by default. Completed page renders replace the prior canvas without blanking it.
+Passwords remain in the frame. Scanned PDFs
 without a text layer have no text search; OCR and annotation editing are not
 included. Images support zoom, panning, rotation, backgrounds and bundle
 navigation. CSV previews show at most 10,000 rows and 100 columns, with lazy row
