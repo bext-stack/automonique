@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_auth;
+mod chat_conversations;
 mod connection_tests;
 mod controls;
 mod jev;
@@ -203,6 +204,8 @@ pub enum Route {
     ApiChat,
     ApiChatAction,
     ApiChatHistory,
+    ApiChatConversations,
+    ApiChatConversationAction,
     ApiChatNew,
     ApiManageChatHistory,
     ApiManageChatTurn,
@@ -758,6 +761,7 @@ pub struct WebIntegration {
     state_dir: PathBuf,
     runtime_dir: PathBuf,
     controls: controls::Controls,
+    dashboard_chat: Mutex<()>,
     memory_path: PathBuf,
     lane: Mutex<SocketRunLane>,
     platform: Mutex<PlatformClient<UnixTransport>>,
@@ -1862,12 +1866,14 @@ struct MemoryActionRequest {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    expected_conversation: Option<String>,
     message: String,
     profile: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatActionRequest {
+    expected_conversation: Option<String>,
     action_id: String,
     decision: String,
 }
@@ -1999,6 +2005,8 @@ impl ManageChatContextRef {
 
 #[derive(Serialize)]
 struct ChatResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
     schema: &'static str,
     answer: String,
     profile: &'static str,
@@ -2338,6 +2346,8 @@ enum SlackReadPlan {
 
 #[derive(Serialize)]
 struct ChatHistoryView {
+    conversation_id: Option<String>,
+    has_more: bool,
     schema: &'static str,
     messages: Vec<ChatMessageView>,
     pending_actions: Vec<ChatActionView>,
@@ -2345,6 +2355,7 @@ struct ChatHistoryView {
 
 #[derive(Serialize)]
 struct ChatMessageView {
+    id: i64,
     role: String,
     content: String,
     created_at_ms: i64,
@@ -2438,6 +2449,7 @@ impl WebIntegration {
             state_dir: state_dir.to_path_buf(),
             runtime_dir: runtime_dir.to_path_buf(),
             controls: controls::Controls::default(),
+            dashboard_chat: Mutex::new(()),
             memory_path: state_dir.join("agent-memory.sqlite3"),
             lane: Mutex::new(lane),
             platform: Mutex::new(PlatformClient::new(UnixTransport::new(admin_socket))),
@@ -3523,7 +3535,16 @@ impl WebIntegration {
         request: ChatRequest,
         status: &DashboardStatus,
     ) -> Result<ChatResponse, &'static str> {
-        self.chat_bound(request, status, &ChatBinding::dashboard(), None)
+        let _guard = self
+            .dashboard_chat
+            .try_lock()
+            .map_err(|_| "chat_lane_busy")?;
+        if let Some(expected) = &request.expected_conversation {
+            self.check_chat_selection(expected)?;
+        }
+        let mut response = self.chat_bound(request, status, &ChatBinding::dashboard(), None)?;
+        response.conversation_id = self.dashboard_conversation_id()?;
+        Ok(response)
     }
 
     fn manage_chat(
@@ -3539,6 +3560,7 @@ impl WebIntegration {
             .transpose()?;
         let mut response = self.chat_bound(
             ChatRequest {
+                expected_conversation: None,
                 message: request.message,
                 profile: request.profile,
             },
@@ -3944,6 +3966,7 @@ impl WebIntegration {
             })
             .map_err(|_| "memory_write_refused")?;
         Ok(ChatResponse {
+            conversation_id: None,
             schema: "automonique.dashboard.chat/v2",
             answer,
             profile: profile_name,
@@ -4356,6 +4379,7 @@ impl WebIntegration {
             })
             .map_err(|_| "memory_write_refused")?;
         Ok(ChatResponse {
+            conversation_id: None,
             schema: "automonique.dashboard.chat/v2",
             answer,
             profile: "operational",
@@ -4822,6 +4846,7 @@ impl WebIntegration {
             })
             .map_err(|_| "memory_write_refused")?;
         Ok(ChatResponse {
+            conversation_id: None,
             schema: "automonique.dashboard.chat/v2",
             answer,
             profile: "operational",
@@ -4841,6 +4866,13 @@ impl WebIntegration {
         &self,
         request: ChatActionRequest,
     ) -> Result<ChatResponse, &'static str> {
+        let _guard = self
+            .dashboard_chat
+            .try_lock()
+            .map_err(|_| "chat_lane_busy")?;
+        if let Some(expected) = &request.expected_conversation {
+            self.check_chat_selection(expected)?;
+        }
         self.resolve_chat_action_bound(request, &ChatBinding::dashboard())
     }
 
@@ -4851,6 +4883,7 @@ impl WebIntegration {
         let binding = ChatBinding::manage(&request.subject)?;
         let mut response = self.resolve_chat_action_bound(
             ChatActionRequest {
+                expected_conversation: None,
                 action_id: request.action_id,
                 decision: request.decision,
             },
@@ -4942,6 +4975,7 @@ impl WebIntegration {
             })
             .map_err(|_| "memory_write_refused")?;
         Ok(ChatResponse {
+            conversation_id: None,
             schema: "automonique.dashboard.chat/v2",
             answer,
             profile: "operational",
@@ -4990,12 +5024,14 @@ impl WebIntegration {
             .map_err(|_| "memory_unavailable")?
         else {
             return Ok(ChatHistoryView {
+                conversation_id: None,
+                has_more: false,
                 schema,
                 messages: Vec::new(),
                 pending_actions: Vec::new(),
             });
         };
-        let messages = store
+        let messages: Vec<ChatMessageView> = store
             .recent_messages(
                 &self.config.tenant,
                 &self.config.actor,
@@ -5006,6 +5042,7 @@ impl WebIntegration {
             .map_err(|_| "memory_unavailable")?
             .into_iter()
             .map(|message| ChatMessageView {
+                id: message.id,
                 role: message.role,
                 content: message.content,
                 created_at_ms: message.created_at_ms,
@@ -5067,13 +5104,22 @@ impl WebIntegration {
                 }),
         );
         Ok(ChatHistoryView {
+            conversation_id: Some(conversation),
+            has_more: messages.len() == 32,
             schema,
             messages,
             pending_actions,
         })
     }
 
-    fn new_chat(&self) -> Result<ChatHistoryView, &'static str> {
+    fn new_chat(&self, expected: Option<&str>) -> Result<ChatHistoryView, &'static str> {
+        let _guard = self
+            .dashboard_chat
+            .try_lock()
+            .map_err(|_| "chat_lane_busy")?;
+        if let Some(expected) = expected {
+            self.check_chat_selection(expected)?;
+        }
         self.new_chat_bound(
             &ChatBinding::dashboard(),
             "automonique.dashboard.chat-history/v1",
@@ -5136,6 +5182,8 @@ impl WebIntegration {
                 .map_err(|_| "memory_write_refused")?;
         }
         Ok(ChatHistoryView {
+            conversation_id: None,
+            has_more: false,
             schema,
             messages: Vec::new(),
             pending_actions: Vec::new(),
@@ -7219,6 +7267,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/chat" => Route::ApiChat,
                 "/api/chat/action" => Route::ApiChatAction,
                 "/api/chat/history" => Route::ApiChatHistory,
+                "/api/chat/conversations" => Route::ApiChatConversations,
+                "/api/chat/conversations/action" => Route::ApiChatConversationAction,
                 "/api/chat/new" => Route::ApiChatNew,
                 "/api/v1/manage-chat/history" => Route::ApiManageChatHistory,
                 "/api/v1/manage-chat/turn" => Route::ApiManageChatTurn,
@@ -7252,6 +7302,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::MobilePlatformV2Grant
                     | Route::ApiChat
                     | Route::ApiChatAction
+                    | Route::ApiChatConversationAction
                     | Route::ApiChatNew
                     | Route::ApiManageChatHistory
                     | Route::ApiManageChatTurn
@@ -7715,6 +7766,8 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiChat
         | Route::ApiChatAction
         | Route::ApiChatHistory
+        | Route::ApiChatConversations
+        | Route::ApiChatConversationAction
         | Route::ApiChatNew
         | Route::ApiManageChatHistory
         | Route::ApiManageChatTurn
@@ -8090,13 +8143,38 @@ fn api_response(
             },
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
+        Route::ApiChatConversations => match integration.chat_conversations() {
+            Ok(view) => json_response("200 OK", &view),
+            Err(reason) => json_error("503 Service Unavailable", reason),
+        },
+        Route::ApiChatConversationAction => {
+            match serde_json::from_slice::<chat_conversations::ConversationAction>(body) {
+                Ok(action) => match integration.chat_conversation_action(action) {
+                    Ok(view) => json_response("200 OK", &view),
+                    Err(reason) => json_error("409 Conflict", reason),
+                },
+                Err(_) => json_error("400 Bad Request", "invalid_json"),
+            }
+        }
         Route::ApiChatHistory => match integration.chat_history() {
             Ok(history) => json_response("200 OK", &history),
             Err(category) => json_error("503 Service Unavailable", category),
         },
-        Route::ApiChatNew => match integration.new_chat() {
-            Ok(history) => json_response("200 OK", &history),
-            Err(category) => json_error("503 Service Unavailable", category),
+        Route::ApiChatNew => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(value)
+                if value.is_object()
+                    && value
+                        .get("expected_conversation")
+                        .is_none_or(Value::is_string) =>
+            {
+                match integration
+                    .new_chat(value.get("expected_conversation").and_then(Value::as_str))
+                {
+                    Ok(history) => json_response("200 OK", &history),
+                    Err(category) => json_error("409 Conflict", category),
+                }
+            }
+            _ => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiManageChatHistory => {
             match serde_json::from_slice::<ManageChatSubjectRequest>(body) {
@@ -8585,6 +8663,8 @@ fn handle(
             | Route::ApiChat
             | Route::ApiChatAction
             | Route::ApiChatHistory
+            | Route::ApiChatConversations
+            | Route::ApiChatConversationAction
             | Route::ApiChatNew
             | Route::ApiManageChatHistory
             | Route::ApiManageChatTurn
@@ -13937,6 +14017,7 @@ mod tests {
         let response = integration
             .chat(
                 ChatRequest {
+                    expected_conversation: None,
                     message: String::from("what models do we have access to ?"),
                     profile: None,
                 },
@@ -15006,6 +15087,7 @@ mod tests {
         decision: &str,
     ) -> Result<ChatResponse, &'static str> {
         integration.resolve_chat_action(ChatActionRequest {
+            expected_conversation: None,
             action_id: action_id.to_owned(),
             decision: decision.to_owned(),
         })

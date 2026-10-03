@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=25">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=26">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=26" defer></script>
+    <script src="/assets/dashboard.js?v=27" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -172,45 +172,49 @@
 
         <!-- ASSISTANT -->
         <section class="view" data-panel="chat" aria-labelledby="chat-title">
-          <div class="view-head">
-            <div class="view-title"><h1 id="chat-title">Assistant</h1><span class="tag">GENERAL HELP</span></div>
-            <p class="view-lede">Ask anything about Monique. For work on a task, reply inside that task instead.</p>
-            <div class="view-actions"><button class="button ghost" type="button" data-open-sessions>Back to tasks</button></div>
-          </div>
-          <div class="chat-layout">
+          <div class="chat-workspace" id="chat-workspace">
+            <aside class="chat-history" id="chat-history" aria-label="Conversation history">
+              <div class="chat-history-head"><strong>Conversations</strong><button class="chat-icon-button" id="chat-history-close" type="button" aria-label="Close conversation history">×</button></div>
+              <button class="button primary" id="new-chat" type="button">＋ New chat</button>
+              <input id="chat-history-search" type="search" placeholder="Search conversations…" aria-label="Search conversations" autocomplete="off">
+              <div class="chat-history-list" id="chat-history-list"><p class="inline-hint">Loading conversations…</p></div>
+              <div class="chat-history-foot"><small>Recent conversations · retained for 90 days</small><button class="text-button" type="button" data-open-sessions>Back to tasks</button></div>
+            </aside>
+            <button class="chat-history-backdrop" id="chat-history-backdrop" type="button" aria-label="Close conversation history" hidden></button>
             <article class="chat-surface">
-              <div class="chat-model-bar">
-                <div class="model-identity"><span>M</span><div><strong>Monique</strong><small>General assistant</small></div></div>
+              <header class="chat-model-bar">
+                <button class="chat-icon-button" id="chat-history-toggle" type="button" aria-controls="chat-history" aria-expanded="true" aria-label="Toggle conversation history" title="Conversation history">☰</button>
+                <div class="chat-heading"><h1 id="chat-title">Monique</h1><p id="chat-conversation-title" data-i18n-skip></p></div>
                 <div class="chat-model-actions">
-                  <div class="chat-context-summary" aria-label="Conversation context">
-                    <span><b id="chat-memory-count">-</b> memory</span>
-                    <span><b id="chat-source-count">0</b> live</span>
-                    <span><b id="chat-latency">-</b> last turn</span>
-                    <span id="chat-manage-state" hidden>Actions ready</span>
+                  <button class="chat-icon-button" id="chat-new-shortcut" type="button" aria-label="New chat" title="New chat">＋</button>
+                  <details class="chat-options" id="chat-options"><summary aria-label="Conversation options" title="Conversation options">···</summary><div class="chat-options-menu">
+                    <strong>Conversation context</strong>
+                    <div class="chat-context-summary"><span><b id="chat-memory-count">-</b> memory</span><span><b id="chat-source-count">0</b> live</span><span><b id="chat-latency">-</b> last turn</span><span id="chat-manage-state" hidden>Actions ready</span></div>
+                    <button class="button ghost small voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
+                    <button class="button ghost small" id="chat-export" type="button">Export visible messages</button>
+                    <button class="button ghost small" id="chat-reload" type="button">Reload conversation</button>
+                    <small>GENERAL HELP</small><p>For work on a task, reply inside that task instead.</p>
+                  </div></details>
+                </div>
+              </header>
+              <div class="chat-reading-area">
+                <div class="chat-thread" id="chat-thread" aria-label="Conversation messages" aria-busy="true">
+                  <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Think it through, find an answer, or get something done.</p></div>
+                </div>
+                <button class="button ghost small chat-jump" id="chat-jump" type="button" hidden>↓ Latest messages</button>
+              </div>
+              <div class="chat-compose-area">
+                <div class="chat-compose-status"><span id="chat-state" role="status">Loading conversation…</span><span class="composer-hint"><span id="chat-limit" hidden><b id="chat-count">0</b>/8192 · </span><span id="chat-keyboard-hint">Shift + Enter for a new line</span></span></div>
+                <form class="composer" id="chat-form">
+                  <textarea id="chat-input" maxlength="8192" rows="1" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
+                  <div class="composer-row">
+                    <label class="chat-mode"><span class="sr-only">Mode</span><select id="chat-profile" aria-label="Response mode"><option value="conversation">Fast conversation</option><option value="operational">Operational reasoning</option></select></label>
+                    <button class="voice-input-button" id="voice-input" type="button" aria-pressed="false" aria-label="Start voice input" title="Start voice input">MIC</button>
+                    <button class="send-button" id="chat-send" type="submit" aria-label="Send message" disabled>↑</button>
                   </div>
-                  <button class="button ghost small voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
-                  <button class="button ghost small new-chat-button" id="new-chat" type="button">＋ New chat</button>
-                </div>
+                </form>
+                <p class="chat-disclaimer">Monique can make mistakes. Check important information.</p>
               </div>
-              <div class="chat-thread" id="chat-thread" aria-live="polite">
-                <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Ask naturally. I can use what I remember, read connected tools, and prepare actions for your approval.</p><div class="starter-grid"><button type="button" data-chat-prompt="Explain the current operational health and any risks."><strong>Explain system health</strong><small>Live status and risks</small></button><button type="button" data-chat-prompt="Summarize the latest relevant Slack messages."><strong>Catch me up</strong><small>Recent Slack messages</small></button><button type="button" data-chat-prompt="What do you remember that is most relevant right now? Cite memory references."><strong>Explore memory</strong><small>What Monique remembers</small></button><button type="button" data-chat-prompt="Show me the useful actions available in Manage AI Operations and help me choose the right one."><strong>Work in Manage</strong><small>Prepare an action for approval</small></button></div></div>
-              </div>
-              <form class="composer" id="chat-form">
-                <textarea id="chat-input" maxlength="8192" rows="2" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
-                <div class="composer-row">
-                  <label>Mode
-                    <select id="chat-profile">
-                      <option value="conversation">Fast conversation</option>
-                      <option value="operational">Operational reasoning</option>
-                    </select>
-                  </label>
-                  <span class="composer-hint"><b id="chat-count">0</b>/8192 · <kbd>Enter</kbd> send</span>
-                  <span id="chat-state" role="status">Ready</span>
-                  <button class="voice-input-button" id="voice-input" type="button" aria-pressed="false" aria-label="Start voice input" title="Start voice input">MIC</button>
-                  <button class="send-button" id="chat-send" type="submit" aria-label="Send message">↑</button>
-                </div>
-              </form>
-              <p class="chat-disclaimer">Monique can make mistakes. Answers show when they rely on memory or live sources. Voice uses your browser and starts only when you press a voice button.</p>
             </article>
           </div>
         </section>

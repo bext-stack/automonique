@@ -72,8 +72,7 @@ let voiceRepliesEnabled = storedPreference("monique-voice-replies", ["on", "off"
 let activeSpeechButton = null;
 let activeSpeechUtterance = null;
 let activeSpeechStatus = null;
-let newChatArmed = false;
-let newChatTimer = null;
+const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),follow:true,hasMore:false};
 let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
@@ -1403,6 +1402,45 @@ const frenchUi = Object.freeze({
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
+  // Conversation workspace.
+  "Today": "Aujourd’hui",
+  "Close conversation history": "Fermer l’historique",
+  "Toggle conversation history": "Afficher ou masquer l’historique",
+  "Search conversations…": "Rechercher une conversation…",
+  "Search conversations": "Rechercher une conversation",
+  "Recent conversations · retained for 90 days": "Conversations récentes · conservées 90 jours",
+  "Conversation options": "Options de la conversation",
+  "Export visible messages": "Exporter les messages affichés",
+  "Reload conversation": "Recharger la conversation",
+  "Conversation messages": "Messages de la conversation",
+  "Think it through, find an answer, or get something done.": "Réfléchir ensemble, trouver une réponse ou avancer sur un projet.",
+  "↓ Latest messages": "↓ Derniers messages",
+  "Loading conversation…": "Chargement de la conversation…",
+  "Shift + Enter for a new line": "Maj + Entrée pour une nouvelle ligne",
+  "Response mode": "Mode de réponse",
+  "Monique can make mistakes. Check important information.": "Monique peut se tromper. Vérifiez les informations importantes.",
+  "Your message is too long. Shorten it before sending.": "Votre message est trop long. Raccourcissez-le avant de l’envoyer.",
+  "Previous 7 days": "7 derniers jours",
+  "Earlier": "Plus anciennes",
+  "No conversations match your search.": "Aucune conversation ne correspond à votre recherche.",
+  "Your conversations will appear here.": "Vos conversations apparaîtront ici.",
+  "Conversation history is unavailable.": "L’historique des conversations est indisponible.",
+  "Load earlier messages": "Charger les messages précédents",
+  "Thinking…": "Réflexion en cours…",
+  "Reply unavailable · your draft is kept": "Réponse indisponible · votre brouillon est conservé",
+  "Visible messages from this conversation.": "Messages affichés dans cette conversation.",
+  "Make a plan": "Préparer un plan",
+  "Turn an idea into clear next steps": "Passer d’une idée à des étapes concrètes",
+  "Help me turn an idea into a clear plan.": "Aide-moi à transformer une idée en un plan clair.",
+  "Write something": "Trouver les mots",
+  "Draft, rewrite, or find the right words": "Rédiger, reformuler ou améliorer un texte",
+  "Help me improve a piece of writing.": "Aide-moi à améliorer un texte.",
+  "The active conversation changed. Reload it before sending.": "La conversation active a changé. Rechargez-la avant d’envoyer un message.",
+  "This conversation is no longer available.": "Cette conversation n’est plus disponible.",
+  "Copy code": "Copier le code",
+  "Code copied.": "Code copié.",
+  "Code": "Code",
+  "Use again": "Réutiliser",
   // Agent run inspector.
   "Saved output": "Sortie conservée",
   "Live output": "Sortie en direct",
@@ -6914,6 +6952,8 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   byId("chat-empty")?.remove();
   const item = document.createElement("article");
   item.className = `message ${role === "user" ? "user" : "assistant"}${details.error ? " error" : ""}`;
+  item._chatContent = String(content);
+  if (Number.isSafeInteger(details.id)) item.dataset.chatMessageId = String(details.id);
   const avatar = document.createElement("span");
   avatar.className = "message-avatar";
   avatar.textContent = role === "user" ? "YOU" : "M";
@@ -6923,8 +6963,16 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   markdown.className = "message-markdown";
   if (!details.error && !details.localized) markdown.setAttribute("data-i18n-skip", "");
   markdown.append(renderMarkdown(content));
+  for (const pre of markdown.querySelectorAll("pre")) {
+    const code=pre.querySelector("code");if(!code)continue;
+    const wrapper=controlNode("div",undefined,"chat-code-block"),head=controlNode("div",undefined,"chat-code-head");
+    const label=controlData("span",code.dataset.language || translatePhrase("Code"));
+    const copy=controlButton("Copy code",async()=>{await navigator.clipboard.writeText(code.textContent);toast(translatePhrase("Code copied."));});
+    head.append(label,copy);pre.replaceWith(wrapper);wrapper.append(head,pre);
+  }
   body.append(markdown);
   if (role !== "user" && details.action) body.append(createActionCard(details.action));
+  if (details.error) body.append(controlButton("Reload conversation",()=>loadChatHistory(true)));
   const meta = document.createElement("div");
   meta.className = "message-meta";
   meta.dataset.createdAt = String(createdAt);
@@ -6992,9 +7040,13 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
     tools.append(actions);
     body.append(tools);
   }
-  if (role === "user") item.append(body, avatar); else item.append(avatar, body);
+  if (role === "user") {
+    const tools=controlNode("div",undefined,"message-tools"),actions=controlNode("div",undefined,"message-actions");
+    const reuse=controlButton("Use again",()=>{byId("chat-input").value=String(content);updateChatComposer();byId("chat-input").focus();});reuse.dataset.reusePrompt="";
+    actions.append(reuse);tools.append(actions);body.append(tools);item.append(body,avatar);
+  } else item.append(avatar,body);
   byId("chat-thread").append(item);
-  item.scrollIntoView({ block: "end" });
+  revealChatMessage(role === "user");
   if (role !== "user" && details.speak && voiceRepliesEnabled) {
     window.setTimeout(() => speakText(markdown.innerText || markdown.textContent), 0);
   }
@@ -7038,6 +7090,7 @@ function createActionCard(action) {
 async function resolveChatAction(card, decision) {
   if (chatBusy || card.dataset.state) return;
   chatBusy = true;
+  updateChatComposer();
   card.dataset.state = "working";
   card.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   const pending = appendPendingMessage();
@@ -7049,7 +7102,7 @@ async function resolveChatAction(card, decision) {
     const answer = await api("/api/chat/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action_id: card.dataset.actionId, decision }),
+      body: JSON.stringify({ action_id: card.dataset.actionId, decision, expected_conversation: chatUi.id || "" }),
     });
     pending.remove();
     card.dataset.state = decision === "approve" ? "approved" : "denied";
@@ -7072,6 +7125,7 @@ async function resolveChatAction(card, decision) {
     toast("The action was not completed.", "error");
   } finally {
     chatBusy = false;
+    updateChatComposer();
   }
 }
 
@@ -7088,14 +7142,14 @@ function appendPendingMessage() {
   dots.className = "thinking-dots";
   dots.setAttribute("aria-label", "Monique is working");
   dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
-  body.append(dots);
+  body.append(dots, controlNode("span", "Thinking…", "chat-pending-label"));
   item.append(avatar, body);
   byId("chat-thread").append(item);
-  item.scrollIntoView({ block: "end" });
+  revealChatMessage();
   return item;
 }
 
-function createWelcome(title = "How can I help?", text = "Ask naturally. I can use reviewed memory, live sources, and prepare actions for your approval.") {
+function createWelcome(title = "What can I help with?", text = "Think it through, find an answer, or get something done.") {
   const empty = document.createElement("div");
   empty.className = "empty-state";
   empty.id = "chat-empty";
@@ -7108,10 +7162,10 @@ function createWelcome(title = "How can I help?", text = "Ask naturally. I can u
   const starters = document.createElement("div");
   starters.className = "starter-grid";
   [
-    ["Explain system health", "Review live status and surface risks", "Explain the current operational health and any risks."],
-    ["Catch me up", "Read recent configured Slack context", "Summarize the latest relevant Slack messages."],
-    ["Explore memory", "Use reviewed durable evidence", "What do you remember that is most relevant right now? Cite memory references."],
-    ["Work in Manage", "Prepare a reviewable AI Operations action", "Show me the useful actions available in Manage AI Operations and help me choose the right one."],
+    ["Make a plan", "Turn an idea into clear next steps", "Help me turn an idea into a clear plan."],
+    ["Catch me up", "Recent Slack messages", "Summarize the latest relevant Slack messages."],
+    ["Explore memory", "What Monique remembers", "What do you remember that is most relevant right now? Cite memory references."],
+    ["Write something", "Draft, rewrite, or find the right words", "Help me improve a piece of writing."],
   ].forEach(([caption, description, prompt]) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -7127,27 +7181,109 @@ function createWelcome(title = "How can I help?", text = "Ask naturally. I can u
   return empty;
 }
 
-async function loadChatHistory() {
-  const thread = byId("chat-thread");
-  if (thread.dataset.loaded === "true") return;
-  try {
-    const history = await api("/api/chat/history");
-    if ((history.messages || []).length > 0) {
-      thread.replaceChildren();
-      history.messages.forEach((message) => appendMessage(message.role, message.content, message.created_at_ms));
-    }
-    (history.pending_actions || []).forEach((action) => {
-      appendMessage("assistant", "This action is still awaiting your decision.", Date.now(), { action, localized: true });
-    });
-    thread.dataset.loaded = "true";
-  } catch (_error) {
-    byId("chat-state").textContent = "History unavailable";
-    toast("Durable chat history is unavailable.", "error");
+function updateChatComposer() {
+  const input=byId("chat-input");const bytes=new TextEncoder().encode(input.value).length;
+  input.disabled=chatUi.loading;
+  if(!CSS.supports("field-sizing", "content")){input.rows=1;const lineHeight=parseFloat(getComputedStyle(input).lineHeight)||24;input.rows=Math.min(7,Math.max(1,Math.ceil((input.scrollHeight-24)/lineHeight)));}
+  byId("chat-count").textContent=bytes.toLocaleString(localeTag());byId("chat-limit").hidden=bytes<6000;
+  byId("chat-send").disabled=chatBusy || chatUi.loading || !chatUi.ready || !input.value.trim() || bytes>8192;
+  byId("chat-profile").disabled=chatBusy || chatUi.loading;
+  byId("voice-input").disabled=chatBusy || chatUi.loading || !voiceInputSupported;
+  byId("chat-thread").querySelectorAll(".action-card").forEach(card=>card.querySelectorAll("button").forEach(button=>button.disabled=chatBusy || chatUi.loading || Boolean(card.dataset.state)));
+  byId("new-chat").disabled=chatBusy || chatUi.loading || !chatUi.ready;
+  byId("chat-new-shortcut").disabled=byId("new-chat").disabled;
+  byId("chat-reload").disabled=chatBusy || chatUi.loading;
+  byId("chat-export").disabled=!byId("chat-thread").querySelector(".message:not(.pending)");
+  byId("chat-thread").setAttribute("aria-busy",String(chatBusy || chatUi.loading));
+  document.querySelectorAll(".chat-history-item").forEach(button=>button.disabled=chatBusy || chatUi.loading);
+  document.querySelectorAll(".message-actions [data-reuse-prompt]").forEach(button=>button.disabled=chatUi.loading);
+  if(bytes>8192)byId("chat-state").textContent=translatePhrase("Your message is too long. Shorten it before sending.");
+  else if(chatUi.tooLong)byId("chat-state").textContent=translatePhrase(chatBusy?"Monique is working…":"Ready");
+  chatUi.tooLong=bytes>8192;
+  if(byId("chat-older"))byId("chat-older").disabled=chatBusy || chatUi.loading;
+}
+function chatAtBottom() {const thread=byId("chat-thread");return thread.scrollHeight-thread.scrollTop-thread.clientHeight<100;}
+function scrollChatLatest() {const thread=byId("chat-thread");thread.scrollTop=thread.scrollHeight;chatUi.follow=true;byId("chat-jump").hidden=true;}
+function revealChatMessage(force=false) {
+  if(force || chatUi.follow)scrollChatLatest();else byId("chat-jump").hidden=false;
+}
+function toggleChatHistory(open) {
+  const root=byId("chat-workspace");const narrow=matchMedia("(max-width: 1000px)").matches;
+  const current=narrow?root.classList.contains("history-open"):!root.classList.contains("history-collapsed");
+  open=open===undefined?!current:open;
+  if(narrow)root.classList.toggle("history-open",open);else {root.classList.toggle("history-collapsed",!open);root.classList.remove("history-open");}
+  byId("chat-history-backdrop").hidden=!(narrow && open);
+  byId("chat-history-toggle").setAttribute("aria-expanded",String(open));
+  if(narrow){byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=open;}
+  else {byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=false;}
+  if(narrow && open)byId("chat-history-search").focus();
+}
+function renderChatConversations() {
+  const root=byId("chat-history-list");const query=byId("chat-history-search").value.trim().toLocaleLowerCase();root.replaceChildren();
+  const items=chatUi.items.filter(item=>String(item.title||"").toLocaleLowerCase().includes(query));
+  let previousGroup=null;
+  for(const item of items){
+    const date=new Date(item.updated_at_ms);const today=new Date();const recent=new Date();recent.setDate(today.getDate()-7);
+    const group=date.toDateString()===today.toDateString()?"Today":date>=recent?"Previous 7 days":"Earlier";
+    if(group!==previousGroup){root.append(controlNode("h2",group));previousGroup=group;}
+    const button=controlButton("",()=>selectChatConversation(item.id));button.className="chat-history-item";button.dataset.conversationId=item.id;button.setAttribute("aria-current",String(item.id===chatUi.id));
+    button.append(controlData("strong",item.title || translatePhrase("New conversation")),controlNode("small",ticketDateLabel(new Date(item.updated_at_ms).toISOString())));button.title=item.title || translatePhrase("New conversation");button.disabled=chatBusy || chatUi.loading;root.append(button);
   }
+  if(!items.length)root.append(controlNode("p",query?"No conversations match your search.":"Your conversations will appear here.","inline-hint"));
+  const selected=chatUi.items.find(item=>item.id===chatUi.id);byId("chat-conversation-title").textContent=selected?.title || translatePhrase("New conversation");
+}
+async function loadChatConversations() {
+  try {const view=await api("/api/chat/conversations");chatUi.items=Array.isArray(view.items)?view.items:[];renderChatConversations();}
+  catch(_error){byId("chat-history-list").replaceChildren(controlNode("p","Conversation history is unavailable.","inline-hint"),controlButton("Try again",loadChatConversations));}
+}
+function rememberChatDraft() {chatUi.drafts.set(chatUi.id || "",byId("chat-input").value);}
+function applyChatHistory(history) {
+  stopSpeaking();const thread=byId("chat-thread");thread.replaceChildren();chatUi.id=history.conversation_id || null;chatUi.follow=false;
+  for(const message of history.messages || [])appendMessage(message.role,message.content,message.created_at_ms,{id:message.id});
+  for(const action of history.pending_actions || [])appendMessage("assistant","This action is still awaiting your decision.",Date.now(),{action,localized:true});
+  if(!thread.children.length)thread.append(createWelcome());
+  chatUi.hasMore=Boolean(history.has_more);addOlderChatButton();thread.dataset.loaded="true";chatUi.ready=true;
+  byId("chat-input").value=chatUi.seededPrompt ?? chatUi.drafts.get(chatUi.id || "") ?? "";
+  chatUi.seededPrompt=null;
+  byId("chat-state").textContent=translatePhrase("Ready");
+  byId("chat-memory-count").textContent="-";byId("chat-source-count").textContent="0";byId("chat-latency").textContent="-";
+  renderChatConversations();scrollChatLatest();updateChatComposer();
+}
+function addOlderChatButton() {
+  byId("chat-older")?.remove();if(!chatUi.hasMore)return;
+  const button=controlButton("Load earlier messages",loadOlderChatMessages);button.id="chat-older";byId("chat-thread").prepend(button);
+}
+async function selectChatConversation(id) {
+  if(chatBusy || chatUi.loading || id===chatUi.id)return;
+  rememberChatDraft();chatUi.loading=true;updateChatComposer();
+  try {const history=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"select",id,expected_conversation:chatUi.id || ""})});applyChatHistory(history);if(matchMedia("(max-width: 1000px)").matches)toggleChatHistory(false);}
+  catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+}
+async function loadOlderChatMessages() {
+  if(chatUi.loading || chatBusy || !chatUi.id)return;
+  const thread=byId("chat-thread"),first=thread.querySelector("[data-chat-message-id]");if(!first)return;
+  const id=chatUi.id;chatUi.loading=true;updateChatComposer();
+  try {
+    const page=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"older",id,before:Number(first.dataset.chatMessageId)})});
+    if(chatUi.id!==id)return;
+    const height=thread.scrollHeight,top=thread.scrollTop;byId("chat-older")?.remove();const old=[...thread.children];chatUi.follow=false;
+    const nodes=(page.messages || []).map(message=>appendMessage(message.role,message.content,message.created_at_ms,{id:message.id}));thread.replaceChildren(...nodes,...old);chatUi.hasMore=Boolean(page.has_more);addOlderChatButton();thread.scrollTop=top+(thread.scrollHeight-height);
+  }catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+}
+async function loadChatHistory(force=false) {
+  const thread=byId("chat-thread");if(chatUi.loading || chatBusy || (!force && thread.dataset.loaded==="true"))return;
+  rememberChatDraft();if(force)chatUi.seededPrompt=byId("chat-input").value;chatUi.loading=true;updateChatComposer();
+  try {applyChatHistory(await api("/api/chat/history"));await loadChatConversations();}
+  catch(_error){byId("chat-state").textContent=translatePhrase("History unavailable");toast("Durable chat history is unavailable.","error");}
+  finally{chatUi.loading=false;updateChatComposer();}
 }
 
 function humanChatError(category) {
   const messages = {
+    chat_conversation_changed: "The active conversation changed. Reload it before sending.",
+    chat_conversation_unavailable: "This conversation is no longer available.",
     chat_lane_busy: "Monique is finishing another contained turn. Try again in a moment.",
     slack_read_unavailable: "The configured Slack read is temporarily unavailable.",
     slack_tool_unavailable: "The Slack read surface is temporarily busy.",
@@ -7352,93 +7488,63 @@ function initializeVoiceSupport() {
 
 byId("chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (chatBusy) return;
-  stopVoiceInput();
-  const input = byId("chat-input");
-  const message = input.value.trim();
-  if (!message) return;
-  chatBusy = true;
-  appendMessage("user", message);
-  input.value = "";
-  byId("chat-count").textContent = "0";
-  byId("chat-send").disabled = true;
-  const pending = appendPendingMessage();
-  const started = performance.now();
-  const timer = window.setInterval(() => {
-    byId("chat-state").textContent = `Monique is working · ${Math.max(1, Math.round((performance.now() - started) / 1000))}s`;
-  }, 1000);
-  byId("chat-state").textContent = "Monique is working…";
+  if(chatBusy || chatUi.loading || !chatUi.ready)return;
+  stopVoiceInput();const input=byId("chat-input"),message=input.value.trim();
+  if(!message || new TextEncoder().encode(message).length>8192)return;
+  chatBusy=true;chatUi.drafts.delete(chatUi.id || "");appendMessage("user",message);input.value="";updateChatComposer();scrollChatLatest();
+  const pending=appendPendingMessage(),started=performance.now();
+  const timer=setInterval(()=>{const seconds=Math.max(1,Math.round((performance.now()-started)/1000));const label=pending.querySelector(".chat-pending-label");if(label)label.textContent=`${translatePhrase("Thinking…")} ${seconds}s`;},1000);
+  byId("chat-state").textContent=translatePhrase("Monique is working…");
   try {
-    const answer = await api("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, profile: byId("chat-profile").value }),
-    });
-    pending.remove();
-    const sources = Array.isArray(answer.live_sources) ? answer.live_sources : [];
-    appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action, speak: true });
-    byId("chat-memory-count").textContent = count(answer.memory_evidence);
-    byId("chat-source-count").textContent = count(sources.length);
-    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : `${Math.round(performance.now() - started).toLocaleString(localeTag())} ms`;
-    byId("chat-state").textContent = `${words(answer.profile)} · retained`;
-  } catch (error) {
-    pending.remove();
-    appendMessage("assistant", humanChatError(error.message), Date.now(), { error: true });
-    byId("chat-state").textContent = "Turn refused";
-    toast("Monique could not complete that turn.", "error");
-  } finally {
-    window.clearInterval(timer);
-    chatBusy = false;
-    byId("chat-send").disabled = false;
-    input.focus();
-  }
+    const answer=await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message,profile:byId("chat-profile").value,expected_conversation:chatUi.id || ""})});
+    pending.remove();chatUi.id=answer.conversation_id || chatUi.id;
+    const sources=Array.isArray(answer.live_sources)?answer.live_sources:[];
+    appendMessage("assistant",answer.answer,Date.now(),{sources,durationMs:answer.duration_ms,action:answer.action,speak:true});
+    byId("chat-memory-count").textContent=count(answer.memory_evidence);byId("chat-source-count").textContent=count(sources.length);
+    byId("chat-latency").textContent=Number.isSafeInteger(answer.duration_ms)?`${(answer.duration_ms/1000).toFixed(1)} s`:"-";
+    byId("chat-state").textContent=translatePhrase("Ready");await loadChatConversations();
+  }catch(error){
+    pending.remove();appendMessage("assistant",humanChatError(error.message),Date.now(),{error:true});
+    if(!input.value.trim())input.value=message;
+    byId("chat-state").textContent=translatePhrase("Reply unavailable · your draft is kept");
+  }finally{clearInterval(timer);chatBusy=false;updateChatComposer();}
 });
-
-byId("chat-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    byId("chat-form").requestSubmit();
-  }
+byId("chat-input").addEventListener("keydown",(event)=>{
+  if(event.key!=="Enter" || event.isComposing || event.keyCode===229)return;
+  const desktop=!matchMedia("(pointer: coarse)").matches;
+  if(!event.shiftKey && (desktop || event.ctrlKey || event.metaKey)){event.preventDefault();byId("chat-form").requestSubmit();}
 });
-byId("chat-input").addEventListener("input", (event) => {
-  byId("chat-count").textContent = event.target.value.length.toLocaleString(localeTag());
-});
+byId("chat-input").addEventListener("input",updateChatComposer);
 initializeVoiceSupport();
 
-function resetNewChatButton() {
-  window.clearTimeout(newChatTimer);
-  newChatArmed = false;
-  byId("new-chat").textContent = "New conversation";
-  byId("new-chat").removeAttribute("data-armed");
-}
-
-byId("new-chat").addEventListener("click", async () => {
-  if (chatBusy) {
-    toast("Wait for the current turn to finish before starting a new conversation.");
-    return;
-  }
-  if (!newChatArmed) {
-    newChatArmed = true;
-    byId("new-chat").textContent = "Confirm new conversation";
-    byId("new-chat").dataset.armed = "true";
-    newChatTimer = window.setTimeout(resetNewChatButton, 5000);
-    return;
-  }
-  byId("new-chat").disabled = true;
+byId("new-chat").addEventListener("click",async()=>{
+  if(chatBusy || chatUi.loading || !chatUi.ready)return;
+  rememberChatDraft();chatUi.loading=true;updateChatComposer();
   try {
-    await api("/api/chat/new", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    byId("chat-thread").replaceChildren(createWelcome("New conversation", "The previous durable conversation was archived. Long-term memory remains available."));
-    byId("chat-state").textContent = "New durable session";
-    byId("chat-memory-count").textContent = "-";
-    byId("chat-source-count").textContent = "0";
-    byId("chat-latency").textContent = "-";
-    toast("A new durable conversation is ready.");
-  } catch (error) {
-    byId("chat-state").textContent = `New chat refused · ${error.message}`;
-    toast("The current conversation was not changed.", "error");
-  } finally {
-    byId("new-chat").disabled = false;
-    resetNewChatButton();
+    const history=await api("/api/chat/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({expected_conversation:chatUi.id || ""})});
+    chatUi.drafts.delete("");applyChatHistory(history);await loadChatConversations();
+    if(matchMedia("(max-width: 1000px)").matches)toggleChatHistory(false);byId("chat-input").focus();
+  }catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+});
+byId("chat-new-shortcut").addEventListener("click",()=>byId("new-chat").click());
+byId("chat-history-search").addEventListener("input",renderChatConversations);
+byId("chat-history-toggle").addEventListener("click",()=>toggleChatHistory());
+for(const id of ["chat-history-close","chat-history-backdrop"])byId(id).addEventListener("click",()=>{toggleChatHistory(false);byId("chat-history-toggle").focus();});
+byId("chat-jump").addEventListener("click",scrollChatLatest);
+byId("chat-thread").addEventListener("scroll",()=>{chatUi.follow=chatAtBottom();if(chatUi.follow)byId("chat-jump").hidden=true;});
+byId("chat-reload").addEventListener("click",()=>{byId("chat-options").open=false;loadChatHistory(true);});
+byId("chat-export").addEventListener("click",()=>{
+  const messages=[...byId("chat-thread").querySelectorAll(".message:not(.pending)")].filter(node=>node._chatContent!==undefined);
+  const content=["# Monique",translatePhrase("Visible messages from this conversation."),...messages.map(node=>`## ${node.classList.contains("user")?translatePhrase("You"):"Monique"}\n\n${node._chatContent}`)].join("\n\n");
+  const url=URL.createObjectURL(new Blob([content],{type:"text/markdown;charset=utf-8"}));const link=document.createElement("a");link.href=url;link.download="monique-conversation.md";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);byId("chat-options").open=false;
+});
+const chatNarrowMedia=matchMedia("(max-width: 1000px)");chatNarrowMedia.addEventListener("change",()=>toggleChatHistory(!chatNarrowMedia.matches));toggleChatHistory(!chatNarrowMedia.matches);
+document.addEventListener("keydown",event=>{
+  if(event.key==="Escape" && byId("chat-workspace").classList.contains("history-open")){event.preventDefault();toggleChatHistory(false);byId("chat-history-toggle").focus();}
+  if(event.key==="Tab" && byId("chat-workspace").classList.contains("history-open")){
+    const nodes=[...byId("chat-history").querySelectorAll("button:not(:disabled), input")].filter(node=>node.getClientRects().length);const first=nodes[0],last=nodes[nodes.length-1];
+    if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
   }
 });
 
@@ -7448,7 +7554,8 @@ function seedChatPrompt(prompt) {
   showView("chat");
   const input = byId("chat-input");
   input.value = prompt;
-  byId("chat-count").textContent = prompt.length.toLocaleString(localeTag());
+  if(chatUi.loading || !chatUi.ready)chatUi.seededPrompt=prompt;
+  updateChatComposer();
   input.focus();
 }
 
@@ -7490,8 +7597,7 @@ document.addEventListener("keydown", (event) => {
     showView("sessions");
     // "New task" means ready to type, not just the right page.
     window.setTimeout(() => byId("platform-task-text").focus(), 0);
-  } else if (event.key === "Escape" && newChatArmed) {
-    resetNewChatButton();
+
   } else if (event.key === "Escape" && !byId("appearance-panel").hidden) {
     appearanceOpen(false);
     byId("theme-cycle").focus();

@@ -1119,6 +1119,106 @@ impl AgentMemoryStore {
         Ok((current.conversation_id, current.revision + 1))
     }
 
+    /// Retained conversations for one exact transport scope; never mixes inboxes.
+    pub fn scoped_conversations(
+        &self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        scope: &str,
+        now: i64,
+    ) -> Kept<Vec<(String, String, i64)>> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (scope, "scope"),
+        ] {
+            validate_field(value, field)?;
+        }
+        validate_time(now, "now")?;
+        let mut statement=self.connection.prepare("SELECT c.conversation_id, COALESCE((SELECT substr(m.content,1,160) FROM messages m WHERE m.conversation_id=c.conversation_id AND m.tenant=?1 AND m.actor=?2 AND m.role='user' AND m.expires_at_ms>?5 ORDER BY m.message_id LIMIT 1),''), c.last_message_at_ms FROM conversations c WHERE c.tenant=?1 AND c.actor=?2 AND c.transport=?3 AND c.external_scope=?4 AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.conversation_id AND m.tenant=?1 AND m.actor=?2 AND m.expires_at_ms>?5) ORDER BY c.last_message_at_ms DESC,c.conversation_id LIMIT 100")?;
+        statement
+            .query_map(params![tenant, actor, transport, scope, now], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Resume a retained conversation without moving any other actor's head.
+    pub fn resume_conversation(
+        &mut self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        scope: &str,
+        id: &str,
+    ) -> Kept<()> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (scope, "scope"),
+            (id, "conversation_id"),
+        ] {
+            validate_field(value, field)?;
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM conversations WHERE conversation_id=?1 AND tenant=?2 AND actor=?3 AND transport=?4 AND external_scope=?5)",params![id,tenant,actor,transport,scope],|r|r.get(0))?;
+        if !owned {
+            return Err(AgentMemoryError::NotFound);
+        }
+        tx.execute("UPDATE conversations SET archived_at_ms=NULL,revision=revision+1 WHERE conversation_id=?1",params![id])?;
+        tx.execute("INSERT INTO conversation_heads (tenant,actor,transport,external_scope,conversation_id) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(tenant,actor,transport,external_scope) DO UPDATE SET conversation_id=excluded.conversation_id,revision=conversation_heads.revision+1",params![tenant,actor,transport,scope,id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One older page, scoped to both the conversation owner and its surface.
+    pub fn scoped_messages_before(
+        &self,
+        tenant: &str,
+        actor: &str,
+        transport: &str,
+        scope: &str,
+        id: &str,
+        before: i64,
+        now: i64,
+    ) -> Kept<Vec<ConversationMessage>> {
+        for (value, field) in [
+            (tenant, "tenant"),
+            (actor, "actor"),
+            (transport, "transport"),
+            (scope, "scope"),
+            (id, "conversation_id"),
+        ] {
+            validate_field(value, field)?;
+        }
+        validate_time(now, "now")?;
+        if before <= 0 {
+            return Err(AgentMemoryError::InvalidField("before"));
+        }
+        let mut statement=self.connection.prepare("SELECT m.message_id,m.role,m.content,m.created_at_ms FROM messages m JOIN conversations c ON c.conversation_id=m.conversation_id WHERE c.tenant=?1 AND c.actor=?2 AND c.transport=?3 AND c.external_scope=?4 AND c.conversation_id=?5 AND m.tenant=?1 AND m.actor=?2 AND (m.created_at_ms,m.message_id)<(SELECT created_at_ms,message_id FROM messages WHERE message_id=?6 AND tenant=?1 AND actor=?2 AND conversation_id=?5) AND m.expires_at_ms>?7 ORDER BY m.created_at_ms DESC,m.message_id DESC LIMIT 32")?;
+        let mut rows = statement
+            .query_map(
+                params![tenant, actor, transport, scope, id, before, now],
+                |r| {
+                    Ok(ConversationMessage {
+                        id: r.get(0)?,
+                        role: r.get(1)?,
+                        content: r.get(2)?,
+                        created_at_ms: r.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     pub fn recent_messages(
         &self,
         tenant: &str,
@@ -2298,6 +2398,152 @@ mod tests {
                 )
                 .expect("expired")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn dashboard_history_resume_and_pagination_are_scoped_and_retention_aware() {
+        let (_root, mut store) = store();
+        for (id, actor, transport, scope) in [
+            ("first", "ben", "web", "dashboard"),
+            ("second", "ben", "web", "dashboard"),
+            ("foreign", "other", "web", "dashboard"),
+            ("slack", "ben", "slack", "dashboard"),
+            ("manage", "ben", "web", "manage:other"),
+        ] {
+            store
+                .start_conversation("primary", actor, transport, scope, id, 10)
+                .unwrap();
+            for n in 1..=37 {
+                store
+                    .record_message(&MessageInput {
+                        tenant: "primary",
+                        actor,
+                        conversation_id: id,
+                        transport,
+                        external_scope: scope,
+                        transport_key: &format!("{id}-{n}"),
+                        role: "user",
+                        content: &format!("Question {n}"),
+                        created_at_ms: 10 + n,
+                    })
+                    .unwrap();
+            }
+        }
+        let list = store
+            .scoped_conversations("primary", "ben", "web", "dashboard", 100)
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().all(|(_, title, _)| title == "Question 1"));
+        store
+            .archive_conversation("primary", "ben", "web", "dashboard", 100)
+            .unwrap();
+        store
+            .resume_conversation("primary", "ben", "web", "dashboard", "second")
+            .unwrap();
+        assert_eq!(
+            store
+                .current_conversation("primary", "ben", "web", "dashboard")
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
+        for id in ["foreign", "slack", "manage", "missing"] {
+            assert!(
+                store
+                    .resume_conversation("primary", "ben", "web", "dashboard", id)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .scoped_messages_before("primary", "ben", "web", "dashboard", id, i64::MAX, 100)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store
+                .current_conversation("primary", "ben", "web", "dashboard")
+                .unwrap()
+                .as_deref(),
+            Some("second")
+        );
+        let recent = store
+            .recent_messages("primary", "ben", "second", 100, 32)
+            .unwrap();
+        let older = store
+            .scoped_messages_before(
+                "primary",
+                "ben",
+                "web",
+                "dashboard",
+                "second",
+                recent[0].id,
+                100,
+            )
+            .unwrap();
+        assert_eq!(older.len(), 5);
+        assert_eq!(older[0].content, "Question 1");
+        assert_eq!(older[4].content, "Question 5");
+        store
+            .record_message(&MessageInput {
+                tenant: "primary",
+                actor: "ben",
+                conversation_id: "second",
+                transport: "web",
+                external_scope: "dashboard",
+                transport_key: "late-import",
+                role: "user",
+                content: "Late imported",
+                created_at_ms: 12,
+            })
+            .unwrap();
+        let recent = store
+            .recent_messages("primary", "ben", "second", 100, 32)
+            .unwrap();
+        let older = store
+            .scoped_messages_before(
+                "primary",
+                "ben",
+                "web",
+                "dashboard",
+                "second",
+                recent[0].id,
+                100,
+            )
+            .unwrap();
+        assert_eq!(recent.len() + older.len(), 38);
+        assert!(
+            older
+                .iter()
+                .any(|message| message.content == "Late imported")
+        );
+
+        assert!(
+            store
+                .scoped_conversations(
+                    "primary",
+                    "ben",
+                    "web",
+                    "dashboard",
+                    DEFAULT_RAW_RETENTION_MS + 100
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scoped_messages_before(
+                    "primary",
+                    "ben",
+                    "web",
+                    "dashboard",
+                    "second",
+                    i64::MAX,
+                    DEFAULT_RAW_RETENTION_MS + 100
+                )
+                .unwrap()
+                .is_empty()
         );
     }
 
