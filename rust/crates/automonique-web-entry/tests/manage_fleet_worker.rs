@@ -74,6 +74,66 @@ case "$mode" in
 esac
 "#;
 
+/// Stand-in for Claude Code, the second engine of a JCode worker. It is signed
+/// in while `claude-signed-in` exists, answers the tool-less triage call from a
+/// `ROUTE:<verdict>` word in the ticket, and otherwise runs the job.
+const FAKE_CLAUDE: &str = r#"#!/usr/bin/env bash
+dir=${FAKE_PROVIDER_DIR:?}
+if [[ "$*" == "auth status --json" ]]; then
+    if [[ -e "$dir/claude-signed-in" ]]; then
+        printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'
+        exit 0
+    fi
+    printf '%s\n' '{"loggedIn":false,"authMethod":"none"}'
+    exit 1
+fi
+prompt=$(cat)
+if [[ "$*" == *"--tools"* ]]; then
+    printf '%s\n' "$*" >>"$dir/claude-triage.args"
+    case "$prompt" in
+        *ROUTE:claude*) answer='Here it is: {\"engine\":\"claude\",\"reason\":\"new tool to build\"}' ;;
+        *ROUTE:jcode*) answer='{\"engine\":\"jcode\",\"reason\":\"scoped fix\"}' ;;
+        *ROUTE:other*) answer='{\"engine\":\"codex\",\"reason\":\"not an engine of this worker\"}' ;;
+        *) answer='I cannot tell.' ;;
+    esac
+    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"$answer\"}"
+    exit 0
+fi
+printf '%s\n' "$*" >>"$dir/claude-run.args"
+printf '%s\n' "$CLAUDE_CONFIG_DIR" >"$dir/claude-run.home"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude_session_1","model":"fake-claude-1"}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude_session_1","result":"Finished. https://github.com/example/repo/issues/1#issuecomment-5","total_cost_usd":0.25,"num_turns":4,"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}'
+"#;
+
+/// The account directory the dashboard writes: one Claude account, selected.
+const CLAUDE_ACCOUNT: &str = "acct-0123456789abcdef01234567";
+const SECOND_ENGINE: &[(&str, &str)] = &[
+    ("AUTOMONIQUE_AGENT_AUTH_DIR", "{root}/agent-auth"),
+    ("AUTOMONIQUE_FLEET_CLAUDE_BINARY", "{root}/bin/claude"),
+];
+
+fn install_claude_account(root: &Path, signed_in: bool) {
+    for directory in ["agent-auth/health", "agent-auth/profiles"] {
+        fs::create_dir_all(root.join(directory)).expect("account layout");
+    }
+    fs::create_dir_all(root.join("agent-auth/profiles").join(CLAUDE_ACCOUNT)).expect("profile");
+    fs::write(
+        root.join("agent-auth/accounts.json"),
+        json!({
+            "schema": "automonique.agent-accounts/v1",
+            "worker_provider": "codex",
+            "selected": {"claude": CLAUDE_ACCOUNT},
+            "accounts": [{"id": CLAUDE_ACCOUNT, "provider": "claude", "label": "Test Claude"}],
+        })
+        .to_string(),
+    )
+    .expect("account registry");
+    executable(&root.join("bin/claude"), FAKE_CLAUDE);
+    if signed_in {
+        fs::write(root.join("pids/claude-signed-in"), "").expect("signed-in marker");
+    }
+}
+
 /// Stand-in for the GitHub CLI: every completion comment follows the report
 /// shape the worker requires.
 const FAKE_GH: &str =
@@ -133,6 +193,19 @@ impl Platform {
             "id": id,
             "prompt": format!("Handle the ticket. MODE:{mode}"),
         }));
+    }
+
+    /// A job whose ticket carries a routing word for the triage stand-in and,
+    /// when Manage resolved one, the engine its label or project asks for.
+    fn queue_routed_job(&self, id: &str, mode: &str, route: &str, engine: Option<&str>) {
+        let mut job = json!({
+            "id": id,
+            "prompt": format!("Handle the ticket. MODE:{mode} ROUTE:{route}"),
+        });
+        if let Some(engine) = engine {
+            job["engine"] = json!(engine);
+        }
+        self.state.lock().unwrap().queue.push_back(job);
     }
 
     /// Every runtime document of one action received so far.
@@ -491,6 +564,189 @@ fn a_finished_run_and_a_failed_run_both_report_their_telemetry() {
     assert!(arguments.contains("run --ndjson --disabled-tools browser,swarm,integration_tools -"));
     assert!(worker.stop().success());
     assert!(!worker.journal().contains("left processes behind"));
+}
+
+#[test]
+fn a_ticket_that_asks_for_claude_runs_on_claude_and_reports_it() {
+    let asked = job_id(20);
+    let mut worker = Worker::start(SECOND_ENGINE, |platform, root| {
+        install_claude_account(root, true);
+        platform.queue_routed_job(&asked, "done", "jcode", Some("claude"));
+    });
+
+    let report = worker.terminal_report(&asked);
+    assert_eq!("done", report["status"], "{report}");
+    assert_eq!("claude", report["agent"], "{report}");
+    assert_eq!(
+        "asked for by the ticket or its project", report["engine_reason"],
+        "{report}"
+    );
+    assert_eq!("claude_session_1", report["session_id"], "{report}");
+    assert_eq!("fake-claude-1", report["model"], "{report}");
+    assert_eq!(4, report["num_turns"], "{report}");
+    assert_eq!(0.25, report["cost_usd"], "{report}");
+
+    // Manage learns the engine when the run starts, not only when it ends.
+    let running = worker
+        .platform
+        .runtime("job")
+        .into_iter()
+        .find(|report| report["jobId"] == asked.as_str() && report["status"] == "running")
+        .expect("a running report");
+    assert_eq!("claude", running["agent"], "{running}");
+
+    let pids = worker.root.path().join("pids");
+    // The request decided: nothing was triaged and JCode never started.
+    assert!(!pids.join("claude-triage.args").exists());
+    assert!(!pids.join("done.pid").exists());
+    let home = fs::read_to_string(pids.join("claude-run.home")).unwrap();
+    assert!(home.trim_end().ends_with(CLAUDE_ACCOUNT), "{home}");
+    let arguments = fs::read_to_string(pids.join("claude-run.args")).unwrap();
+    assert!(arguments.contains("--print --output-format stream-json --verbose"));
+
+    // The second engine's health is its account's. The file that gates new
+    // claims still describes the worker's own engine.
+    let state = worker
+        .root
+        .path()
+        .join("state/manage-fleet-worker/auth-health.json");
+    let aggregate: Value = serde_json::from_str(&fs::read_to_string(state).unwrap()).unwrap();
+    assert_eq!("jcode", aggregate["provider"], "{aggregate}");
+    let account = worker
+        .root
+        .path()
+        .join(format!("agent-auth/health/{CLAUDE_ACCOUNT}.json"));
+    let account: Value = serde_json::from_str(&fs::read_to_string(account).unwrap()).unwrap();
+    assert_eq!("claude", account["provider"], "{account}");
+    assert_eq!("authenticated", account["status"], "{account}");
+    assert!(last_heartbeat_detail(&worker.platform).contains("claude ready"));
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn an_unmarked_ticket_is_triaged_and_a_ticket_that_names_jcode_is_not() {
+    let open_ended = job_id(21);
+    let scoped = job_id(22);
+    let unclear = job_id(23);
+    let foreign = job_id(24);
+    let named = job_id(25);
+    let mut worker = Worker::start(
+        &[SECOND_ENGINE, &[("AUTOMONIQUE_FLEET_CONCURRENCY", "1")]].concat(),
+        |platform, root| {
+            install_claude_account(root, true);
+            platform.queue_routed_job(&open_ended, "done", "claude", None);
+            platform.queue_routed_job(&scoped, "done", "jcode", None);
+            platform.queue_routed_job(&unclear, "done", "unsure", None);
+            platform.queue_routed_job(&foreign, "done", "other", None);
+            platform.queue_routed_job(&named, "done", "claude", Some("jcode"));
+        },
+    );
+
+    let report = worker.terminal_report(&open_ended);
+    assert_eq!("done", report["status"], "{report}");
+    assert_eq!("claude", report["agent"], "{report}");
+    assert_eq!(
+        "triage: new tool to build", report["engine_reason"],
+        "{report}"
+    );
+
+    let report = worker.terminal_report(&scoped);
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!("triage: scoped fix", report["engine_reason"], "{report}");
+    assert_eq!("fake-model-1", report["model"], "{report}");
+
+    // No verdict, or a verdict naming an engine this worker does not host:
+    // the ticket stays on the worker's own engine.
+    for job in [&unclear, &foreign] {
+        let report = worker.terminal_report(job);
+        assert_eq!("done", report["status"], "{report}");
+        assert_eq!("jcode", report["agent"], "{report}");
+        assert_eq!(
+            "triage gave no verdict", report["engine_reason"],
+            "{report}"
+        );
+    }
+
+    let report = worker.terminal_report(&named);
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!(
+        "asked for by the ticket or its project", report["engine_reason"],
+        "{report}"
+    );
+
+    let pids = worker.root.path().join("pids");
+    // Four tickets were triaged, each by a call that can use no tool.
+    let triage = fs::read_to_string(pids.join("claude-triage.args")).unwrap();
+    assert_eq!(4, triage.lines().count(), "{triage}");
+    for call in triage.lines() {
+        assert!(
+            call.contains(
+                "--tools  --no-session-persistence --strict-mcp-config --setting-sources"
+            ),
+            "{call}"
+        );
+    }
+    assert_eq!(
+        1,
+        fs::read_to_string(pids.join("claude-run.args"))
+            .unwrap()
+            .lines()
+            .count()
+    );
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn a_signed_out_claude_account_fails_the_ticket_that_asks_for_it_and_no_other() {
+    let asked = job_id(26);
+    let unmarked = job_id(27);
+    let mut worker = Worker::start(SECOND_ENGINE, |platform, root| {
+        install_claude_account(root, false);
+        platform.queue_routed_job(&asked, "done", "claude", Some("claude"));
+        platform.queue_routed_job(&unmarked, "done", "claude", None);
+    });
+
+    let report = worker.terminal_report(&asked);
+    assert_eq!("failed", report["status"], "{report}");
+    assert!(
+        report["result"]
+            .as_str()
+            .unwrap()
+            .contains("no signed-in Claude account"),
+        "{report}"
+    );
+
+    let report = worker.terminal_report(&unmarked);
+    assert_eq!("done", report["status"], "{report}");
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!(
+        "not triaged: the Claude account is signed out", report["engine_reason"],
+        "{report}"
+    );
+
+    let pids = worker.root.path().join("pids");
+    assert!(!pids.join("claude-triage.args").exists());
+    assert!(!pids.join("claude-run.args").exists());
+    worker.until("a heartbeat that names the signed-out account", || {
+        last_heartbeat_detail(&worker.platform)
+            .contains("claude signed out")
+            .then_some(())
+    });
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn a_worker_without_a_second_engine_fails_a_ticket_that_asks_for_claude() {
+    let plain = job_id(28);
+    let mut worker = Worker::start(&[], |platform, _| {
+        platform.queue_routed_job(&plain, "done", "claude", Some("claude"));
+    });
+
+    // No account directory: asking for Claude cannot be served here.
+    let report = worker.terminal_report(&plain);
+    assert_eq!("failed", report["status"], "{report}");
+    assert!(!last_heartbeat_detail(&worker.platform).contains("claude"));
+    assert!(worker.stop().success());
 }
 
 #[test]

@@ -120,6 +120,7 @@ class ProviderLifecycleTests(unittest.TestCase):
                         "abort_job_run",
                         "run_telemetry",
                         "wait_for_provider",
+                        "select_job_engine",
                         "run_job",
                     )
                 ]
@@ -133,6 +134,9 @@ class ProviderLifecycleTests(unittest.TestCase):
                 "selected_home": directory,
                 "selected_binary": str(binary),
                 "job_timeout_seconds": "7200",
+                # Not a JCode worker: the job runs on the selected provider.
+                "provider_engine": "codex",
+                "claude_model": "",
                 "kill_grace_seconds": "20",
                 "worker_group": "",
                 "TEST_PROVIDER": provider,

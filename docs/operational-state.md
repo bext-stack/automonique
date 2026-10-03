@@ -22,6 +22,29 @@ service whose executable changed. In particular, a dashboard-only deployment
 does not require restarting the daemon or fleet worker, and a daemon-only
 deployment does not require restarting the dashboard or fleet worker.
 
+### Engine of a ticket job
+
+A worker whose provider engine is JCode can run a single job on Claude Code
+when the account directory holds a selected, signed-in Claude account. The
+engine of each job is chosen in this order:
+
+1. The ticket asks for one: Manage sends `engine` on the job, from a ticket
+   label (`moteur:claude`, `moteur:jcode`) or else from its project's engine
+   setting.
+2. Nothing is asked: one tool-less call on a small Claude model reads the
+   ticket and answers `claude` (a new or large, open-ended build) or `jcode`
+   (a scoped change on an existing codebase). No verdict means JCode.
+
+A ticket that asks for Claude by name fails when no Claude account is signed
+in, so that it is not silently run on the other engine; an unmarked ticket
+runs on JCode and says it was not triaged. The worker reports the engine it
+started and the reason on the job (`agent`, `engine_reason`), and the
+heartbeat detail ends with `claude ready` or `claude signed out`. Only the
+worker's own engine writes the aggregate authentication health that gates new
+claims; a Claude run records its account's health alone.
+`AUTOMONIQUE_FLEET_CLAUDE_MODEL` pins the model of Claude runs and
+`AUTOMONIQUE_FLEET_TRIAGE_MODEL` (default `haiku`) the model of the triage.
+
 The dashboard's work-queue view keeps Support tickets and Manage issue work in
 one operator workspace but preserves their source on every row and filter.
 Support lifecycle state must not be presented as Manage execution state, and a
