@@ -306,6 +306,7 @@ mod tests {
             observed_at_ms: None,
             last_verified_at_ms: None,
             usage: UsageView::unavailable("not_checked"),
+            response_test: None,
         };
         let mut cached = UsageView::unavailable("not_checked");
         apply_result(

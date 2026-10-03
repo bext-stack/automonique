@@ -1257,6 +1257,48 @@ impl AgentMemoryStore {
         )
     }
 
+    /// Atomically remove a selected set from retrieval, retaining content and audit.
+    /// Every row must belong to this actor and still have the expected revision.
+    pub fn archive_many(
+        &mut self,
+        tenant: &str,
+        actor: &str,
+        entries: &[(i64, u32)],
+        at_ms: i64,
+    ) -> Kept<usize> {
+        validate_field(tenant, "tenant")?;
+        validate_field(actor, "actor")?;
+        validate_time(at_ms, "at_ms")?;
+        if entries.is_empty() || entries.len() > 100 {
+            return Err(AgentMemoryError::InvalidField("entries"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for &(id, revision) in entries {
+            if !seen.insert(id) {
+                return Err(AgentMemoryError::Conflict);
+            }
+            let record =
+                read_memory(&transaction, tenant, id)?.ok_or(AgentMemoryError::NotFound)?;
+            if record.actor != actor {
+                return Err(AgentMemoryError::NotFound);
+            }
+            if record.revision != revision {
+                return Err(AgentMemoryError::StaleRevision);
+            }
+            if record.status != MemoryStatus::Active {
+                return Err(AgentMemoryError::Conflict);
+            }
+            let next = revision.checked_add(1).ok_or(AgentMemoryError::Conflict)?;
+            transaction.execute("UPDATE memories SET status='deleted',deleted_at_ms=?1,updated_at_ms=?1,revision=?2 WHERE tenant=?3 AND memory_id=?4", params![at_ms,next,tenant,id])?;
+            transaction.execute("INSERT INTO memory_audit (memory_id,tenant,actor,action,cause,at_ms,revision) VALUES (?1,?2,?3,'deleted','dashboard_archive',?4,?5)",params![id,tenant,actor,at_ms,next])?;
+        }
+        transaction.commit()?;
+        Ok(entries.len())
+    }
+
     pub fn forget(
         &mut self,
         tenant: &str,
@@ -1923,6 +1965,68 @@ mod tests {
             review_at_ms: Some(2_000),
             created_at_ms: 1_000,
         }
+    }
+
+    #[test]
+    fn bulk_archive_is_atomic_revision_checked_and_keeps_history() {
+        let (_root, mut store) = store();
+        let a = store
+            .record_memory(&memory("a", "Shared duplicate", MemoryStatus::Active))
+            .unwrap();
+        let b = store
+            .record_memory(&memory("b", "Shared duplicate", MemoryStatus::Active))
+            .unwrap();
+        assert!(matches!(
+            store.archive_many("primary", "ben", &[(a.id, 1), (b.id, 99)], 1500),
+            Err(AgentMemoryError::StaleRevision)
+        ));
+        assert_eq!(
+            store.item("primary", "ben", a.id).unwrap().unwrap().status,
+            MemoryStatus::Active
+        );
+        assert_eq!(
+            store
+                .archive_many("primary", "ben", &[(a.id, 1), (b.id, 1)], 1500)
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .search("primary", "ben", "duplicate", 1600, 6)
+                .unwrap()
+                .is_empty()
+        );
+        let retained = store.inventory("primary", "ben", "").unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.iter().all(|r| r.status == MemoryStatus::Deleted
+            && r.revision == 2
+            && r.content == "Shared duplicate"));
+    }
+    #[test]
+    fn bulk_archive_refuses_foreign_duplicate_or_empty_selection() {
+        let (_root, mut store) = store();
+        let a = store
+            .record_memory(&memory("a", "Fact", MemoryStatus::Active))
+            .unwrap();
+        assert!(
+            store
+                .archive_many("primary", "other", &[(a.id, 1)], 1500)
+                .is_err()
+        );
+        assert!(
+            store
+                .archive_many("primary", "ben", &[(a.id, 1), (a.id, 1)], 1500)
+                .is_err()
+        );
+        assert!(store.archive_many("primary", "ben", &[], 1500).is_err());
+        assert_eq!(
+            store
+                .item("primary", "ben", a.id)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
     }
 
     #[test]

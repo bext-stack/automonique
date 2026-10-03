@@ -4,6 +4,7 @@
 
 mod agent_auth;
 mod connection_tests;
+mod controls;
 mod jev;
 mod mobile_auth;
 mod mobile_task;
@@ -170,6 +171,8 @@ pub enum Route {
     ApiMemoryAction,
     ApiConfiguration,
     ApiConnectionTest,
+    ApiControls,
+    ApiControlsAction,
     ApiAgentAccounts,
     ApiAgentAccountsAction,
     ApiOperations,
@@ -753,6 +756,8 @@ impl AppState {
 pub struct WebIntegration {
     config: IntegrationConfig,
     state_dir: PathBuf,
+    runtime_dir: PathBuf,
+    controls: controls::Controls,
     memory_path: PathBuf,
     lane: Mutex<SocketRunLane>,
     platform: Mutex<PlatformClient<UnixTransport>>,
@@ -2431,6 +2436,8 @@ impl WebIntegration {
         Ok(Self {
             config,
             state_dir: state_dir.to_path_buf(),
+            runtime_dir: runtime_dir.to_path_buf(),
+            controls: controls::Controls::default(),
             memory_path: state_dir.join("agent-memory.sqlite3"),
             lane: Mutex::new(lane),
             platform: Mutex::new(PlatformClient::new(UnixTransport::new(admin_socket))),
@@ -7178,6 +7185,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/api/memory/action" => Route::ApiMemoryAction,
                 "/api/configuration" => Route::ApiConfiguration,
                 "/api/connections/test" => Route::ApiConnectionTest,
+                "/api/controls" => Route::ApiControls,
+                "/api/controls/action" => Route::ApiControlsAction,
                 "/api/agent-accounts" => Route::ApiAgentAccounts,
                 "/api/agent-accounts/action" => Route::ApiAgentAccountsAction,
                 "/api/operations" => Route::ApiOperations,
@@ -7222,6 +7231,7 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 route,
                 Route::ApiMemorySearch
                     | Route::ApiMemoryAction
+                    | Route::ApiControlsAction
                     | Route::ApiConnectionTest
                     | Route::ApiAgentAccountsAction
                     | Route::ApiTicketDetail
@@ -7685,8 +7695,10 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         Route::ApiMemory
         | Route::ApiMemorySearch
         | Route::ApiMemoryAction
+        | Route::ApiControls
         | Route::ApiConfiguration
         | Route::ApiAgentAccounts
+        | Route::ApiControlsAction
         | Route::ApiConnectionTest
         | Route::ApiAgentAccountsAction
         | Route::ApiOperations
@@ -7811,6 +7823,14 @@ fn api_response(
                 Err(_) => json_error("400 Bad Request", "invalid_json"),
             }
         }
+        Route::ApiControls => json_response("200 OK", &integration.controls_view()),
+        Route::ApiControlsAction => match serde_json::from_slice::<controls::Action>(body) {
+            Ok(action) => match integration.control_action(action) {
+                Ok(view) => json_response("200 OK", &view),
+                Err(reason) => json_error("409 Conflict", reason),
+            },
+            Err(_) => json_error("400 Bad Request", "invalid_request"),
+        },
         Route::ApiConfiguration => json_response("200 OK", &integration.configuration()),
         Route::ApiConnectionTest => {
             match serde_json::from_slice::<connection_tests::TestRequest>(body) {
@@ -8545,8 +8565,10 @@ fn handle(
         Route::ApiMemory
             | Route::ApiMemorySearch
             | Route::ApiMemoryAction
+            | Route::ApiControls
             | Route::ApiConfiguration
             | Route::ApiAgentAccounts
+            | Route::ApiControlsAction
             | Route::ApiConnectionTest
             | Route::ApiAgentAccountsAction
             | Route::ApiOperations

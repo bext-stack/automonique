@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::fd::AsFd;
 
+#[path = "agent_probe.rs"]
+mod probe;
 #[path = "agent_usage.rs"]
 mod usage;
 
@@ -328,6 +330,7 @@ pub(crate) struct AccountView {
     observed_at_ms: Option<u64>,
     last_verified_at_ms: Option<u64>,
     usage: usage::UsageView,
+    response_test: Option<Value>,
 }
 
 impl AccountView {
@@ -419,6 +422,9 @@ pub(crate) enum AgentAuthAction {
     Refresh {
         account_id: String,
     },
+    TestResponse {
+        account_id: String,
+    },
     Rename {
         account_id: String,
         label: String,
@@ -443,6 +449,7 @@ pub(crate) enum AgentAuthAction {
 pub(crate) struct AgentAuthManager {
     config: AgentAuthConfig,
     registry_lock: Mutex<()>,
+    response_tests: Arc<Mutex<BTreeMap<String, Value>>>,
     usage: Arc<Mutex<usage::UsageCache>>,
     sessions: Arc<Mutex<BTreeMap<String, LoginSession>>>,
 }
@@ -456,6 +463,7 @@ impl AgentAuthManager {
         let manager = Self {
             config,
             registry_lock: Mutex::new(()),
+            response_tests: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(usage::UsageCache::default())),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
         };
@@ -490,6 +498,11 @@ impl AgentAuthManager {
                 worker_selected: selected
                     && registry.worker_provider.as_deref() == Some(account.provider.as_str()),
                 usage: usage::UsageView::unavailable("sign_in_required"),
+                response_test: self
+                    .response_tests
+                    .lock()
+                    .ok()
+                    .and_then(|tests| tests.get(&account.id).cloned()),
                 status: health.status,
                 method: health.method,
                 evidence: health.reason,
@@ -549,6 +562,7 @@ impl AgentAuthManager {
             AgentAuthAction::Rename { account_id, label } => self.rename(&account_id, &label)?,
             AgentAuthAction::Select { account_id } => self.select(&account_id)?,
             AgentAuthAction::Refresh { account_id } => self.refresh(&account_id)?,
+            AgentAuthAction::TestResponse { account_id } => self.test_response(&account_id)?,
             AgentAuthAction::CancelLogin { session_id } => self.cancel_login(&session_id)?,
             AgentAuthAction::SubmitAuthorizationCode { session_id, code } => {
                 self.submit_authorization_code(&session_id, &code)?;
@@ -1156,10 +1170,10 @@ fn probe_native_subscription(provider: Provider, binary: &Path, profile: &Path) 
 }
 
 /// What one bounded provider CLI call produced, once it has certainly ended.
-struct BoundedCall {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(super) struct BoundedCall {
+    pub(super) success: bool,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 /// Run one provider CLI call under `timeout`, killing it if it outlives that.
@@ -1180,7 +1194,10 @@ struct BoundedCall {
 /// unbounded wait this function exists to remove. Whatever a reader has not
 /// delivered by the deadline is simply absent, which the callers read as an
 /// unverified account.
-fn bounded_provider_call(command: &mut Command, timeout: Duration) -> Option<BoundedCall> {
+pub(super) fn bounded_provider_call(
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<BoundedCall> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

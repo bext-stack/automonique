@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=21">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=22">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=23" defer></script>
+    <script src="/assets/dashboard.js?v=24" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -330,7 +330,7 @@
               <article class="stat"><b id="memory-candidates">-</b> to approve</article>
               <article class="stat stat-warn"><b id="memory-review-due">-</b> to recheck</article>
               <article class="stat"><b id="memory-superseded">-</b> replaced</article>
-              <article class="stat"><b id="memory-deleted">-</b> deleted</article>
+              <article class="stat"><b id="memory-deleted">-</b> archived</article>
               <article class="stat"><b id="memory-messages">-</b> messages</article>
             </div>
             <form class="search-field memory-search" id="memory-search" role="search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 1 0 4.1 11.5L20 21M10.5 4a6.5 6.5 0 0 1 4.1 11.5"></path></svg><input id="memory-query" maxlength="512" aria-label="Search memory" placeholder="Search what Monique remembers"><button class="search-clear" id="memory-clear" type="button" aria-label="Clear memory search" hidden>×</button><button class="button ghost small" type="submit">Search</button></form>
@@ -338,6 +338,8 @@
           <div class="toolbar memory-toolbar">
             <button class="button primary" id="memory-create" type="button">Add memory</button>
             <button class="button secondary" id="memory-refresh" type="button">Refresh</button>
+            <button class="button secondary" id="memory-retrieval-test" type="button">Test retrieval</button>
+            <button class="button secondary" id="memory-duplicates" type="button">Find duplicates</button>
             <button class="button secondary" id="memory-export" type="button" disabled>Export results</button>
             <div class="segmented memory-modes" role="group" aria-label="Memory view"><button type="button" data-memory-mode="list">List</button><button type="button" data-memory-mode="timeline">Timeline</button><button type="button" data-memory-mode="graph">Map</button></div>
             <div class="memory-filters">
@@ -350,6 +352,8 @@
             </div>
             <span class="toolbar-meta" id="memory-result-label" role="status">Loading…</span>
           </div>
+          <div class="memory-bulk-toolbar"><button class="button ghost small" id="memory-select-visible" type="button">Select filtered memories</button><span id="memory-selected-count" role="status">0 selected</span><button class="button ghost small" id="memory-clear-selection" type="button">Clear selection</button><button class="button ghost small" id="memory-archive-selected" type="button" disabled>Archive selected</button></div>
+          <section class="panel memory-inspection" id="memory-inspection" aria-live="polite" hidden></section>
           <div class="view-split">
             <div class="view-main memory-views">
               <div class="table memory-table" id="memory-list" hidden></div>
@@ -521,6 +525,7 @@
               </article>
 
               <div class="config-section-heading" data-config-card data-config-category="all"><div><h2>System settings</h2><p>Read from the running server. Change them on the server.</p></div><span class="section-meta" id="configuration-last-read">Checking…</span></div>
+              <div class="config-grid" id="configuration-controls"></div>
               <div class="config-grid" id="configuration-grid"><article class="settings-group loading-panel">Loading settings…</article></div>
               <div class="config-empty" id="configuration-empty" hidden><strong>No matching settings</strong><span>Try another word or section.</span></div>
             </div>

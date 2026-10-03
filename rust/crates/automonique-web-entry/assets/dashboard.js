@@ -384,6 +384,91 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "archived": "archivés",
+  "Model not reported": "Modèle non communiqué",
+  "active jobs": "tâches actives",
+  "Manage reports this run as active, but the assigned worker reports no active jobs.": "Manage indique une exécution en cours, mais le worker assigné ne signale aucune tâche active.",
+  "Test response": "Tester une réponse",
+  "Response test started.": "Test de réponse lancé.",
+  "Sends a small test prompt using this subscription.": "Envoie une courte demande de test avec cet abonnement.",
+  "MCP servers & tools": "Serveurs et outils MCP",
+  "No MCP servers configured.": "Aucun serveur MCP configuré.",
+  "MCP configuration is unavailable.": "La configuration MCP est indisponible.",
+  "Refresh tools": "Actualiser les outils",
+  "Tools discovered": "Outils disponibles",
+  "Discovery failed": "Échec de la découverte",
+  "Changes data": "Modifie des données",
+  "Not checked yet": "Pas encore vérifié",
+  "Automations": "Automatisations",
+  "Pause stops future runs. Work already running can finish.": "La pause arrête les prochaines exécutions. Le travail en cours peut se terminer.",
+  "Automation service is unavailable.": "Le service d’automatisation est indisponible.",
+  "No automations registered.": "Aucune automatisation enregistrée.",
+  "Last result": "Dernier résultat",
+  "Next run": "Prochaine exécution",
+  "Last run": "Dernière exécution",
+  "Never run": "Jamais exécutée",
+  "Preview": "Aperçu",
+  "Preview only · nothing will run": "Aperçu uniquement · aucune exécution",
+  "Schedule": "Planification",
+  "Scope": "Périmètre",
+  "No task registered.": "Aucune tâche enregistrée.",
+  "Pause": "Mettre en pause",
+  "Resume": "Reprendre",
+  "Paused": "En pause",
+  "Archived": "Archivé",
+  "Backups": "Sauvegardes",
+  "Next backup": "Prochaine sauvegarde",
+  "Latest backup": "Dernière sauvegarde",
+  "Automatic backups are not configured.": "Les sauvegardes automatiques ne sont pas configurées.",
+  "Automatic backups are paused.": "Les sauvegardes automatiques sont en pause.",
+  "Backup schedule is unavailable.": "La planification des sauvegardes est indisponible.",
+  "No completed backups found.": "Aucune sauvegarde terminée trouvée.",
+  "Older backups": "Sauvegardes précédentes",
+  "databases": "bases de données",
+  "Verify backup": "Vérifier la sauvegarde",
+  "Verifying backup…": "Vérification de la sauvegarde…",
+  "Backup verified": "Sauvegarde vérifiée",
+  "Backup verification failed": "Échec de la vérification de la sauvegarde",
+  "Check latest status": "Vérifier l’état actuel",
+  "Checking latest status…": "Vérification de l’état actuel…",
+  "Fresh snapshot": "Relevé récent",
+  "Last activity": "Dernière activité",
+  "GitHub is closed while Manage still reports pending or running work. These sources disagree.": "Le ticket GitHub est fermé, mais Manage indique encore un travail en attente ou en cours. Les sources sont en désaccord.",
+  "Issue state and agent execution are separate. An open issue can contain completed work.": "L’état du ticket et l’exécution de l’agent sont distincts. Un ticket ouvert peut contenir un travail terminé.",
+  "The source status differs from the ticket list. Refresh the list to reconcile the display.": "L’état de la source diffère de la liste. Actualisez la liste pour mettre l’affichage à jour.",
+  "Testing response…": "Test de réponse en cours…",
+  "Response verified": "Réponse vérifiée",
+  "Response test failed": "Échec du test de réponse",
+  "Subscription quota reached.": "Quota de l’abonnement atteint.",
+  "Sign in before testing a response.": "Connectez le compte avant de tester une réponse.",
+  "The provider could not complete the response test.": "Le fournisseur n’a pas pu terminer le test de réponse.",
+  "Test retrieval": "Tester le rappel",
+  "Find duplicates": "Chercher les doublons",
+  "Select filtered memories": "Sélectionner les souvenirs filtrés",
+  "Clear selection": "Effacer la sélection",
+  "Archive selected": "Archiver la sélection",
+  "selected": "sélectionnés",
+  "Select": "Sélectionner",
+  "Select up to 100 memories.": "Sélectionnez jusqu’à 100 souvenirs.",
+  "Retrieval preview": "Aperçu du rappel",
+  "These are the memories supplied to dashboard chat for this question. No message was sent.": "Voici les souvenirs fournis à l’assistant pour cette question. Aucun message n’a été envoyé.",
+  "No active memories match this question.": "Aucun souvenir actif ne correspond à cette question.",
+  "Duplicate memories": "Souvenirs en double",
+  "Matches ignore letter case and extra spaces. Review each group before archiving.": "La recherche ignore les majuscules et les espaces supplémentaires. Vérifiez chaque groupe avant d’archiver.",
+  "No duplicate memories found.": "Aucun doublon trouvé.",
+  "Results are limited. Search to narrow the inventory.": "Les résultats sont limités. Affinez votre recherche.",
+  "Enter a question in the memory search field.": "Saisissez une question dans le champ de recherche des souvenirs.",
+  "Archive selected memories": "Archiver les souvenirs sélectionnés",
+  "Selected memories": "Souvenirs sélectionnés",
+  "They will stop appearing in retrieval. Their content and audit history will be retained.": "Ils ne seront plus utilisés par l’assistant. Leur contenu et leur historique seront conservés.",
+  "Archive": "Archiver",
+  "Selected memories archived.": "Souvenirs sélectionnés archivés.",
+  "This automation changed. Refresh before trying again.": "Cette automatisation a changé. Actualisez avant de réessayer.",
+  "A selected memory changed. Refresh and select it again.": "Un souvenir sélectionné a changé. Actualisez et sélectionnez-le à nouveau.",
+  "A backup verification is already running.": "Une vérification de sauvegarde est déjà en cours.",
+  "An agent response test is already running.": "Un test de réponse d’agent est déjà en cours.",
+  "Check the selected item and try again.": "Vérifiez l’élément sélectionné et réessayez.",
+
   "Test": "Tester",
   "Test again": "Retester",
   "Testing…": "Test en cours…",
@@ -805,7 +890,7 @@ const frenchUi = Object.freeze({
   "Save a stable fact or preference for future conversations. It will be active immediately.": "Enregistrez un fait stable ou une préférence pour les prochaines conversations. Il sera actif immédiatement.",
   "Saving keeps the previous version as a replaced record. Approval status is preserved. Choose a future review date or leave it empty.": "L’enregistrement conserve la version précédente et l’état d’approbation. Choisissez une date de réexamen future ou laissez ce champ vide.",
   "This proposal will become active and available in future conversations.": "Cette proposition deviendra active et disponible dans les prochaines conversations.",
-  "This memory will be excluded from future recall. Its content and audit history remain available as a deleted record.": "Ce souvenir ne sera plus utilisé. Son contenu et son historique restent disponibles dans les éléments supprimés.",
+  "This memory will be excluded from future recall. Its content and audit history remain available as an archived record.": "Ce souvenir ne sera plus utilisé. Son contenu et son historique restent disponibles dans les éléments supprimés.",
   "This memory changed elsewhere. Your draft is still here. Cancel and refresh before trying again.": "Ce souvenir a été modifié ailleurs. Votre brouillon est conservé. Annulez et actualisez avant de réessayer.",
   "This memory is unavailable or belongs to another author. Refresh the list.": "Ce souvenir est indisponible ou appartient à un autre auteur. Actualisez la liste.",
   "Check the content, certainty, and future review date. Content must fit within 8 KB.": "Vérifiez le contenu, la certitude et la date de réexamen future. Le contenu est limité à 8 Ko.",
@@ -2594,7 +2679,7 @@ function updateMemoryFacet(id, entries, field, allLabel, previous) {
   values.forEach((value) => {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = label(value);
+    option.textContent = field === "status" && value === "deleted" ? translatePhrase("Archived") : label(value);
     select.append(option);
   });
   const selected = values.includes(previous) ? previous : "all";
@@ -2628,6 +2713,8 @@ function setMemoryMode(mode) {
 function renderMemory(view) {
   memorySnapshot = view;
   const entries = view.entries || [];
+  for (const [reference, selected] of memorySelection) if (!entries.some((entry)=>entry.reference===reference && entry.revision===selected.revision && entry.status==="active")) memorySelection.delete(reference);
+  updateMemorySelection();
   byId("memory-active").textContent = count(view.counts?.active);
   byId("memory-candidates").textContent = count(view.counts?.candidates);
   byId("memory-superseded").textContent = count(view.counts?.superseded);
@@ -2685,11 +2772,12 @@ function renderMemoryList(entries) {
     row.dataset.memoryReference = entry.reference;
     const ref = consoleCell(entry.reference, "cell cell-mono");
     ref.setAttribute("data-i18n-skip", "");
+    ref.prepend(memorySelectionCheckbox(entry));
     const text = consoleCell(entry.content, "cell memory-row-content");
     text.setAttribute("data-i18n-skip", "");
     const kind = consoleCell(consoleSentence(entry.kind), "cell");
     const due = Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now();
-    const status = consoleBadge(due ? "Recheck" : consoleSentence(entry.status), due ? "warn" : { active: "ok", candidate: "info", superseded: "quiet", deleted: "danger" }[entry.status] || "quiet");
+    const status = consoleBadge(due ? "Recheck" : entry.status === "deleted" ? "Archived" : consoleSentence(entry.status), due ? "warn" : { active: "ok", candidate: "info", superseded: "quiet", deleted: "danger" }[entry.status] || "quiet");
     const confidence = document.createElement("span");
     confidence.className = "confidence";
     const bar = document.createElement("i");
@@ -2765,7 +2853,7 @@ function renderMemoryTimeline(entries) {
     content.setAttribute("data-i18n-skip", "");
     content.textContent = entry.content;
     const meta = document.createElement("small");
-    meta.textContent = `${words(entry.kind)} · ${words(entry.status)}`;
+    meta.textContent = `${words(entry.kind)} · ${entry.status === "deleted" ? translatePhrase("Archived") : words(entry.status)}`;
     body.append(heading, content, meta);
     item.append(marker, date, body);
     item.dataset.row = "";
@@ -2811,7 +2899,7 @@ function renderMemoryInspector(entry) {
   title.textContent = entry.reference;
   headingCopy.append(eyebrow, title);
   const status = document.createElement("i");
-  status.textContent = words(entry.status).toUpperCase();
+  status.textContent = (entry.status === "deleted" ? translatePhrase("Archived") : words(entry.status)).toUpperCase();
   status.dataset.state = entry.status;
   head.append(headingCopy, status);
   const content = document.createElement("p");
@@ -2836,7 +2924,7 @@ function renderMemoryInspector(entry) {
   facts.className = "memory-inspector-facts";
   [
     ["Type", consoleSentence(entry.kind)],
-    ["Status", consoleSentence(entry.status)],
+    ["Status", entry.status === "deleted" ? "Archived" : consoleSentence(entry.status)],
     ["Learned from", entry.provenance],
     ["Updated", memoryDateLabel(entry.updated_at_ms)],
     ["Recheck", memoryReviewLabel(entry.review_at_ms)],
@@ -2934,7 +3022,7 @@ function confirmMemoryAction(entry, action) {
   byId("memory-confirm-submit").textContent = verb;
   byId("memory-confirm-help").textContent = action === "approve"
     ? "This proposal will become active and available in future conversations."
-    : "This memory will be excluded from future recall. Its content and audit history remain available as a deleted record.";
+    : "This memory will be excluded from future recall. Its content and audit history remain available as an archived record.";
   byId("memory-confirm-content").textContent = entry.content;
   byId("memory-confirm-error").hidden = true;
   byId("memory-confirm").showModal();
@@ -3321,6 +3409,7 @@ function renderProcessDrawer(job) {
     manageLink.textContent = awaitingApproval ? "Approve in Manage ↗" : "Manage ↗";
     actions.append(manageLink);
   }
+  appendRunCheck(actions, summary, job);
   summary.append(badges, lede);
   if (actions.childNodes.length) summary.append(actions);
   const output = document.createElement("section");
@@ -4632,6 +4721,7 @@ function renderTicketDrawer(ticket) {
   const summary = document.createElement("section");
   summary.className = "drawer-section";
   summary.append(badges, actions);
+  appendTicketCheck(actions, summary, ticket);
   const detailsSection = document.createElement("section");
   detailsSection.className = "drawer-section";
   const detailsTitle = document.createElement("h3");
@@ -5930,6 +6020,9 @@ function renderAgentAccount(account) {
   const connected = agentAccountConnected(account);
   actions.append(agentAccountButton(connected ? (account.worker_selected ? "Selected for worker" : "Use for worker") : "Sign in", () => connected ? mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected.") : startAgentLogin(account.provider, account), connected && account.worker_selected));
   actions.append(agentAccountButton("Verify connection", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")));
+  const responseTest = agentAccountButton("Test response", () => mutateAgentAccounts({action:"test_response",account_id:account.id}, "Response test started."), !connected || (agentAccountsView?.accounts || []).some((a)=>a.response_test?.status==="checking"));
+  responseTest.title = translatePhrase("Sends a small test prompt using this subscription.");
+  actions.append(responseTest);
   const more = document.createElement("details");
   more.className = "agent-account-manage";
   const summary = document.createElement("summary");
@@ -5952,7 +6045,7 @@ function renderAgentAccount(account) {
   const controls = document.createElement("div");
   controls.className = "agent-account-controls";
   controls.append(actions, more);
-  card.append(head, renderAgentUsage(account.usage), controls);
+  card.append(head, renderAgentUsage(account.usage), controls, renderAgentResponseTest(account));
   return card;
 }
 
@@ -6035,7 +6128,7 @@ function renderAgentAccounts(view) {
   accountsRoot.append(empty);
   filterAgentAccounts();
   const activeLogin = (view.login_sessions || []).some((session) => !["authenticated", "failed", "cancelled"].includes(session.status));
-  scheduleAgentAccountsPoll(false, activeLogin || accounts.some((a) => a.usage?.status === "loading") ? 2000 : 30000);
+  scheduleAgentAccountsPoll(false, activeLogin || accounts.some((a) => a.usage?.status === "loading" || a.response_test?.status === "checking") ? 2000 : 30000);
 }
 
 function scheduleAgentAccountsPoll(immediate = false, delay = 2000) {
@@ -6066,6 +6159,177 @@ async function loadAgentAccounts(polling = false) {
 byId("agent-account-search").addEventListener("input", filterAgentAccounts);
 byId("agent-account-filter").addEventListener("change", filterAgentAccounts);
 byId("agent-accounts-refresh").addEventListener("click", () => loadAgentAccounts());
+
+// Direct controls share one small result area; no provider text is rendered as HTML.
+const controlState = { view: null, mcp: new Map(), runs: new Map(), tickets: new Map(), timer: null, loading: false };
+const memorySelection = new Map();
+function controlNode(tag, text, className = "") { const node = document.createElement(tag); if (text !== undefined) node.textContent = translatePhrase(String(text)); if (className) node.className = className; return node; }
+function controlData(tag, text) { const node=document.createElement(tag); node.dataset.i18nSkip=""; node.textContent=String(text); return node; }
+function controlTime(ms) { return Number.isFinite(ms) && ms > 0 ? new Date(ms).toLocaleString(localeTag(), { dateStyle: "short", timeStyle: "short" }) : translatePhrase("Not available"); }
+function controlError(error) {
+  return translatePhrase({ automation_revision_stale: "This automation changed. Refresh before trying again.", memory_revision_stale: "A selected memory changed. Refresh and select it again.", backup_busy: "A backup verification is already running.", connection_test_busy: "Another connection test is running. Try again shortly.", agent_test_busy: "An agent response test is already running.", agent_sign_in_required: "Sign in before testing a response.", invalid_request: "Check the selected item and try again." }[error?.message] || "The check could not finish. Try again.");
+}
+function controlAction(action) { return api("/api/controls/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(action), signal: AbortSignal.timeout(25000) }); }
+function controlButton(text, run) {
+  const button = controlNode("button", text, "button ghost small"); button.type = "button";
+  button.addEventListener("click", async () => { if (button.disabled) return; button.disabled = true; button.setAttribute("aria-busy", "true"); try { await run(button); } catch (error) { toast(controlError(error), "error"); } finally { button.disabled = false; button.removeAttribute("aria-busy"); } });
+  return button;
+}
+function controlResult(text = "") { const result = controlNode("div", text, "control-result"); result.setAttribute("role", "status"); result.setAttribute("aria-live", "polite"); return result; }
+function controlCard(title, category, key) {
+  const card = controlNode("article", undefined, "panel config-card control-card"); card.dataset.configCard = ""; card.dataset.configCategory = category; card.dataset.controlCard = key;
+  const head = controlNode("div", undefined, "config-card-heading"); head.append(controlNode("h2", title));
+  head.append(controlButton("Refresh", () => loadControls())); card.append(head); return card;
+}
+async function loadControls() {
+  if (controlState.loading) return;
+  controlState.loading = true;
+  try { controlState.view = await api("/api/controls"); renderControls(); }
+  catch (error) { const root = byId("configuration-controls"); root.replaceChildren(controlResult(controlError(error))); }
+  finally { controlState.loading = false; }
+}
+function renderControls() {
+  const root = byId("configuration-controls"); if (!root) return;
+  // Preserve expanded server/tool lists across backup polling.
+  const expanded = new Set([...root.querySelectorAll("details[open][data-control-details]")].map((node) => node.dataset.controlDetails));
+  root.replaceChildren(); const view = controlState.view || {};
+  const mcp = controlCard("MCP servers & tools", "integrations", "mcp");
+  if (!view.mcp?.servers?.length) mcp.append(controlNode("p", view.mcp?.status === "unavailable" ? "MCP configuration is unavailable." : "No MCP servers configured.", "inline-hint"));
+  for (const server of view.mcp?.servers || []) {
+    const item = controlNode("details", undefined, "control-disclosure"); item.dataset.controlDetails = `mcp:${server}`;
+    const summary = controlNode("summary", server); summary.dataset.i18nSkip = ""; item.append(summary);
+    const result = controlResult(); const check = controlState.mcp.get(server);
+    result.textContent = check?.status === "verified" ? `${translatePhrase("Tools discovered")}: ${check.tools.length} · ${controlTime(check.checked_at_ms)}` : check?.status === "failed" ? `${translatePhrase("Discovery failed")}: ${translatePhrase(connectionTestReasons[check.reason] || "The check could not finish. Try again.")}${check.checked_at_ms ? ` · ${controlTime(check.checked_at_ms)}` : ""}` : translatePhrase("Not checked yet");
+    result.dataset.state = check?.status || "idle";
+    const discover = controlButton("Refresh tools", async () => {
+      controlState.mcp.set(server, {status:"checking",tools:[]}); item.open = true; renderControls();
+      try { controlState.mcp.set(server, await controlAction({action:"discover_mcp",server})); }
+      catch (error) { controlState.mcp.set(server,{status:"failed",reason:"service_unavailable",tools:[]}); }
+      renderControls();
+    });
+    discover.disabled = [...controlState.mcp.values()].some((check)=>check.status==="checking");
+    if (check?.status==="checking") result.textContent=translatePhrase("Checking connection…");
+    item.append(discover, result);
+    for (const tool of check?.tools || []) { const line = controlNode("div", undefined, "control-tool"); const name = controlNode("strong", tool.name); name.dataset.i18nSkip = ""; line.append(name, controlNode("span", tool.read_only ? "Read only" : "Changes data", "source-pill"), controlNode("small", tool.description)); item.append(line); }
+    item.open = expanded.has(item.dataset.controlDetails); mcp.append(item);
+  }
+  const automations = controlCard("Automations", "ai integrations", "automations");
+  automations.append(controlNode("p", "Pause stops future runs. Work already running can finish.", "inline-hint"));
+  const schedule = view.automations || {};
+  if (schedule.status !== "ready") automations.append(controlResult("Automation service is unavailable."));
+  else if (!schedule.items?.length) automations.append(controlNode("p", "No automations registered.", "inline-hint"));
+  for (const item of schedule.items || []) {
+    const row = controlNode("div", undefined, "control-row"); row.dataset.automationId = item.id;
+    const title = controlNode("strong", item.id); title.dataset.i18nSkip = "";
+    const meta = controlNode("div", undefined, "control-meta");
+    meta.append(controlNode("span", {enabled:"Enabled",paused:"Paused",archived:"Archived"}[item.state] || "Unknown"), controlNode("span", `${translatePhrase("Next run")}: ${item.state === "paused" ? translatePhrase("Paused") : controlTime(item.next_run_at_ms)}`), controlNode("span", `${translatePhrase("Last result")}: ${translatePhrase({completed:"Completed",failed:"Failed",pending:"Queued",claimed:"Running",never_run:"Never run",unavailable:"Not available"}[item.last_result] || "Not available")}`), controlNode("span", `${translatePhrase("Last run")}: ${controlTime(item.last_run_at_ms)}`));
+    const actions = controlNode("div", undefined, "control-actions"); const output = controlResult();
+    actions.append(controlButton("Preview", async () => { const preview = await controlAction({ action:"preview_automation", id:item.id }); output.replaceChildren(controlNode("p", "Preview only · nothing will run"), controlNode("span", `${translatePhrase("Schedule")}: ${preview.schedule || "—"} · ${translatePhrase("Scope")}: ${preview.scope || "—"}`), controlData("pre", preview.prompt || translatePhrase("No task registered."))); }));
+    if (item.state !== "archived") actions.append(controlButton(item.state === "paused" ? "Resume" : "Pause", async () => { await controlAction({action:"set_automation",id:item.id,revision:item.revision,paused:item.state !== "paused"}); await loadControls(); }));
+    row.append(title, meta, actions, output); automations.append(row);
+  }
+  if (Number.isSafeInteger(schedule.next_cursor)) automations.append(controlButton("Load more", async () => { const page = await controlAction({action:"list_automations",cursor:schedule.next_cursor}); controlState.view.automations = {...page,items:[...schedule.items,...(page.items || [])]}; renderControls(); }));
+  const backups = controlCard("Backups", "security", "backups");
+  const inventory = view.backups || {}; const timer = inventory.timer || {};
+  backups.append(controlNode("p", timer.status === "active" ? `${translatePhrase("Next backup")}: ${timer.next_run_at_ms ? controlTime(timer.next_run_at_ms) : timer.next_run || translatePhrase("Not available")}` : translatePhrase(timer.status === "not_configured" ? "Automatic backups are not configured." : timer.status === "inactive" ? "Automatic backups are paused." : "Backup schedule is unavailable."), "inline-hint"));
+  if (!inventory.items?.length) backups.append(controlNode("p", "No completed backups found.", "inline-hint"));
+  else backups.append(controlNode("p", `${translatePhrase("Latest backup")}: ${controlTime(inventory.items[0].created_at_ms)}`, "inline-hint"));
+  const history = controlNode("details", undefined, "control-disclosure"); history.dataset.controlDetails = "backup-history"; history.open = expanded.has("backup-history"); history.append(controlNode("summary", "Older backups"));
+  (inventory.items || []).forEach((item, index) => {
+    const row = controlNode("div", undefined, "control-row"); row.dataset.backupId = item.id;
+    row.append(controlNode("strong", controlTime(item.created_at_ms)), controlNode("small", `${item.databases} ${translatePhrase("databases")} · ${(item.bytes / 1048576).toFixed(1)} MB`));
+    const verification = item.verification || {};
+    const result = controlResult(`${translatePhrase({checking:"Verifying backup…",verified:"Backup verified",failed:"Backup verification failed",not_checked:"Not checked yet"}[verification.status] || "Not checked yet")}${verification.checked_at_ms ? ` · ${controlTime(verification.checked_at_ms)}` : ""}`); result.dataset.state = verification.status;
+    const verify = controlButton("Verify backup", async () => { await controlAction({action:"verify_backup",id:item.id}); await loadControls(); }); verify.disabled = (inventory.items || []).some((item)=>item.verification?.status === "checking");
+    row.append(verify, result); (index === 0 ? backups : history).append(row);
+  });
+  if ((inventory.items?.length || 0) > 1) backups.append(history);
+  root.append(mcp, automations, backups); applyConfigurationFilter();
+  if (controlState.timer !== null) clearTimeout(controlState.timer);
+  if ((inventory.items || []).some((item) => item.verification?.status === "checking")) controlState.timer = setTimeout(() => { if (location.hash === "#configuration") loadControls(); }, 2000);
+}
+
+function appendRunCheck(actions, summary, job) {
+  const output = controlResult(); output.dataset.runCheck = job.id;
+  const paint = (result) => {
+    output.replaceChildren(); if (!result) return;
+    if (result.pending) {output.textContent=translatePhrase("Checking latest status…");return;}
+    if (result.error) {output.textContent=controlError(result.error);return;}
+    output.append(controlNode("span", `${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`),controlNode("p", `Manage: ${processStatusLabel(result.manage.status)} · ${translatePhrase(result.manage.fresh ? "Fresh snapshot" : "Out-of-date snapshot")} · ${controlTime(result.manage.observed_at_ms)}`),controlNode("p", `${translatePhrase("Last activity")}: ${result.manage.last_activity ? ticketDateLabel(result.manage.last_activity) : translatePhrase("Not available")}`),controlNode("p", `GitHub: ${result.github.status === "verified" ? ticketStatusLabel(result.github.state) : translatePhrase("Not available")}`),controlNode("p", result.issue_conflict ? "GitHub is closed while Manage still reports pending or running work. These sources disagree." : "Issue state and agent execution are separate. An open issue can contain completed work."));
+    if (result.worker?.status) output.append(controlNode("p", `${translatePhrase("Worker")}: ${operationLabel(result.worker.status)} · ${result.worker.active_jobs ?? "—"} ${translatePhrase("active jobs")}`));
+    if (result.worker_conflict) output.append(controlNode("p", "Manage reports this run as active, but the assigned worker reports no active jobs."));
+    output.dataset.state=result.disagreement ? "failed" : "verified";
+  };
+  const existing=controlState.runs.get(job.id);paint(existing);
+  const button=controlButton("Check latest status", async()=>{
+    controlState.runs.set(job.id,{pending:true});paint({pending:true});
+    try {const result=await controlAction({action:"check_run",id:job.id});controlState.runs.set(job.id,result);paint(result);}
+    catch(error){const result={error};controlState.runs.set(job.id,result);paint(result);}
+  });button.disabled=existing?.pending===true;
+  actions.append(button);summary.append(output);
+}
+function appendTicketCheck(actions, summary, ticket) {
+  const key=ticketConversationKey(ticket);const output=controlResult();const paint=(result)=>{
+    if(!result)return;
+    if(result.pending){output.textContent=translatePhrase("Checking latest status…");return;}
+    if(result.error){output.textContent=controlError(result.error);return;}
+    output.replaceChildren(controlNode("span", `${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`),controlNode("p", `${translatePhrase("Source")}: ${ticket.integration_server} · ${ticketStatusLabel(result.status || "unknown")}`),controlNode("p", `${translatePhrase("Last activity")}: ${result.updated_at ? ticketDateLabel(result.updated_at) : translatePhrase("Not available")}`));
+    if(result.status && result.status!==ticket.status)output.append(controlNode("p","The source status differs from the ticket list. Refresh the list to reconcile the display."));
+  };
+  const existing=controlState.tickets.get(key);paint(existing);
+  const button=controlButton("Check latest status",async()=>{controlState.tickets.set(key,{pending:true});paint({pending:true});try {const result=await api("/api/tickets/detail",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({integration_server:ticket.integration_server,id:ticket.id})});result.checked_at_ms=Date.now();controlState.tickets.set(key,result);paint(result);}catch(error){controlState.tickets.set(key,{error});paint({error});}});button.disabled=!ticket.integration_server || existing?.pending===true;actions.append(button);summary.append(output);
+}
+function renderAgentResponseTest(account) {
+  const test=account.response_test;const output=controlResult();output.classList.add("agent-response-test");
+  if(!test){output.hidden=true;return output;}
+  const labels={checking:"Testing response…",verified:"Response verified",failed:"Response test failed"};
+  output.append(controlNode("strong",labels[test.status] || "Not checked yet"));
+  if(test.reason && test.reason!=="response_verified")output.append(controlNode("span",{quota_limited:"Subscription quota reached.",sign_in_required:"Sign in before testing a response.",timed_out:"The connection timed out. Try again.",response_failed:"The provider could not complete the response test."}[test.reason] || "The check could not finish. Try again."));
+  if(test.status!=="checking")output.append(controlNode("span",test.model || "Model not reported"));
+  if(test.duration_ms!==undefined)output.append(controlNode("span",`${(test.duration_ms/1000).toFixed(1)} s`));
+  if(test.checked_at_ms)output.append(controlNode("time",controlTime(test.checked_at_ms)));
+  output.dataset.state=test.status;return output;
+}
+function updateMemorySelection() {
+  document.querySelectorAll("[data-memory-select]").forEach((checkbox)=>{checkbox.checked=memorySelection.has(checkbox.dataset.memorySelect);});
+  byId("memory-archive-selected").disabled=memorySelection.size===0;
+  byId("memory-selected-count").textContent=`${memorySelection.size} ${translatePhrase("selected")}`;
+}
+function memorySelectionCheckbox(entry) {
+  const checkbox=document.createElement("input");checkbox.type="checkbox";checkbox.className="memory-select";checkbox.dataset.memorySelect=entry.reference;
+  checkbox.setAttribute("aria-label",`${translatePhrase("Select")} ${entry.reference}`);checkbox.checked=memorySelection.has(entry.reference);checkbox.disabled=entry.status!=="active" || !entry.editable;
+  checkbox.addEventListener("click",event=>event.stopPropagation());
+  checkbox.addEventListener("keydown",event=>event.stopPropagation());
+  checkbox.addEventListener("change",()=>{if(checkbox.checked){if(memorySelection.size>=100){checkbox.checked=false;toast(translatePhrase("Select up to 100 memories."),"error");return;}memorySelection.set(entry.reference,{reference:entry.reference,revision:entry.revision});}else memorySelection.delete(entry.reference);updateMemorySelection();});return checkbox;
+}
+async function inspectMemory(action) {
+  const output=byId("memory-inspection");output.hidden=false;output.replaceChildren(controlResult("Checking…"));
+  try {
+    const result=await controlAction(action);output.replaceChildren();
+    const close=controlButton("Dismiss",()=>{output.hidden=true;});output.append(close);
+    if(action.action==="retrieve_memory"){
+      output.append(controlNode("h3","Retrieval preview"),controlNode("p","These are the memories supplied to dashboard chat for this question. No message was sent."));
+      if(!result.entries.length)output.append(controlNode("p","No active memories match this question."));
+      for(const entry of result.entries)output.append(controlData("p",`${entry.reference} · ${entry.content}`));
+    }else{
+      output.append(controlNode("h3","Duplicate memories"),controlNode("p","Matches ignore letter case and extra spaces. Review each group before archiving."));
+      if(!result.groups.length)output.append(controlNode("p","No duplicate memories found."));
+      for(const group of result.groups){const row=controlNode("div",undefined,"control-row");for(const entry of group){const line=controlNode("label",undefined,"memory-duplicate-choice");line.append(memorySelectionCheckbox(entry),controlData("span",`${entry.reference} · ${entry.content}`));row.append(line);}output.append(row);}
+      if(result.truncated)output.append(controlNode("p","Results are limited. Search to narrow the inventory."));
+    }
+  }catch(error){output.replaceChildren(controlResult(controlError(error)));}
+}
+byId("memory-retrieval-test").addEventListener("click",()=>{const query=byId("memory-query").value.trim();if(!query){toast(translatePhrase("Enter a question in the memory search field."));byId("memory-query").focus();return;}inspectMemory({action:"retrieve_memory",query});});
+byId("memory-duplicates").addEventListener("click",()=>inspectMemory({action:"find_duplicates"}));
+byId("memory-select-visible").addEventListener("click",()=>{memorySelection.clear();for(const entry of selectedMemoryEntries().filter(e=>e.editable && e.status==="active").slice(0,100))memorySelection.set(entry.reference,{reference:entry.reference,revision:entry.revision});renderSelectedMemory();updateMemorySelection();});
+byId("memory-clear-selection").addEventListener("click",()=>{memorySelection.clear();renderSelectedMemory();updateMemorySelection();byId("memory-inspection").hidden=true;});
+byId("memory-archive-selected").addEventListener("click",async()=>{
+  const selected=[...memorySelection.values()];if(!selected.length)return;
+  if(!await agentAccountDialog("Archive selected memories", `${translatePhrase("Selected memories")}: ${selected.length}. ${translatePhrase("They will stop appearing in retrieval. Their content and audit history will be retained.")}`, {submit:"Archive"}))return;
+  const button=byId("memory-archive-selected");button.disabled=true;
+  try {await controlAction({action:"archive_memories",entries:selected});memorySelection.clear();byId("memory-inspection").hidden=true;await loadMemory(memoryQuery);toast(translatePhrase("Selected memories archived."));}
+  catch(error){toast(controlError(error),"error");}finally{updateMemorySelection();}
+});
 
 async function loadConfiguration(force = false) {
   const root = byId("configuration-grid");
@@ -6099,6 +6363,7 @@ async function loadConfiguration(force = false) {
     );
     updateConfigurationSummary(config);
     await loadAgentAccounts();
+    loadControls();
     applyConfigurationFilter();
     root.dataset.loaded = "true";
     if (force) toast("Runtime configuration refreshed.");

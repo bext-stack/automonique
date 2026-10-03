@@ -79,3 +79,20 @@ test("an older request cannot replace a newer completion", async ({ page }) => {
   await page.evaluate(() => window.firstProcessRefresh);
   await expect(page.locator("#ops-drawer-kicker")).toHaveText("Agent run · Finished");
 });
+
+test("status checks show GitHub and worker disagreements without changing a run", async ({ page }) => {
+  await openProcesses(page, fixture());
+  const calls=[];
+  await page.route("**/api/controls/action", route=>{
+    calls.push(route.request().postDataJSON());
+    return route.fulfill({json:{checked_at_ms:Date.now(),manage:{status:"running",fresh:true,observed_at_ms:Date.now(),last_activity:"2026-01-01T01:00:00Z"},github:{status:"verified",state:"closed"},worker:{status:"online",active_jobs:0},disagreement:true,issue_conflict:true,worker_conflict:true}});
+  });
+  await page.locator("#ops-drawer").getByRole("button",{name:"Check latest status"}).click();
+  const result=page.locator('[data-run-check="fixture-job-0001"]');
+  await expect(result).toContainText("GitHub: Closed");
+  await expect(result).toContainText("These sources disagree");
+  await expect(result).toContainText("assigned worker reports no active jobs");
+  expect(calls).toEqual([{action:"check_run",id:"fixture-job-0001"}]);
+  await page.evaluate(()=>loadProcesses());
+  await expect(result).toContainText("These sources disagree");
+});

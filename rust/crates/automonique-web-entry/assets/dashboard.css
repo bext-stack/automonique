@@ -1596,3 +1596,34 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 .ticket-message-body a { color: var(--accent-text); overflow-wrap: anywhere; text-decoration: underline; text-underline-offset: 2px; }
 .capability-codes { display: block; margin-top: 2px; color: var(--quiet); font: var(--font-2xs) var(--font-code); overflow-wrap: anywhere; }
 .platform-history-notice.is-empty { color: var(--muted); background: var(--panel-2); }
+
+/* Compact operational checks and controls. */
+#configuration-controls:empty { display: none; }
+.control-card { align-self: start; }
+.control-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; border-top: 1px solid var(--line); padding: 12px 0; font-size: var(--font-xs); }
+.control-row > strong { overflow-wrap: anywhere; }
+.control-row > .control-meta, .control-row > .control-result { grid-column: 1 / -1; }
+.control-actions, .control-meta, .memory-bulk-toolbar { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.control-meta, .control-row small { color: var(--muted); }
+.control-disclosure { border-top: 1px solid var(--line); padding: 9px 0; }
+.control-disclosure summary { cursor: pointer; font-size: var(--font-sm); overflow-wrap: anywhere; }
+.control-disclosure > .button { margin: 8px 0; }
+.control-result { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: var(--font-xs); color: var(--muted); line-height: 1.6; }
+.control-result:empty, .control-result[hidden] { display: none; }
+.control-result > p, .control-result > pre { flex: 1 1 100%; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.control-result[data-state="verified"] > strong { color: var(--green); }
+.control-result[data-state="failed"] { color: var(--red); }
+.control-tool { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 4px 8px; padding: 8px 0; font-size: var(--font-xs); border-top: 1px solid var(--line); }
+.control-tool strong { overflow-wrap: anywhere; }
+.control-tool small { grid-column: 1 / -1; color: var(--muted); }
+.agent-response-test { grid-column: 1 / -1; }
+.memory-bulk-toolbar { padding: 8px 0; color: var(--muted); font-size: var(--font-xs); }
+.memory-select { width: 16px; height: 16px; margin-right: 7px; vertical-align: middle; accent-color: var(--green); }
+.memory-table .table-head, .memory-table .row { grid-template-columns: 100px minmax(0, 1fr) 96px 104px 86px 112px; }
+.memory-inspection { margin: 8px 0; padding: 14px; font-size: var(--font-sm); max-height: 430px; overflow: auto; }
+.memory-inspection > .button { float: right; }
+.memory-inspection p { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-inspection .control-row { grid-template-columns: minmax(0,1fr); }
+.memory-duplicate-choice { display: flex; align-items: flex-start; gap: 8px; }
+.memory-duplicate-choice input { flex-shrink: 0; }
+@media (max-width: 900px) { .memory-table .row { display: flex; flex-wrap: wrap; } }
