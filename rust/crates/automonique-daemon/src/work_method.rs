@@ -77,14 +77,14 @@ MÉTHODE MONIQUE — à respecter pour chaque ticket (le client lit ton compte r
 8. FICHIERS DE TRAVAIL. Écris tes fichiers temporaires (corps de commentaire, scripts de contrôle, captures) sous /tmp avec un chemin écrit en toutes lettres, et ne les supprime pas : une suppression par variable est refusée par l'outil et te fait perdre un tour.
 
 COMPTE RENDU GITHUB (obligatoire, en français, court, sans jargon interne) — un commentaire unique sur l'issue, structuré ainsi :
-- **Demande 1 — <titre court>** : Fait | Partiel | Non fait
+- **Demande 1 : <titre court>** : Fait | Partiel | Non fait
   Où : <site · page ou écran concerné, avec son URL publique>
   Vérification : <ce qui a été contrôlé et comment>
   Preuve : <URL publique où le client peut le constater, et ce qu'on y voit ; image partagée ![Demande 1](<lien>) si disponible ; résultat de test ou de commande>
-- **Demande 2 — …** (même format pour chaque demande)
+- **Demande 2 : …** (même format pour chaque demande)
 - **Déploiement** : <procédure suivie> · <URL vérifiée> · <preuve que le changement est servi>
 - **Non fait / à clarifier** : <liste honnête, ou « rien »>
-Termine le commentaire par une ligne « — Monique » : il est publié sous le compte de l'équipe et le client doit savoir qui a répondu.
+Termine le commentaire par une ligne de signature « Monique » : il est publié sous le compte de l'équipe et le client doit savoir qui a répondu. N'emploie aucun tiret cadratin dans ce que lit le client.
 Le client lit ce commentaire et n'a accès ni au serveur ni au code : n'y cite aucun chemin de fichier (ni /tmp, ni fichier source), aucun nom de commit et aucun marqueur MONIQUE_…. La seule trace d'une capture qui peut y figurer est le lien renvoyé par share, jamais le fichier local. Ce lien expire : la preuve donnée au client reste ce qu'il peut voir lui-même à l'URL, décrit en toutes lettres.
 N'écris jamais « terminé », « livré » ou « vérifié » pour une demande sans preuve lue. Laisse l'issue ouverte sauf consigne contraire. Ta réponse finale doit contenir le permalien exact de ce commentaire (…#issuecomment-…).
 ",
@@ -127,7 +127,7 @@ mod tests {
         assert!(method.contains("MONIQUE_PURGE_OK"));
         assert!(method.contains("n'y cite aucun chemin de fichier (ni /tmp, ni fichier source)"));
         assert!(method.contains("aucun nom de commit"));
-        assert!(method.contains("« — Monique »"));
+        assert!(method.contains("signature « Monique »"));
         assert!(method.contains(REPORT_MARKER));
         assert!(method.contains("Ne coche JAMAIS en masse"));
         assert!(method.contains("#issuecomment-"));
