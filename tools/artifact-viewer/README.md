@@ -19,9 +19,12 @@ npm run build
 
 `package-lock.json` pins dependencies and their integrity. The build writes the
 viewer, PDF engine and third-party notices to the web entry's assets directory.
-Deploy the same generated files to Share's `public/` directory and the shared
-workspace script to `public/islands/artifacts.js`. Share uses
-`viewerUrl: '/artifact-viewer.html'`; Monique uses `/artifact-viewer`.
+Deploy the PDF engine and license notices to Share's `public/` directory and
+the shared workspace script to `public/islands/artifacts.js`. Share exports the
+generated HTML as a JSON-escaped string in `src/lib/artifact-viewer-document.ts`
+and serves it at `/api/artifact-viewer` with the same isolated CSP. Its generic
+static-file policy does not permit blob media, so do not use a static HTML URL.
+Monique serves the document at `/artifact-viewer`.
 
 PDFs support page navigation, thumbnails, bookmarks, selectable text, search,
 zoom, rotation and password entry. Passwords remain in the frame. Scanned PDFs
