@@ -97,3 +97,25 @@ test("supports French management and mobile dialogs", async ({ page }) => {
   await expect(page.getByRole("dialog")).toContainText("Connecter un abonnement");
   expect(await page.getByRole("dialog").evaluate((node) => node.getBoundingClientRect().right <= innerWidth)).toBe(true);
 });
+
+test("clears completed sign-in panels and their authorization material", async ({ page }) => {
+  view.login_sessions = [{ id: "login", provider: "codex", status: "awaiting_user", authorization_url: "https://auth.openai.com/codex/device", user_code: "TEST-CODE" }];
+  await page.locator("#agent-accounts-refresh").click();
+  await expect(page.locator(".agent-login-code")).toHaveText("TEST-CODE");
+  view.login_sessions[0].status = "authenticated";
+  await page.locator("#agent-accounts-refresh").click();
+  await expect(page.locator(".agent-login-card")).toHaveCount(0);
+  await expect(page.locator(".agent-login-code, .agent-login-link")).toHaveCount(0);
+  await expect(page.locator(".agent-account-card")).toHaveCount(2);
+});
+
+test("failed sign-in can be dismissed without showing expired login controls", async ({ page }) => {
+  view.login_sessions = [{ id: "failed-login", provider: "claude", status: "failed", authorization_url: "https://claude.ai/oauth/authorize", user_code: "EXPIRED-CODE", accepts_authorization_code: true }];
+  await page.locator("#agent-accounts-refresh").click();
+  await expect(page.locator(".agent-login-card")).toHaveCount(1);
+  await expect(page.locator(".agent-login-code, .agent-login-link, .agent-authorization-input")).toHaveCount(0);
+  await page.locator(".agent-login-card").getByRole("button", { name: "Dismiss", exact: true }).click();
+  await page.locator("#agent-accounts-refresh").click();
+  await expect(page.locator(".agent-login-card")).toHaveCount(0);
+  expect(actions).toHaveLength(0);
+});

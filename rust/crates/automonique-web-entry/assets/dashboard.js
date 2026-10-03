@@ -79,6 +79,7 @@ let configurationFilter = "all";
 let configurationQuery = "";
 let agentAccountsPollTimer = null;
 let agentAccountsView = null;
+const dismissedAgentLogins = new Set();
 let agentAccountsRequest = 0;
 let agentAccountMutation = false;
 let statusRefreshTimer = null;
@@ -383,6 +384,7 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "Dismiss": "Masquer",
   "The connection was lost. These readings may be out of date.": "La connexion a été perdue. Ces relevés peuvent être périmés.",
   "Sign-in required": "Connexion nécessaire",
   "Account overview": "Vue d’ensemble des comptes",
@@ -5642,6 +5644,7 @@ async function startAgentLogin(provider, account = null) {
 }
 
 function renderAgentLoginSession(session) {
+  const terminal = ["authenticated", "failed", "cancelled"].includes(session.status);
   const card = document.createElement("div");
   card.className = "agent-login-card";
   const head = document.createElement("div");
@@ -5660,7 +5663,7 @@ function renderAgentLoginSession(session) {
   head.append(identity, status);
   const instructions = document.createElement("div");
   instructions.className = "agent-login-instructions";
-  const authorizationUrl = safeAgentAuthorizationUrl(session);
+  const authorizationUrl = terminal ? null : safeAgentAuthorizationUrl(session);
   if (authorizationUrl) {
     const link = document.createElement("a");
     link.className = "agent-login-link";
@@ -5670,14 +5673,14 @@ function renderAgentLoginSession(session) {
     link.textContent = translatePhrase(session.provider === "claude" ? "Continue with Claude.ai ↗" : "Continue with ChatGPT ↗");
     instructions.append(link);
   }
-  if (typeof session.user_code === "string") {
+  if (!terminal && typeof session.user_code === "string") {
     const code = document.createElement("code");
     code.className = "agent-login-code";
     code.dataset.i18nSkip = "";
     code.textContent = session.user_code;
     instructions.append(code);
   }
-  if (session.accepts_authorization_code === true) {
+  if (!terminal && session.accepts_authorization_code === true) {
     const codeInput = document.createElement("input");
     codeInput.className = "agent-authorization-input";
     codeInput.type = "text";
@@ -5695,8 +5698,13 @@ function renderAgentLoginSession(session) {
     });
     instructions.append(codeInput, submit);
   }
-  if (!["authenticated", "failed", "cancelled"].includes(session.status)) {
+  if (!terminal) {
     instructions.append(agentAccountButton("Cancel", () => mutateAgentAccounts({ action: "cancel_login", session_id: session.id }, "Native sign-in cancelled.")));
+  } else {
+    instructions.append(agentAccountButton("Dismiss", () => {
+      dismissedAgentLogins.add(session.id);
+      renderAgentAccounts(agentAccountsView);
+    }));
   }
   card.append(head);
   if (instructions.childNodes.length) card.append(instructions);
@@ -5793,7 +5801,8 @@ function renderAgentAccount(account) {
   head.append(identity, status);
   const role = document.createElement("div");
   role.className = "agent-account-role";
-  role.textContent = translatePhrase(account.worker_selected ? "Worker account" : "Available account");
+  role.textContent = translatePhrase("Worker account");
+  if (account.worker_selected) identity.append(role);
   const meta = document.createElement("p");
   meta.className = "agent-account-meta";
   meta.textContent = account.last_verified_at_ms ? `${translatePhrase("Last verified")} · ${agentUsageDate(account.last_verified_at_ms)}` : translatePhrase("Not verified yet");
@@ -5820,8 +5829,11 @@ function renderAgentAccount(account) {
       if (await agentAccountDialog("Remove account", "Remove this local account profile and its native credentials?", { submit: "Remove" })) await mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
     }, account.worker_selected),
   );
-  more.append(summary, management);
-  card.append(head, role, renderAgentUsage(account.usage), meta, actions, more);
+  more.append(summary, meta, management);
+  const controls = document.createElement("div");
+  controls.className = "agent-account-controls";
+  controls.append(actions, more);
+  card.append(head, renderAgentUsage(account.usage), controls);
   return card;
 }
 
@@ -5861,6 +5873,7 @@ function renderAgentAccounts(view) {
         replacement.dataset.itemKey = item[key];
         replacement._accountSignature = signature;
         if (draft && replacement.querySelector(".agent-authorization-input")) replacement.querySelector(".agent-authorization-input").value = draft;
+        if (node?.querySelector(".agent-account-manage[open]") && replacement.querySelector(".agent-account-manage")) replacement.querySelector(".agent-account-manage").open = true;
         if (node) node.replaceWith(replacement);
         node = replacement;
         if (wasFocused) requestAnimationFrame(() => node.querySelector(".agent-authorization-input")?.focus());
@@ -5870,7 +5883,10 @@ function renderAgentAccounts(view) {
     for (const node of [...root.children]) if (!nodes.includes(node)) node.remove();
     nodes.forEach((node, index) => { if (root.children[index] !== node) root.insertBefore(node, root.children[index] || null); });
   };
-  reconcile(sessionsRoot, view.login_sessions || [], "id", renderAgentLoginSession);
+  const sessions = view.login_sessions || [];
+  const sessionIds = new Set(sessions.map((session) => session.id));
+  for (const id of dismissedAgentLogins) if (!sessionIds.has(id)) dismissedAgentLogins.delete(id);
+  reconcile(sessionsRoot, sessions.filter((session) => !["authenticated", "cancelled"].includes(session.status) && !dismissedAgentLogins.has(session.id)), "id", renderAgentLoginSession);
   const accounts = Array.isArray(view.accounts) ? view.accounts : [];
   const providers = Array.isArray(view.providers) ? view.providers : [];
   const maximum = Number.isSafeInteger(view.max_accounts) && view.max_accounts > 0 ? view.max_accounts : null;
