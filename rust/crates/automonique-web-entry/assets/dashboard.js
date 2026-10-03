@@ -301,6 +301,7 @@ function consoleOpenTool(key, reveal = true) {
   if (!reveal && !consoleDrawerIsOpen("ops-drawer")) return;
   consoleState.opsKind = "tool";
   consoleState.opsKey = key;
+  processPanel.resetShell();
   renderToolDrawer(tool);
   consoleMarkSelected(byId("operations-tool-grid"), "data-tool-key", key);
   consoleMarkSelected(byId("process-list"), "data-process-id", null);
@@ -308,6 +309,7 @@ function consoleOpenTool(key, reveal = true) {
 }
 
 function consoleCloseOps() {
+  processPanel.resetShell();
   consoleState.opsKind = null;
   consoleState.opsKey = null;
   consoleMarkSelected(byId("process-list"), "data-process-id", null);
@@ -1401,6 +1403,59 @@ const frenchUi = Object.freeze({
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
+  // Agent run inspector.
+  "Saved output": "Sortie conservée",
+  "Live output": "Sortie en direct",
+  "Runtime not reported": "Environnement non renseigné",
+  "Runtime": "Environnement",
+  "Previous run": "Exécution précédente",
+  "Expand panel": "Agrandir le panneau",
+  "Collapse panel": "Réduire le panneau",
+  "Run sections": "Sections de l’exécution",
+  "This snapshot is out of date. Current execution is unconfirmed.": "Ce relevé est ancien. L’exécution actuelle n’est pas confirmée.",
+  "Manage reports a running job, but matching worker activity is not confirmed.": "Manage signale une exécution en cours, mais l’activité correspondante du worker n’est pas confirmée.",
+  "Tool started": "Outil démarré",
+  "Tool request": "Demande à l’outil",
+  "Tool result": "Résultat de l’outil",
+  "Tool finished": "Outil terminé",
+  "Agent response": "Réponse de l’agent",
+  "Run finished": "Exécution terminée",
+  "Run failed": "Exécution en échec",
+  "Run event": "Événement d’exécution",
+  "This event was shortened at the source.": "Cet événement a été raccourci à la source.",
+  "Status sources": "Sources de l’état",
+  "Compare the latest Manage report with GitHub and the worker.": "Comparer le dernier relevé Manage avec GitHub et le worker.",
+  "Failure details": "Détails de l’échec",
+  "Latest activity": "Dernière activité",
+  "Copy response": "Copier la réponse",
+  "Response copied.": "Réponse copiée.",
+  "No final response is included in this snapshot. Open GitHub or Manage for the completion report.": "Ce relevé ne contient pas de réponse finale. Consultez GitHub ou Manage pour le compte rendu.",
+  "No failure details are included in this snapshot. Open Manage to investigate.": "Ce relevé ne précise pas la cause de l’échec. Consultez Manage pour l’examiner.",
+  "Most recent recorded action": "Dernière action enregistrée",
+  "Execution context": "Contexte d’exécution",
+  "Related runs": "Exécutions liées",
+  "Parent run": "Exécution parente",
+  "Child run": "Sous-exécution",
+  "Recent events retained by the worker; this may not be the full history.": "Événements récents conservés par le worker ; l’historique peut être incomplet.",
+  "Copy output": "Copier la sortie",
+  "Output copied.": "Sortie copiée.",
+  "Show new activity": "Afficher les nouveaux événements",
+  "Search activity…": "Rechercher dans l’activité…",
+  "Search activity": "Rechercher dans l’activité",
+  "Filter activity": "Filtrer l’activité",
+  "All events": "Tous les événements",
+  "Messages": "Messages",
+  "Errors": "Erreurs",
+  "Run events": "Événements d’exécution",
+  "Newest first": "Plus récents d’abord",
+  "Reverse activity order": "Inverser l’ordre de l’activité",
+  "No events match your search.": "Aucun événement ne correspond à votre recherche.",
+  "Run details": "Détails de l’exécution",
+  "References": "Références",
+  "Current worker": "Worker actuel",
+  "Current worker configuration, not a record of this run’s model or usage.": "Configuration actuelle du worker. Le modèle et l’utilisation propres à cette exécution ne sont pas renseignés ici.",
+  "Copied.": "Copié.",
+  "events": "événements",
   // Ops console layout.
   "READY": "PRÊT",
   "Session": "Session",
@@ -3171,8 +3226,16 @@ function processSnapshotIsFresh(view = processesSnapshot) {
 }
 
 function processDisplayStatus(job) {
-  return !processSnapshotIsFresh() && !["done", "failed", "cancelled"].includes(job.status)
-    ? "unconfirmed" : job.status;
+  if (["done", "failed", "cancelled"].includes(job.status)) return job.status;
+  if (!processSnapshotIsFresh()) return "unconfirmed";
+  if (job.status === "running") {
+    const worker = processesSnapshot?.worker;
+    const matching = job.assigned_to_worker && worker?.active_jobs > 0
+      && worker.provider === job.provider && worker.runtime === job.runtime
+      && ["online", "ready", "busy", "running"].includes(worker.status);
+    if (!matching) return "unconfirmed";
+  }
+  return job.status;
 }
 
 function processMatches(job, filter) {
@@ -3358,126 +3421,256 @@ function processStatusTone(status) {
   return { pending: "quiet", pending_approval: "warn", running: "info", done: "ok", failed: "danger", cancelled: "quiet" }[status] || "quiet";
 }
 
-function renderProcessDrawer(job) {
-  const displayStatus = processDisplayStatus(job);
-  const fresh = processSnapshotIsFresh();
-  const issueReference = processIssueReference(job);
-  byId("ops-drawer-kicker").textContent = `Agent run · ${processStatusLabel(displayStatus)}`;
-  const title = byId("ops-drawer-title");
-  title.setAttribute("data-i18n-skip", "");
-  title.textContent = issueReference.label;
-  const body = byId("ops-drawer-body");
-  body.replaceChildren();
-  const summary = document.createElement("section");
-  summary.className = "drawer-section";
-  const badges = document.createElement("div");
-  badges.className = "drawer-badges";
-  badges.append(consoleBadge(processStatusLabel(displayStatus), processStatusTone(displayStatus)));
-  if (!fresh) badges.append(consoleBadge("Out-of-date snapshot", "warn"));
-  if (job.approved) badges.append(consoleBadge("Approved", "ok"));
-  if (job.parent_id) badges.append(consoleBadge("Part of a larger run", "quiet"));
-  const lede = document.createElement("p");
-  lede.className = "inline-hint";
-  lede.textContent = {
-    pending: "Waiting for a free agent to pick it up.",
-    pending_approval: "Waiting for your approval in Manage. Nothing runs until it is approved.",
-    running: "An agent is working on this right now.",
-    done: "The agent finished this run.",
-    failed: "This run failed. Check the output below, then retry from Manage.",
-    cancelled: "This run was cancelled.",
-    unconfirmed: "This snapshot is out of date. The last reported status is shown in Details; current execution is unconfirmed.",
-  }[displayStatus] || "Agent run.";
-  const actions = document.createElement("div");
-  actions.className = "drawer-actions";
-  if (issueReference.href) {
-    const issueLink = document.createElement("a");
-    issueLink.className = "button ghost small";
-    issueLink.href = issueReference.href;
-    issueLink.target = "_blank";
-    issueLink.rel = "noreferrer";
-    issueLink.textContent = "GitHub ↗";
-    actions.append(issueLink);
+// Agent details retain the selected tab, search and reading position during polling.
+const processPanel = (() => {
+  const states = new Map();
+  let currentId = null;
+  let signature = null;
+  const text = (tag, value, className) => controlNode(tag, value, className);
+  const raw = (tag, value, className) => {
+    const node = controlData(tag, value);
+    if (className) node.className = className;
+    return node;
+  };
+  const action = (label, fn, key, className = "button ghost small") => {
+    const button = controlButton(label, fn); button.className = className;
+    if (key) button.dataset.runFocus = key;
+    return button;
+  };
+  const currentJob = () => (processesSnapshot?.jobs || []).find((job) => job.id === currentId);
+  const eventKey = (line) => JSON.stringify([line.at_ms, line.kind, line.text, line.truncated]);
+  const timestamp = (value) => {
+    const ms = typeof value === "number" ? value : ticketTimestamp(value);
+    return Number.isFinite(ms) && ms > 0 && ms < 8640000000000000 ? new Date(ms).toISOString() : null;
+  };
+  function time(value) {
+    const iso = timestamp(value), node = text("time", iso ? processTimeLabel(iso) : "Not available");
+    if (iso) { node.dateTime = iso; node.title = ticketDateLabel(iso); }
+    return node;
   }
-  const manageHref = safeTicketLink(job.manage_url);
-  if (manageHref) {
-    const manageLink = document.createElement("a");
-    const awaitingApproval = job.status === "pending_approval";
-    manageLink.className = awaitingApproval ? "button primary small" : "button ghost small";
-    manageLink.href = manageHref;
-    manageLink.target = "_blank";
-    manageLink.rel = "noreferrer";
-    manageLink.textContent = awaitingApproval ? "Approve in Manage ↗" : "Manage ↗";
-    actions.append(manageLink);
+  function stateFor(job) {
+    if (!states.has(job.id)) states.set(job.id, {tab:"overview",query:"",filter:"all",newest:true,open:new Set(),output:job.output || [],pending:null});
+    if (states.size > 100) states.delete(states.keys().next().value);
+    return states.get(job.id);
   }
-  appendRunCheck(actions, summary, job);
-  summary.append(badges, lede);
-  if (actions.childNodes.length) summary.append(actions);
-  const output = document.createElement("section");
-  output.className = "drawer-section process-output";
-  const liveOutput = fresh && job.status === "running";
-  output.setAttribute("aria-label", liveOutput ? "Live agent output" : "Saved agent output");
-  const outputTitle = document.createElement("h3");
-  const outputLines = Array.isArray(job.output) ? job.output : [];
-  outputTitle.textContent = `${liveOutput ? "Live output" : "Saved output"} · ${outputLines.length.toLocaleString(localeTag())} events`;
-  const outputLog = document.createElement("div");
-  outputLog.className = "process-output-log";
-  outputLog.setAttribute("role", "log");
-  if (outputLines.length === 0) {
-    const emptyOutput = document.createElement("p");
-    emptyOutput.textContent = "No output from the agent yet.";
-    outputLog.append(emptyOutput);
-  } else {
-    outputLines.forEach((line) => {
-      const entry = document.createElement("article");
-      const meta = document.createElement("div");
-      const kind = document.createElement("span");
-      kind.textContent = operationLabel(line.kind);
-      const at = document.createElement("time");
-      const timestamp = Number.isSafeInteger(line.at_ms) ? new Date(line.at_ms).toISOString() : null;
-      at.textContent = timestamp ? processTimeLabel(timestamp) : "-";
-      if (timestamp) {
-        at.dateTime = timestamp;
-        at.title = ticketDateLabel(timestamp);
-      }
-      meta.append(kind, at);
-      if (line.truncated) {
-        const truncated = document.createElement("i");
-        truncated.textContent = "CUT SHORT";
-        meta.append(truncated);
-      }
-      const text = document.createElement("pre");
-      text.setAttribute("data-i18n-skip", "");
-      text.textContent = line.text;
-      entry.append(meta, text);
-      outputLog.append(entry);
+  function copy(value, message = "Copied.") {
+    return navigator.clipboard.writeText(value).then(() => toast(translatePhrase(message))).catch(() => toast(translatePhrase("The browser did not allow clipboard access."), "error"));
+  }
+  function category(line) {
+    const kind = String(line.kind || "").toLowerCase();
+    if (/error|fail/.test(kind)) return "errors";
+    if (/^tool/.test(kind)) return "tools";
+    if (["final","assistant","message","answer","result"].includes(kind)) return "messages";
+    return "events";
+  }
+  function eventLabel(line) {
+    return ({tool_start:"Tool started",tool_input:"Tool request",tool_result:"Tool result",tool_end:"Tool finished",final:"Agent response",done:"Run finished",error:"Error",failed:"Run failed",lifecycle:"Run event",assistant:"Agent response"})[line.kind] || operationLabel(line.kind);
+  }
+  function groups(lines) {
+    const result = [];
+    lines.forEach((line) => {
+      const previous = result[result.length - 1];
+      if (line.kind === "tool_input" && previous?.lines.length === 1 && previous.lines[0].kind === "tool_start") {
+        previous.lines.push(line); previous.content = line.text; previous.key += eventKey(line);
+      } else result.push({key:eventKey(line),lines:[line],content:line.text,category:category(line)});
     });
+    return result;
   }
-  output.append(outputTitle, outputLog);
-  const detailsSection = document.createElement("section");
-  detailsSection.className = "drawer-section";
-  const detailsTitle = document.createElement("h3");
-  detailsTitle.textContent = "Details";
-  const details = document.createElement("div");
-  details.className = "process-details";
-  [
-    ["Agent", [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ")],
-    ["Type", job.kind ? translatePhrase(operationLabel(job.kind)) : null],
-    ["Came from", job.source && job.source !== "unknown" ? operationLabel(job.source) : null],
-    ["On this worker", translatePhrase(job.assigned_to_worker ? "Yes" : "No")],
-    ["Last reported status", processStatusLabel(job.status)],
-    ["Snapshot", Number.isSafeInteger(processesSnapshot?.observed_at_ms) ? ticketDateLabel(new Date(processesSnapshot.observed_at_ms).toISOString()) : null],
-    ["Decisions", String(job.decision_count)],
-    ["Site", job.site_id],
-    ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
-    ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
-    ["Run ID", job.id],
-    ["Part of", job.parent_id],
-    ["Ticket ID", job.issue_id],
-    ["Conversation", job.session_id],
-  ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
-  detailsSection.append(detailsTitle, details);
-  body.append(summary, output, detailsSection);
-}
+  function eventRow(group, state, compact = false) {
+    const row = text("article", undefined, `run-event run-event-${group.category}`);
+    const meta = text("div", undefined, "run-event-meta");
+    meta.append(text("span", group.lines.length > 1 ? "Tool request" : eventLabel(group.lines[0])), time(group.lines[group.lines.length-1].at_ms));
+    const content = String(group.content || "");
+    row.append(meta);
+    if (content.length > (compact ? 220 : 700) || content.split("\n").length > (compact ? 3 : 8)) {
+      const disclosure = text("details", undefined, "run-event-disclosure");
+      disclosure.dataset.runDisclosure = group.key; disclosure.open = state.open.has(group.key);
+      disclosure.append(raw("summary", content.replace(/\s+/g," ").slice(0,compact ? 160 : 200) + "…"),raw("pre",content,"run-event-text"));
+      disclosure.firstChild.dataset.runFocus = `event-${group.key}`;
+      disclosure.addEventListener("toggle",()=>disclosure.open ? state.open.add(group.key) : state.open.delete(group.key)); row.append(disclosure);
+    } else row.append(raw("pre", content, "run-event-text"));
+    if (group.lines.length > 1 && !compact) row.append(raw("small",group.lines[0].text,"run-tool-context"));
+    if (group.lines.some((line)=>line.truncated)) row.append(text("small","This event was shortened at the source.","run-truncated"));
+    return row;
+  }
+  function section(title, className = "") {
+    const root = text("section",undefined,`run-section ${className}`); root.append(text("h3",title)); return root;
+  }
+  function fact(root, label, value) {
+    const row = text("div",undefined,"run-fact");row.append(text("dt",label),raw("dd",value || translatePhrase("Not reported")));root.append(row);
+  }
+  function switchTab(tab, focus = false) {
+    const job = currentJob(); if (!job) return;
+    stateFor(job).tab = tab; render(job,true); byId("ops-drawer-body").scrollTop = 0;
+    if (focus) byId(`run-tab-${tab}`)?.focus({preventScroll:true});
+  }
+  function sourceCheck(job) {
+    const root = section("Status sources","run-sources");
+    const output = text("div",undefined,"run-source-result");output.dataset.runCheck = job.id;
+    const result = controlState.runs.get(job.id);
+    const check = action("Check latest status",async()=>{
+      controlState.runs.set(job.id,{pending:true});render(currentJob(),true);
+      try {controlState.runs.set(job.id,await controlAction({action:"check_run",id:job.id}));}
+      catch(error) {controlState.runs.set(job.id,{error});}
+      if(currentId===job.id && consoleState.opsKind === "process")render(currentJob(),true);
+    },"check-status");check.disabled=result?.pending===true;
+    const heading=text("div",undefined,"run-section-head");heading.append(root.firstChild,check);root.append(heading,output);
+    if(result?.pending) output.append(text("p","Checking latest status…","inline-hint"));
+    else if(result?.error) output.append(text("p",controlError(result.error),"run-warning"));
+    else if(result?.manage) {
+      output.append(text("small",`${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`,"inline-hint"));
+      const rows=text("dl",undefined,"run-facts");
+      fact(rows,"Manage",`${translatePhrase(processStatusLabel(result.manage.status))} · ${translatePhrase(result.manage.fresh ? "Fresh snapshot" : "Out-of-date snapshot")}`);
+      fact(rows,"GitHub",result.github?.status==="verified"?translatePhrase(ticketStatusLabel(result.github.state)):translatePhrase("Not available"));
+      if(result.worker?.status)fact(rows,"Worker",`${translatePhrase(operationLabel(result.worker.status))} · ${result.worker.active_jobs ?? "—"} ${translatePhrase("active jobs")}`);
+      output.append(rows);
+      if(result.issue_conflict)output.append(text("p","GitHub is closed while Manage still reports pending or running work. These sources disagree.","run-warning"));
+      else output.append(text("p","Issue state and agent execution are separate. An open issue can contain completed work.","inline-hint"));
+      if(result.worker_conflict)output.append(text("p","Manage reports this run as active, but the assigned worker reports no active jobs.","run-warning"));
+      output.dataset.state=result.disagreement?"failed":"verified";
+    } else output.append(text("p","Compare the latest Manage report with GitHub and the worker.","inline-hint"));
+    return root;
+  }
+  function overview(job,state) {
+    const root = text("div");
+    const lines=job.output || [];
+    const final=[...lines].reverse().find((line)=>line.kind==="final" && String(line.text || "").trim());
+    const error=[...lines].reverse().find((line)=>category(line)==="errors" && String(line.text || "").trim());
+    const result=job.status==="failed" ? error || final : final;
+    const outcome=section(result ? (job.status==="failed" ? "Failure details" : "Agent response") : "Latest activity","run-outcome");
+    if(result) {
+      outcome.dataset.outcome=job.status;
+      outcome.append(eventRow({key:eventKey(result),lines:[result],content:result.text,category:category(result)},state));
+      outcome.append(action("Copy response",()=>copy(String(result.text),"Response copied."),"copy-response"));
+    } else {
+      outcome.append(text("p",job.status==="done" ? "No final response is included in this snapshot. Open GitHub or Manage for the completion report." : job.status==="failed" ? "No failure details are included in this snapshot. Open Manage to investigate." : lines.length ? "Most recent recorded action" : "No output from the agent yet.","inline-hint"));
+      const latest=groups(lines).slice(-1)[0];if(latest)outcome.append(eventRow(latest,state,true));
+    }
+    root.append(outcome);
+    const context=section("Execution context");const facts=text("dl",undefined,"run-facts");
+    fact(facts,"Agent",operationLabel(job.provider));fact(facts,"Runtime",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):null);
+    fact(facts,"Last activity",job.updated_at?ticketDateLabel(job.updated_at):null);
+    context.append(facts);root.append(context);
+    root.append(sourceCheck(job));
+    const related=(processesSnapshot?.jobs || []).filter((item)=>item.id===job.parent_id || item.parent_id===job.id);
+    if(related.length){const sectionRoot=section("Related runs");for(const item of related){const label=`${translatePhrase(item.id===job.parent_id?"Parent run":"Child run")} · ${processIssueReference(item).label}`;sectionRoot.append(action(label,()=>consoleOpenProcess(item.id),`related-${item.id}`));}root.append(sectionRoot);}
+    return root;
+  }
+  function outputText(job,lines) {
+    return [`${processIssueReference(job).label} · ${job.id}`,`${translatePhrase("Last reported status")}: ${translatePhrase(processStatusLabel(job.status))}`,translatePhrase("Recent events retained by the worker; this may not be the full history."),"",...lines.map(line=>`[${timestamp(line.at_ms)||"—"}] ${line.kind}${line.truncated?" [truncated]":""}\n${line.text}`)].join("\n\n");
+  }
+  function activity(job,state) {
+    const root=text("div",undefined,"run-activity");
+    const live=processDisplayStatus(job)==="running";
+    const head=text("div",undefined,"run-section-head");
+    head.append(text("h3",`${translatePhrase(live?"Live output":"Saved output")} · ${state.output.length} ${translatePhrase("events")}`));
+    head.append(action("Copy output",()=>copy(outputText(job,state.output),"Output copied."),"copy-output"));root.append(head);
+    root.append(text("p","Recent events retained by the worker; this may not be the full history.","inline-hint"));
+    if(state.pending){root.append(action("Show new activity",()=>{state.output=state.pending;state.pending=null;render(job,true);byId("ops-drawer-body").scrollTop=0;},"new-activity","button primary small"));}
+    const toolbar=text("div",undefined,"run-activity-toolbar");
+    const search=text("input");search.type="search";search.placeholder=translatePhrase("Search activity…");search.setAttribute("aria-label",translatePhrase("Search activity"));search.value=state.query;search.dataset.runFocus="search";
+    const select=text("select");select.setAttribute("aria-label",translatePhrase("Filter activity"));select.dataset.runFocus="filter";
+    for(const [value,label] of [["all","All events"],["messages","Messages"],["tools","Tools"],["errors","Errors"],["events","Run events"]]) {const option=text("option",label);option.value=value;select.append(option);}select.value=state.filter;
+    const order=action(state.newest?"Newest first":"Oldest first",()=>{state.newest=!state.newest;render(job,true);},"order");order.setAttribute("aria-label",translatePhrase("Reverse activity order"));
+    toolbar.append(search,select,order);root.append(toolbar);
+    const count=text("p",undefined,"run-match-count");count.setAttribute("role","status");
+    const log=text("div",undefined,"run-event-list");log.setAttribute("aria-label",translatePhrase(live?"Live agent output":"Saved agent output"));
+    const paint=()=>{
+      const query=state.query.trim().toLocaleLowerCase();
+      let visible=groups(state.output).filter(group=>(state.filter==="all" || group.category===state.filter) && (!query || group.lines.some(line=>`${line.kind} ${line.text}`.toLocaleLowerCase().includes(query))));
+      if(state.newest)visible.reverse();
+      const events=visible.reduce((n,group)=>n+group.lines.length,0);count.textContent=`${events} / ${state.output.length} ${translatePhrase("events")}`;
+      log.replaceChildren(...visible.map(group=>eventRow(group,state)));
+      if(!visible.length)log.append(text("p",state.output.length?"No events match your search.":"No output from the agent yet.","run-empty"));
+    };
+    search.addEventListener("input",()=>{state.query=search.value;paint();});select.addEventListener("change",()=>{state.filter=select.value;paint();});
+    root.append(count,log);paint();return root;
+  }
+  function details(job) {
+    const root=text("div");const facts=section("Run details");const list=text("dl",undefined,"run-facts");
+    for(const [label,value] of [
+      ["Last reported status",translatePhrase(processStatusLabel(job.status))],
+      ["Created",job.created_at?ticketDateLabel(job.created_at):null],
+      ["Updated",job.updated_at?ticketDateLabel(job.updated_at):null],
+      ["On this worker",translatePhrase(job.assigned_to_worker?"Yes":"No")],
+      ["Approval",translatePhrase(job.approved?"Approved":"Not reported")],
+      ["Decisions",String(job.decision_count ?? 0)],
+      ["Type",job.kind?translatePhrase(operationLabel(job.kind)):null],
+      ["Came from",job.source && job.source!=="unknown"?translatePhrase(operationLabel(job.source)):null],
+    ])if(value)fact(list,label,value);
+    const observed=text("div",undefined,"run-fact");observed.append(text("dt","Snapshot"));const date=raw("dd",controlTime(processesSnapshot?.observed_at_ms));date.dataset.runSnapshot="";observed.append(date);list.append(observed);
+    facts.append(list);root.append(facts);
+    const references=section("References");
+    for(const [label,value] of [["Run ID",job.id],["Ticket ID",job.issue_id],["Conversation",job.session_id],["Part of",job.parent_id],["Site",job.site_id]])if(value){
+      const row=text("div",undefined,"run-reference");const content=text("div");content.append(text("small",label),raw("code",value));
+      const button=action("Copy",()=>copy(value),`copy-${label}`);button.setAttribute("aria-label",`${translatePhrase("Copy")} ${translatePhrase(label)}`);row.append(content,button);references.append(row);
+    }
+    root.append(references);
+    if(job.assigned_to_worker && processesSnapshot?.worker){const worker=processesSnapshot.worker;const sectionRoot=section("Current worker");sectionRoot.append(text("p","Current worker configuration, not a record of this run’s model or usage.","inline-hint"));const workerFacts=text("dl",undefined,"run-facts");
+      for(const [label,value] of [["Status",translatePhrase(operationLabel(worker.status))],["Agent",operationLabel(worker.provider)],["Model",worker.model],["Runtime",worker.runtime],["Version",worker.cli_version],["Active jobs",`${worker.active_jobs ?? 0} / ${worker.concurrency ?? "—"}`]])if(value)fact(workerFacts,label,value);
+      sectionRoot.append(workerFacts);root.append(sectionRoot);}
+    return root;
+  }
+  function header(job,state) {
+    const drawer=byId("ops-drawer");drawer.classList.add("is-run-panel");
+    let tools=drawer.querySelector(".run-header-tools");if(!tools){tools=text("div",undefined,"run-header-tools");drawer.querySelector(".drawer-head").insertBefore(tools,drawer.querySelector(".drawer-close"));}
+    const visible=processHierarchy(processesSnapshot?.jobs || []).filter(({job})=>processMatches(job,processFilter)).map(({job})=>job);
+    const index=visible.findIndex(item=>item.id===job.id);
+    const previous=action("‹",()=>{consoleOpenProcess(visible[index-1].id);byId("ops-drawer").querySelector('[data-run-focus="previous"]')?.focus();},"previous","run-icon-button");
+    const next=action("›",()=>{consoleOpenProcess(visible[index+1].id);byId("ops-drawer").querySelector('[data-run-focus="next"]')?.focus();},"next","run-icon-button");
+    previous.setAttribute("aria-label",translatePhrase("Previous run"));next.setAttribute("aria-label",translatePhrase("Next run"));previous.title=previous.getAttribute("aria-label");next.title=next.getAttribute("aria-label");previous.disabled=index<=0;next.disabled=index<0 || index>=visible.length-1;
+    const position=raw("small",index>=0?`${index+1} / ${visible.length}`:"—","run-position");
+    const expand=action(drawer.classList.contains("is-expanded")?"↙":"↗",()=>{drawer.classList.toggle("is-expanded");drawer.closest(".view-split").classList.toggle("has-expanded-run",drawer.classList.contains("is-expanded"));render(job,true);byId("ops-drawer").querySelector('[data-run-focus="expand"]')?.focus();},"expand","run-icon-button run-expand");
+    expand.setAttribute("aria-label",translatePhrase(drawer.classList.contains("is-expanded")?"Collapse panel":"Expand panel"));expand.title=expand.getAttribute("aria-label");expand.setAttribute("aria-pressed",String(drawer.classList.contains("is-expanded")));
+    tools.replaceChildren(previous,position,next,expand);
+  }
+  function render(job,force=false) {
+    if(!job)return;
+    const body=byId("ops-drawer-body"),drawer=byId("ops-drawer");
+    const changed=currentId!==job.id || !drawer.classList.contains("is-run-panel");
+    const state=stateFor(job);const fresh=processSnapshotIsFresh();const displayStatus=processDisplayStatus(job);
+    const nextSignature=JSON.stringify([job,processesSnapshot?.worker,fresh,currentLanguage,processFilter,(processesSnapshot?.jobs || []).map(j=>[j.id,j.parent_id,j.status]),controlState.runs.get(job.id)]);
+    if(!changed && !force && nextSignature===signature){body.querySelectorAll("[data-run-snapshot]").forEach(node=>node.textContent=controlTime(processesSnapshot?.observed_at_ms));return;}
+    const focused=drawer.contains(document.activeElement)?document.activeElement:null;
+    const focusKey=focused?.dataset.runFocus;const selection=focused?.tagName==="INPUT"?[focused.selectionStart,focused.selectionEnd]:null;
+    const scroll=changed?0:body.scrollTop;
+    const incoming=job.output || [];
+    if(JSON.stringify(incoming)!==JSON.stringify(state.output)) {
+      if(!changed && state.tab==="activity" && scroll>100)state.pending=incoming;
+      else {state.output=incoming;state.pending=null;}
+    }
+    currentId=job.id;signature=nextSignature;
+    byId("ops-drawer-kicker").textContent=`${translatePhrase("Agent run")} · ${translatePhrase(processStatusLabel(displayStatus))}`;
+    const title=byId("ops-drawer-title");title.dataset.i18nSkip="";title.textContent=processIssueReference(job).label;
+    header(job,state);
+    const summary=text("section",undefined,"run-summary");
+    const identity=text("div",undefined,"run-identity");const mark=raw("span",String(operationLabel(job.provider)).slice(0,1).toUpperCase(),"run-agent-mark");mark.setAttribute("aria-hidden","true");
+    const provider=text("div",undefined,"run-agent-name");provider.append(raw("strong",operationLabel(job.provider)),text("small",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):"Runtime not reported"));
+    const badge=consoleBadge(translatePhrase(processStatusLabel(displayStatus)),processStatusTone(displayStatus));identity.append(mark,provider,badge);summary.append(identity);
+    const lede={pending:"Waiting for a free agent to pick it up.",pending_approval:"Waiting for your approval in Manage. Nothing runs until it is approved.",running:"An agent is working on this right now.",done:"The agent finished this run.",failed:"This run failed. Check the output below, then retry from Manage.",cancelled:"This run was cancelled.",unconfirmed:!fresh?"This snapshot is out of date. Current execution is unconfirmed.":"Manage reports a running job, but matching worker activity is not confirmed."}[displayStatus] || "Agent run.";
+    summary.append(text("p",lede,displayStatus==="unconfirmed"||displayStatus==="failed"?"run-warning":"run-lede"));
+    if(!fresh)summary.append(text("small","Out-of-date snapshot","run-warning"));
+    const actions=text("div",undefined,"run-actions");
+    for(const [label,url] of [["GitHub ↗",processIssueReference(job).href],[job.status==="pending_approval"?"Approve in Manage ↗":"Manage ↗",safeTicketLink(job.manage_url)]])if(url){const link=text("a",label,"button ghost small");link.href=url;link.target="_blank";link.rel="noreferrer";actions.append(link);}
+    actions.append(action("Refresh",()=>loadProcesses({announce:true}),"refresh"));
+    const updated=text("span",undefined,"run-updated");updated.append(time(job.updated_at));actions.append(updated);summary.append(actions);
+    const tabs=text("div",undefined,"drawer-tabs run-tabs");tabs.setAttribute("role","tablist");tabs.setAttribute("aria-label",translatePhrase("Run sections"));
+    for(const [key,label] of [["overview","Overview"],["activity","Activity"],["details","Details"]]){
+      const button=action(label,()=>switchTab(key,true),`tab-${key}`,state.tab===key?"is-active":"");button.id=`run-tab-${key}`;button.setAttribute("role","tab");button.setAttribute("aria-controls",`run-pane-${key}`);button.setAttribute("aria-selected",String(state.tab===key));button.tabIndex=state.tab===key?0:-1;
+      button.addEventListener("keydown",event=>{const keys=["overview","activity","details"],i=keys.indexOf(key);const target=event.key==="ArrowRight"?keys[(i+1)%3]:event.key==="ArrowLeft"?keys[(i+2)%3]:event.key==="Home"?keys[0]:event.key==="End"?keys[2]:null;if(target){event.preventDefault();switchTab(target,true);}});tabs.append(button);
+    }
+    body.replaceChildren(summary,tabs);
+    for(const [key,build] of [["overview",()=>overview(job,state)],["activity",()=>activity(job,state)],["details",()=>details(job)]]){const pane=build();pane.id=`run-pane-${key}`;pane.classList.add("run-pane");pane.setAttribute("role","tabpanel");pane.setAttribute("aria-labelledby",`run-tab-${key}`);pane.hidden=state.tab!==key;body.append(pane);}
+    body.scrollTop=scroll;
+    if(focusKey){const replacement=[...drawer.querySelectorAll("[data-run-focus]")].find(node=>node.dataset.runFocus===focusKey && !node.closest("[hidden]"));if(replacement){replacement.focus({preventScroll:true});if(selection && replacement.tagName==="INPUT")replacement.setSelectionRange(...selection);}}
+  }
+  function resetShell() {
+    const drawer=byId("ops-drawer");drawer.classList.remove("is-run-panel","is-expanded");drawer.closest(".view-split")?.classList.remove("has-expanded-run");drawer.querySelector(".run-header-tools")?.remove();currentId=null;signature=null;
+  }
+  return {render,resetShell};
+})();
+
+function renderProcessDrawer(job) { processPanel.render(job); }
 
 async function loadProcesses({ announce = false } = {}) {
   const sequence = ++processesLoadSequence;
@@ -6255,25 +6448,6 @@ function renderControls() {
   if ((inventory.items || []).some((item) => item.verification?.status === "checking")) controlState.timer = setTimeout(() => { if (location.hash === "#configuration") loadControls(); }, 2000);
 }
 
-function appendRunCheck(actions, summary, job) {
-  const output = controlResult(); output.dataset.runCheck = job.id;
-  const paint = (result) => {
-    output.replaceChildren(); if (!result) return;
-    if (result.pending) {output.textContent=translatePhrase("Checking latest status…");return;}
-    if (result.error) {output.textContent=controlError(result.error);return;}
-    output.append(controlNode("span", `${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`),controlNode("p", `Manage: ${processStatusLabel(result.manage.status)} · ${translatePhrase(result.manage.fresh ? "Fresh snapshot" : "Out-of-date snapshot")} · ${controlTime(result.manage.observed_at_ms)}`),controlNode("p", `${translatePhrase("Last activity")}: ${result.manage.last_activity ? ticketDateLabel(result.manage.last_activity) : translatePhrase("Not available")}`),controlNode("p", `GitHub: ${result.github.status === "verified" ? ticketStatusLabel(result.github.state) : translatePhrase("Not available")}`),controlNode("p", result.issue_conflict ? "GitHub is closed while Manage still reports pending or running work. These sources disagree." : "Issue state and agent execution are separate. An open issue can contain completed work."));
-    if (result.worker?.status) output.append(controlNode("p", `${translatePhrase("Worker")}: ${operationLabel(result.worker.status)} · ${result.worker.active_jobs ?? "—"} ${translatePhrase("active jobs")}`));
-    if (result.worker_conflict) output.append(controlNode("p", "Manage reports this run as active, but the assigned worker reports no active jobs."));
-    output.dataset.state=result.disagreement ? "failed" : "verified";
-  };
-  const existing=controlState.runs.get(job.id);paint(existing);
-  const button=controlButton("Check latest status", async()=>{
-    controlState.runs.set(job.id,{pending:true});paint({pending:true});
-    try {const result=await controlAction({action:"check_run",id:job.id});controlState.runs.set(job.id,result);paint(result);}
-    catch(error){const result={error};controlState.runs.set(job.id,result);paint(result);}
-  });button.disabled=existing?.pending===true;
-  actions.append(button);summary.append(output);
-}
 function appendTicketCheck(actions, summary, ticket) {
   const key=ticketConversationKey(ticket);const output=controlResult();const paint=(result)=>{
     if(!result)return;
