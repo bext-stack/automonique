@@ -43,3 +43,10 @@ operator-only legacy directory mapping and atomically moves that directory out
 of the public alias when privacy is enabled. A failed move stays visibly pending
 and can be retried; it never reports successful revocation. Previously downloaded
 or cached copies cannot be recalled. New bundles never use a public static alias.
+
+Asset previews use the separately sandboxed `/artifact-viewer` document.
+PDFs have a local PDF.js reader with search, selectable text, page thumbnails,
+bookmarks, zoom and rotation; images have zoom, pan and gallery navigation.
+CSV, Markdown, JSON and media have format-specific controls. The viewer source,
+reproducible build and limitations are documented in `tools/artifact-viewer/`.
+The generated PDF engine is loaded on demand and never uses an external viewer.

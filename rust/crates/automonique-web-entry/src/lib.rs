@@ -171,6 +171,9 @@ pub enum Route {
     ArtifactScript,
     ArtifactStyles,
     ArtifactPreview,
+    ArtifactViewer,
+    ArtifactPdfEngine,
+    ArtifactViewerLicense,
     ApiArtifacts,
     PlatformCockpitScript,
     QrCodeScript,
@@ -7283,6 +7286,9 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/assets/artifacts.js" => Route::ArtifactScript,
                 "/assets/artifacts.css" => Route::ArtifactStyles,
                 "/artifact-preview" => Route::ArtifactPreview,
+                "/artifact-viewer" => Route::ArtifactViewer,
+                "/artifact-pdf.js" => Route::ArtifactPdfEngine,
+                "/artifact-viewer-LICENSE.txt" => Route::ArtifactViewerLicense,
                 "/api/artifacts" => Route::ApiArtifacts,
                 "/api/chat/conversations" => Route::ApiChatConversations,
                 "/api/chat/conversations/action" => Route::ApiChatConversationAction,
@@ -7741,6 +7747,18 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         Route::ArtifactPreview => Response::static_asset(
             "text/html; charset=utf-8",
             include_str!("../assets/artifact-preview.html"),
+        ),
+        Route::ArtifactViewer => Response::static_asset(
+            "text/html; charset=utf-8",
+            include_str!("../assets/artifact-viewer.html"),
+        ),
+        Route::ArtifactPdfEngine => Response::static_asset(
+            "text/javascript; charset=utf-8",
+            include_str!("../assets/artifact-pdf.js"),
+        ),
+        Route::ArtifactViewerLicense => Response::static_asset(
+            "text/plain; charset=utf-8",
+            include_str!("../assets/artifact-viewer-LICENSE.txt"),
         ),
         Route::Styles => Response::static_asset("text/css; charset=utf-8", DASHBOARD_CSS),
         Route::Script => Response::static_asset("text/javascript; charset=utf-8", DASHBOARD_JS),
@@ -8352,7 +8370,9 @@ fn response_bytes(
     session_cookie: Option<&str>,
     route: Route,
 ) -> Vec<u8> {
-    let content_security_policy = if route == Route::ArtifactPreview {
+    let content_security_policy = if route == Route::ArtifactViewer {
+        "default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:; worker-src blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src blob:; font-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+    } else if route == Route::ArtifactPreview {
         "default-src 'none'; script-src 'unsafe-inline' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; media-src data: blob:; font-src data: blob:; frame-src blob: 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
     } else if response.content_type == Some("text/html; charset=utf-8") {
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src blob:; frame-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
@@ -8373,11 +8393,13 @@ fn response_bytes(
          Connection: close\r\n",
         response.status, response.cache_control, content_security_policy
     );
-    headers.push_str(if route == Route::ArtifactPreview {
-        "X-Frame-Options: SAMEORIGIN\r\n"
-    } else {
-        "X-Frame-Options: DENY\r\n"
-    });
+    headers.push_str(
+        if matches!(route, Route::ArtifactPreview | Route::ArtifactViewer) {
+            "X-Frame-Options: SAMEORIGIN\r\n"
+        } else {
+            "X-Frame-Options: DENY\r\n"
+        },
+    );
     if let Some(content_type) = response.content_type {
         headers.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
@@ -12125,6 +12147,19 @@ mod tests {
         assert!(!preview.contains("allow-same-origin"));
         assert!(preview.contains("connect-src 'none'"));
         assert!(preview.contains("X-Frame-Options: SAMEORIGIN"));
+        let viewer = String::from_utf8(response_bytes(
+            Response::static_asset("text/html; charset=utf-8", "viewer"),
+            false,
+            None,
+            Route::ArtifactViewer,
+        ))
+        .unwrap();
+        assert!(viewer.contains("worker-src blob:"));
+        assert!(viewer.contains("connect-src 'none'"));
+        assert!(viewer.contains("sandbox allow-scripts"));
+        assert!(!viewer.contains("allow-same-origin"));
+        assert!(!viewer.contains("'unsafe-eval'"));
+        assert!(viewer.contains("X-Frame-Options: SAMEORIGIN"));
         let dashboard = String::from_utf8(response_bytes(
             Response::static_asset("text/html; charset=utf-8", "dashboard"),
             false,
