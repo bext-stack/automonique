@@ -170,3 +170,49 @@ test('an export can be cancelled while the draft remains editable',async({page})
  await page.locator('#chat-input').fill('Still writing');await page.locator('#chat-export-all').click();await expect(page.locator('#chat-export-status')).toHaveText('Export cancelled.');release();
  await expect(page.locator('#chat-input')).toHaveValue('Still writing');expect(await page.evaluate(()=>window.downloaded)).toBe(false);
 });
+
+test('chat fills the viewport without an outer page scroll and other pages keep normal scrolling',async({page})=>{
+ for(const viewport of [{width:1852,height:908},{width:1280,height:720},{width:393,height:851},{width:851,height:393}]){
+  await page.setViewportSize(viewport);
+  expect(await page.evaluate(()=>document.scrollingElement.scrollHeight<=innerHeight+1)).toBe(true);
+  const bottom=await page.locator('#chat-workspace').evaluate(node=>node.getBoundingClientRect().bottom);expect(bottom).toBeLessThanOrEqual(viewport.height+1);
+  await expect(page.locator('#chat-send')).toBeInViewport();
+ }
+ await page.evaluate(()=>showView('configuration'));expect(await page.evaluate(()=>getComputedStyle(document.body).overflow)).not.toBe('hidden');
+ await page.evaluate(()=>showView('chat'));expect(await page.evaluate(()=>document.scrollingElement.scrollHeight<=innerHeight+1)).toBe(true);
+});
+test('short conversations need no transcript scroll and long conversations scroll only inside the thread',async({page})=>{
+ await page.setViewportSize({width:1280,height:800});histories['chat-one'].messages=[message(1,'user','Hello'),message(2,'assistant','How can I help?')];await page.evaluate(()=>loadChatHistory(true));
+ expect(await page.locator('#chat-thread').evaluate(node=>node.scrollHeight<=node.clientHeight+1)).toBe(true);
+ histories['chat-one'].messages=Array.from({length:16},(_,i)=>message(i+1,i%2?'assistant':'user','A longer message. '.repeat(70)));await page.evaluate(()=>loadChatHistory(true));
+ expect(await page.locator('#chat-thread').evaluate(node=>node.scrollHeight>node.clientHeight)).toBe(true);
+ await page.locator('#chat-thread').evaluate(node=>node.scrollTop=0);expect(await page.evaluate(()=>window.scrollY)).toBe(0);expect(await page.evaluate(()=>document.scrollingElement.scrollHeight<=innerHeight+1)).toBe(true);
+ await expect(page.locator('#chat-send')).toBeInViewport();
+});
+test('older chats are compact and searchable without forcing a sidebar scrollbar',async({page})=>{
+ await page.setViewportSize({width:1280,height:800});
+ await page.evaluate(()=>{chatUi.items=[...chatUi.items,...Array.from({length:15},(_,i)=>({id:`old-${i}`,title:`A retained project ${i}`,updated_at_ms:Date.now()-40*86400000}))];renderChatConversations();});
+ const older=page.locator('[data-history-group="Earlier"]');await expect(older).not.toHaveAttribute('open','');await expect(older.locator('summary')).toContainText('15');
+ expect(await page.locator('#chat-history-list').evaluate(node=>node.scrollHeight<=node.clientHeight+1)).toBe(true);
+ await page.locator('#chat-history-search').fill('retained project 12');await expect(page.locator('.chat-history-item')).toHaveCount(1);await expect(page.locator('[data-conversation-id="old-12"]')).toBeVisible();
+ await page.locator('#chat-history-search').fill('');await expect(older).not.toHaveAttribute('open','');await older.locator('summary').click();await expect(page.locator('[data-conversation-id="old-12"]')).toBeVisible();
+ await page.evaluate(()=>renderChatConversations());await expect(older).toHaveAttribute('open','');
+});
+test('an active older conversation is visible and the sidebar can collapse persistently',async({page})=>{
+ await page.setViewportSize({width:1280,height:800});await page.evaluate(()=>{chatUi.items[0].updated_at_ms=Date.now()-40*86400000;renderChatConversations();});
+ await expect(page.locator('[data-conversation-id="chat-one"]')).toBeVisible();await expect(page.locator('[data-history-group="Earlier"]')).toHaveAttribute('open','');
+ await page.locator('#chat-history-close').click();await expect(page.locator('#chat-history')).toBeHidden();await expect(page.locator('#chat-history-toggle')).toBeFocused();
+ await page.reload();await expect(page.locator('#chat-input')).toBeEnabled();await expect(page.locator('#chat-history')).toBeHidden();
+ await page.locator('#chat-history-toggle').click();await expect(page.locator('#chat-history')).toBeVisible();await page.setViewportSize({width:393,height:851});await page.setViewportSize({width:1280,height:800});await expect(page.locator('#chat-history')).toBeVisible();
+});
+test('the mobile history focus loop includes date group controls',async({page})=>{
+ await page.setViewportSize({width:393,height:851});await history(page);
+ await page.locator('[data-history-group="Previous 7 days"] summary').click();await expect(page.locator('[data-conversation-id="chat-two"]')).toBeHidden();
+ await page.locator('[data-history-group="Previous 7 days"] summary').focus();await page.keyboard.press('Tab');await expect(page.locator('#chat-history-close')).toBeFocused();
+ await page.keyboard.press('Shift+Tab');await expect(page.locator('[data-history-group="Previous 7 days"] summary')).toBeFocused();
+});
+test('conversation options remain reachable on short screens',async({page})=>{
+ await page.setViewportSize({width:851,height:393});await page.locator('#chat-options summary').click();
+ const menu=await page.locator('.chat-options-menu').boundingBox();expect(menu.y+menu.height).toBeLessThanOrEqual(393);
+ await page.getByRole('button',{name:'Back to tasks',exact:true}).click();await expect(page.locator('[data-panel="sessions"]')).toBeVisible();expect(await page.evaluate(()=>getComputedStyle(document.body).overflow)).not.toBe('hidden');
+});

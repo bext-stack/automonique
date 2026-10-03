@@ -72,7 +72,7 @@ let voiceRepliesEnabled = storedPreference("monique-voice-replies", ["on", "off"
 let activeSpeechButton = null;
 let activeSpeechUtterance = null;
 let activeSpeechStatus = null;
-const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),quotes:new Map(),findHits:[],findIndex:-1,follow:true,hasMore:false};
+const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),quotes:new Map(),findHits:[],findIndex:-1,historyGroups:new Map(),follow:true,hasMore:false};
 let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
@@ -1403,6 +1403,8 @@ const frenchUi = Object.freeze({
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
   // Conversation workspace.
+  "New chat": "Nouvelle discussion",
+  "Conversations retained for 90 days": "Conversations conservées 90 jours",
   "Find in conversation": "Rechercher dans la conversation",
   "Find in this conversation…": "Rechercher dans cette conversation…",
   "Find in this conversation": "Rechercher dans cette conversation",
@@ -2743,6 +2745,7 @@ function showView(name) {
     cockpitState = globalThis.AutomoniquePlatformCockpit.initialState(link);
     if (link.session) platformSelectedSession = link.session;
   }
+  document.body.classList.toggle("chat-page", name === "chat");
   document.querySelectorAll("[data-panel]").forEach((node) => node.classList.toggle("is-visible", node.dataset.panel === name));
   document.querySelectorAll("[data-view]").forEach((node) => {
     const active = node.dataset.view === name;
@@ -7383,21 +7386,32 @@ function toggleChatHistory(open) {
   byId("chat-history-backdrop").hidden=!(narrow && open);
   byId("chat-history-toggle").setAttribute("aria-expanded",String(open));
   if(narrow){byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=open;}
-  else {byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=false;}
+  else {byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=false;savePreference("monique-chat-history",open?"expanded":"collapsed");}
   if(narrow && open)byId("chat-history-search").focus();
 }
 function renderChatConversations() {
-  const root=byId("chat-history-list");const query=byId("chat-history-search").value.trim().toLocaleLowerCase();root.replaceChildren();
+  const root=byId("chat-history-list"),top=root.scrollTop,query=byId("chat-history-search").value.trim().toLocaleLowerCase();root.replaceChildren();
   const items=chatUi.items.filter(item=>String(item.title||"").toLocaleLowerCase().includes(query));
-  let previousGroup=null;
+  const groups=new Map(),today=new Date(),recent=new Date();recent.setDate(today.getDate()-7);recent.setHours(0,0,0,0);
   for(const item of items){
-    const date=new Date(item.updated_at_ms);const today=new Date();const recent=new Date();recent.setDate(today.getDate()-7);
-    const group=date.toDateString()===today.toDateString()?"Today":date>=recent?"Previous 7 days":"Earlier";
-    if(group!==previousGroup){root.append(controlNode("h2",group));previousGroup=group;}
-    const button=controlButton("",()=>selectChatConversation(item.id));button.className="chat-history-item";button.dataset.conversationId=item.id;button.setAttribute("aria-current",String(item.id===chatUi.id));
-    button.append(controlData("strong",item.title || translatePhrase("New conversation")),controlNode("small",ticketDateLabel(new Date(item.updated_at_ms).toISOString())));button.title=item.title || translatePhrase("New conversation");button.disabled=chatBusy || chatUi.loading;root.append(button);
+    const date=new Date(item.updated_at_ms),group=date.toDateString()===today.toDateString()?"Today":date>=recent?"Previous 7 days":"Earlier";
+    if(!groups.has(group))groups.set(group,[]);groups.get(group).push(item);
+  }
+  for(const [group,conversations] of groups){
+    const section=controlNode("details",undefined,"chat-history-group"),summary=controlNode("summary"),list=controlNode("div",undefined,"chat-history-group-items");
+    section.dataset.historyGroup=group;
+    section.open=Boolean(query) || (chatUi.historyGroups.get(group) ?? (group!=="Earlier" || conversations.some(item=>item.id===chatUi.id)));
+    const countLabel=controlData("b",String(conversations.length));countLabel.setAttribute("aria-hidden","true");summary.append(controlNode("span",group),countLabel);
+    summary.addEventListener("click",()=>{if(!query)chatUi.historyGroups.set(group,!section.open);});
+    for(const item of conversations){
+      const title=item.title || translatePhrase("New conversation"),button=controlButton("",()=>selectChatConversation(item.id));
+      button.className="chat-history-item";button.dataset.conversationId=item.id;button.setAttribute("aria-current",String(item.id===chatUi.id));
+      button.append(controlData("strong",title));button.title=`${title} · ${ticketDateLabel(new Date(item.updated_at_ms).toISOString())}`;button.disabled=chatBusy || chatUi.loading;list.append(button);
+    }
+    section.append(summary,list);root.append(section);
   }
   if(!items.length)root.append(controlNode("p",query?"No conversations match your search.":"Your conversations will appear here.","inline-hint"));
+  root.scrollTop=top;
   const selected=chatUi.items.find(item=>item.id===chatUi.id);byId("chat-conversation-title").textContent=selected?.title || translatePhrase("New conversation");
 }
 async function loadChatConversations() {
@@ -7726,11 +7740,13 @@ byId("chat-export").addEventListener("click",()=>{
   const content=["# Monique",translatePhrase("Visible messages from this conversation."),...messages.map(node=>`## ${node.classList.contains("user")?translatePhrase("You"):"Monique"}\n\n${node._chatContent}`)].join("\n\n");
   downloadChatMarkdown(content,"monique-conversation.md");byId("chat-options").open=false;
 });
-const chatNarrowMedia=matchMedia("(max-width: 1000px)");chatNarrowMedia.addEventListener("change",()=>toggleChatHistory(!chatNarrowMedia.matches));toggleChatHistory(!chatNarrowMedia.matches);
+const chatNarrowMedia=matchMedia("(max-width: 1000px)");
+function restoreChatHistoryLayout(){toggleChatHistory(!chatNarrowMedia.matches && storedPreference("monique-chat-history",["expanded","collapsed"],"expanded")==="expanded");}
+chatNarrowMedia.addEventListener("change",restoreChatHistoryLayout);restoreChatHistoryLayout();
 document.addEventListener("keydown",event=>{
   if(event.key==="Escape" && byId("chat-workspace").classList.contains("history-open")){event.preventDefault();toggleChatHistory(false);byId("chat-history-toggle").focus();}
   if(event.key==="Tab" && byId("chat-workspace").classList.contains("history-open")){
-    const nodes=[...byId("chat-history").querySelectorAll("button:not(:disabled), input")].filter(node=>node.getClientRects().length);const first=nodes[0],last=nodes[nodes.length-1];
+    const nodes=[...byId("chat-history").querySelectorAll("button:not(:disabled), input, summary")].filter(node=>node.getClientRects().length && !node.closest("details:not([open]) .chat-history-group-items"));const first=nodes[0],last=nodes[nodes.length-1];
     if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
   }
 });
