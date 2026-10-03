@@ -107,3 +107,66 @@ test('reloading after a conversation conflict preserves the unsent question',asy
  current='chat-two';await page.locator('.message.error').getByRole('button',{name:'Reload conversation'}).click();
  await expect(page.locator('#chat-thread')).toContainText('A retained reply');await expect(page.locator('#chat-input')).toHaveValue('Keep my question');
 });
+
+async function navigation(page,mode='find') {
+ if(mode==='find')await page.locator('#chat-find-toggle').click();
+ else {await page.locator('#chat-options summary').click();await page.locator('#chat-outline-toggle').click();}
+}
+test('find matches across formatting, wraps, and preserves code copying',async({page})=>{
+ await navigation(page);const input=page.locator('#chat-find-input');await input.fill('with the audience');
+ await expect(page.locator('#chat-find-status')).toHaveText('1 / 1');await expect(page.locator('.chat-find-mark.current')).toHaveCount(2);
+ await input.fill('plan');await expect(page.locator('#chat-find-status')).toHaveText('1 / 2');await input.press('Enter');await expect(page.locator('#chat-find-status')).toHaveText('2 / 2');await input.press('Enter');await expect(page.locator('#chat-find-status')).toHaveText('1 / 2');
+ await input.fill('<script>');await expect(page.locator('#chat-thread img')).toHaveCount(0);await expect(page.locator('#chat-find-status')).toHaveText('1 / 1');
+ await page.evaluate(()=>Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async value=>{window.copiedText=value;}}}));
+ await page.getByRole('button',{name:'Copy code',exact:true}).click();expect(await page.evaluate(()=>window.copiedText)).toBe('const safe = "<script>";');
+ await input.focus();await input.press('Escape');await expect(page.locator('#chat-navigator')).toBeHidden();await expect(page.locator('mark.chat-find-mark')).toHaveCount(0);await expect(page.locator('#chat-find-toggle')).toBeFocused();expect(calls).toEqual([]);
+});
+test('find reports its loaded scope and discovers earlier messages on request',async({page})=>{
+ histories['chat-one'].has_more=true;await page.evaluate(()=>loadChatHistory(true));await navigation(page);
+ await page.locator('#chat-find-input').fill('earlier');await expect(page.locator('#chat-find-status')).toHaveText('No matches');await expect(page.locator('#chat-navigation-scope')).toHaveText('Loaded messages');
+ await page.locator('#chat-navigation-older').click();await expect(page.locator('#chat-find-status')).toHaveText('1 / 1');await expect(page.locator('#chat-navigation-scope')).toHaveText('All retained messages loaded');
+ expect(calls).toEqual([{action:'older',id:'chat-one',before:1}]);
+});
+test('outline navigates questions and headings inside the transcript',async({page})=>{
+ histories['chat-one'].messages=Array.from({length:10},(_,i)=>message(i+1,i%2?'assistant':'user',i%2?`## Section ${i}\n\n${'Useful detail. '.repeat(100)}`:`Question ${i}`));
+ await page.evaluate(()=>loadChatHistory(true));await navigation(page,'outline');await expect(page.locator('.chat-outline-item')).toHaveCount(10);
+ const outer=await page.evaluate(()=>window.scrollY);await page.locator('.chat-outline-item').first().click();expect(await page.locator('#chat-thread').evaluate(node=>node.scrollTop)).toBeLessThan(50);expect(await page.evaluate(()=>window.scrollY)).toBe(outer);
+ await page.locator('#chat-outline-tab').focus();await page.keyboard.press('ArrowLeft');await expect(page.locator('#chat-find-tab')).toHaveAttribute('aria-selected','true');await expect(page.locator('#chat-find-tab')).toBeFocused();expect(calls).toEqual([]);
+});
+test('quoting a selection preserves the draft, survives switching, and sends only on submit',async({page})=>{
+ await page.locator('#chat-input').fill('Explain this');await page.locator('.message.assistant .message-markdown strong').evaluate(node=>{const range=document.createRange();range.selectNodeContents(node);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);});
+ await page.locator('[data-quote-message]').click();await expect(page.locator('#chat-quote-text')).toHaveText('the audience');await expect(page.locator('#chat-input')).toHaveValue('Explain this');expect(calls).toEqual([]);
+ await history(page);await page.locator('[data-conversation-id="chat-two"]').click();await expect(page.locator('#chat-quote')).toBeHidden();
+ await history(page);await page.locator('[data-conversation-id="chat-one"]').click();await expect(page.locator('#chat-quote-text')).toHaveText('the audience');await expect(page.locator('#chat-input')).toHaveValue('Explain this');
+ await page.locator('#chat-send').click();await expect(page.locator('#chat-thread')).toContainText('A useful answer');expect(calls.at(-1).message).toBe('> the audience\n\nExplain this');await expect(page.locator('#chat-quote')).toBeHidden();
+});
+test('quote removal and a failed send preserve the original draft',async({page})=>{
+ await page.locator('#chat-input').fill('My follow-up');await page.locator('[data-quote-message]').click();await page.locator('#chat-quote-remove').click();await expect(page.locator('#chat-input')).toHaveValue('My follow-up');await expect(page.locator('#chat-quote')).toBeHidden();
+ await page.locator('[data-quote-message]').click();const quote=await page.locator('#chat-quote-text').textContent();refuse=true;await page.locator('#chat-send').click();await expect(page.locator('.message.error')).toBeVisible();
+ await expect(page.locator('#chat-input')).toHaveValue('My follow-up');await expect(page.locator('#chat-quote-text')).toHaveText(quote);expect(calls).toHaveLength(1);
+});
+test('the quote counts toward the byte limit and fits with mobile search',async({page})=>{
+ await page.locator('[data-quote-message]').click();await page.locator('#chat-input').fill('é'.repeat(4050));await expect(page.locator('#chat-send')).toBeDisabled();
+ await page.locator('#chat-input').fill('A short follow-up');await navigation(page);await page.locator('#chat-find-input').fill('audience');await expect(page.locator('#chat-send')).toBeInViewport();
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);const box=await page.locator('#chat-form').boundingBox();expect(box.y+box.height).toBeLessThanOrEqual(page.viewportSize().height);
+});
+test('full export includes retained older messages without moving the conversation',async({page})=>{
+ histories['chat-one'].has_more=true;await page.evaluate(()=>loadChatHistory(true));await page.locator('#chat-input').fill('Keep my draft');
+ await page.locator('#chat-options summary').click();const downloaded=page.waitForEvent('download');await page.locator('#chat-export-all').click();await expect(page.locator('#chat-export-status')).toHaveText('Conversation exported.');
+ const download=await downloaded;expect(download.suggestedFilename()).toBe('monique-conversation.md');const content=await readFile(await download.path(),'utf8');expect(content).toContain('An earlier question');expect(content).toContain('A clear plan');expect(content.indexOf('An earlier question')).toBeLessThan(content.indexOf('Help me plan'));
+ await expect(page.locator('#chat-thread .message')).toHaveCount(2);await expect(page.locator('#chat-input')).toHaveValue('Keep my draft');expect(calls).toEqual([{action:'older',id:'chat-one',before:1}]);
+});
+test('export failures never download a partial conversation',async({page})=>{
+ histories['chat-one'].has_more=true;await page.evaluate(()=>{window.downloaded=false;downloadChatMarkdown=()=>window.downloaded=true;});
+ await page.route('**/api/chat/conversations/action',route=>route.fulfill({status:503,json:{error:'memory_unavailable'}}));
+ await page.locator('#chat-options summary').click();await page.locator('#chat-export-all').click();await expect(page.locator('#chat-export-status')).toContainText('No partial file');expect(await page.evaluate(()=>window.downloaded)).toBe(false);
+ await expect(page.locator('#chat-export-all')).toBeEnabled();
+});
+test('an export can be cancelled while the draft remains editable',async({page})=>{
+ await page.evaluate(()=>{window.downloaded=false;downloadChatMarkdown=()=>window.downloaded=true;});
+ let release;const gate=new Promise(resolve=>release=resolve);
+ await page.route('**/api/chat/history',async route=>{await gate;await route.fulfill({json:histories[current]}).catch(()=>{});});
+ await page.locator('#chat-options summary').click();await page.locator('#chat-export-all').click();await expect(page.locator('#chat-export-all')).toHaveText('Cancel export');
+ await page.locator('#chat-input').fill('Still writing');await page.locator('#chat-export-all').click();await expect(page.locator('#chat-export-status')).toHaveText('Export cancelled.');release();
+ await expect(page.locator('#chat-input')).toHaveValue('Still writing');expect(await page.evaluate(()=>window.downloaded)).toBe(false);
+});

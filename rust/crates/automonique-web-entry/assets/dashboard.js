@@ -72,7 +72,7 @@ let voiceRepliesEnabled = storedPreference("monique-voice-replies", ["on", "off"
 let activeSpeechButton = null;
 let activeSpeechUtterance = null;
 let activeSpeechStatus = null;
-const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),follow:true,hasMore:false};
+const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),quotes:new Map(),findHits:[],findIndex:-1,follow:true,hasMore:false};
 let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
@@ -1403,6 +1403,34 @@ const frenchUi = Object.freeze({
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
   // Conversation workspace.
+  "Find in conversation": "Rechercher dans la conversation",
+  "Find in this conversation…": "Rechercher dans cette conversation…",
+  "Find in this conversation": "Rechercher dans cette conversation",
+  "Navigate conversation": "Parcourir la conversation",
+  "Navigation mode": "Mode de navigation",
+  "Close conversation navigation": "Fermer la navigation",
+  "Conversation outline": "Sommaire de la conversation",
+  "Find": "Rechercher",
+  "Outline": "Sommaire",
+  "Previous match": "Résultat précédent",
+  "Next match": "Résultat suivant",
+  "No matches": "Aucun résultat",
+  "First 1000 matches": "1 000 premiers résultats",
+  "Loaded messages": "Messages chargés",
+  "All retained messages loaded": "Tous les messages conservés sont chargés",
+  "Questions and reply headings will appear here.": "Les questions et les titres des réponses apparaîtront ici.",
+  "Quote": "Citer",
+  "Quoted excerpt": "Extrait cité",
+  "Remove quote": "Retirer la citation",
+  "Download reply": "Télécharger la réponse",
+  "Export full conversation": "Exporter toute la conversation",
+  "Cancel export": "Annuler l’export",
+  "Preparing retained messages…": "Préparation des messages conservés…",
+  "Conversation exported.": "Conversation exportée.",
+  "Export cancelled.": "Export annulé.",
+  "Export could not finish. No partial file was downloaded.": "L’export n’a pas abouti. Aucun fichier partiel n’a été téléchargé.",
+  "This conversation is too large to export here.": "Cette conversation est trop volumineuse pour être exportée ici.",
+  "Retained messages at the time of export.": "Messages conservés au moment de l’export.",
   "Today": "Aujourd’hui",
   "Close conversation history": "Fermer l’historique",
   "Toggle conversation history": "Afficher ou masquer l’historique",
@@ -7037,6 +7065,12 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
       }
     });
     actions.append(copy);
+    if (!details.error && !details.localized) {
+      const quote=controlButton("Quote",()=>quoteChatMessage(markdown,content));quote.dataset.quoteMessage="";
+      quote.addEventListener("mousedown",event=>event.preventDefault());
+      const download=controlButton("Download reply",()=>downloadChatMarkdown(String(content),"monique-reply.md"));
+      actions.append(quote,download);
+    }
     tools.append(actions);
     body.append(tools);
   }
@@ -7046,6 +7080,7 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
     actions.append(reuse);tools.append(actions);body.append(tools);item.append(body,avatar);
   } else item.append(avatar,body);
   byId("chat-thread").append(item);
+  refreshChatNavigation();
   revealChatMessage(role === "user");
   if (role !== "user" && details.speak && voiceRepliesEnabled) {
     window.setTimeout(() => speakText(markdown.innerText || markdown.textContent), 0);
@@ -7181,8 +7216,137 @@ function createWelcome(title = "What can I help with?", text = "Think it through
   return empty;
 }
 
+function chatOutgoingMessage() {
+  const draft=byId("chat-input").value.trim(),quote=chatUi.quotes.get(chatUi.id || "");
+  return quote?`${quote.split("\n").map(line=>`> ${line}`).join("\n")}\n\n${draft}`:draft;
+}
+function renderChatQuote() {
+  const quote=chatUi.quotes.get(chatUi.id || "");byId("chat-quote").hidden=!quote;
+  byId("chat-quote-text").textContent=quote || "";
+}
+function quoteChatMessage(markdown,content) {
+  if(chatUi.loading)return;
+  const selection=window.getSelection();
+  const selected=selection && !selection.isCollapsed && markdown.contains(selection.anchorNode) && markdown.contains(selection.focusNode)?selection.toString().trim():"";
+  const text=Array.from(selected || String(content));
+  chatUi.quotes.set(chatUi.id || "",text.slice(0,1200).join("")+(text.length>1200?"…":""));
+  updateChatComposer();byId("chat-input").focus();
+}
+function downloadChatMarkdown(content,filename) {
+  const url=URL.createObjectURL(new Blob([content],{type:"text/markdown;charset=utf-8"}));
+  const link=document.createElement("a");link.href=url;link.download=filename;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+async function exportChatConversation() {
+  if(chatUi.exportController){chatUi.exportController.abort();return;}
+  if(chatBusy || chatUi.loading || !chatUi.id)return;
+  const id=chatUi.id,title=chatUi.items.find(item=>item.id===id)?.title || "Monique",controller=new AbortController();
+  chatUi.exportController=controller;byId("chat-export-all").textContent=translatePhrase("Cancel export");
+  const status=byId("chat-export-status");status.hidden=false;status.textContent=translatePhrase("Preparing retained messages…");
+  let timedOut=false;const timer=setTimeout(()=>{timedOut=true;controller.abort();},120000);
+  try {
+    const history=await api("/api/chat/history",{signal:controller.signal});
+    if(history.conversation_id!==id)throw new Error("chat_conversation_changed");
+    let messages=history.messages || [],more=history.has_more,pages=0,size=JSON.stringify(messages).length;
+    const seen=new Set(messages.map(message=>message.id));
+    while(more){
+      if(++pages>1000 || size>20000000)throw new Error("chat_export_too_large");
+      const before=messages[0]?.id;if(!Number.isSafeInteger(before))throw new Error("chat_export_incomplete");
+      const page=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},signal:controller.signal,body:JSON.stringify({action:"older",id,before})});
+      if(page.conversation_id!==id || !Array.isArray(page.messages))throw new Error("chat_export_incomplete");
+      for(const message of page.messages){if(seen.has(message.id))throw new Error("chat_export_incomplete");seen.add(message.id);}
+      if(page.has_more && !page.messages.length)throw new Error("chat_export_incomplete");
+      messages=[...page.messages,...messages];more=page.has_more;size+=JSON.stringify(page.messages).length;
+    }
+    if(size>20000000)throw new Error("chat_export_too_large");
+    if(controller.signal.aborted)throw new DOMException("Cancelled","AbortError");
+    const content=[`# ${title}`,translatePhrase("Retained messages at the time of export."),...messages.map(message=>`## ${message.role==="user"?translatePhrase("You"):"Monique"}\n\n${message.content}`)].join("\n\n");
+    downloadChatMarkdown(content,"monique-conversation.md");status.textContent=translatePhrase("Conversation exported.");
+  }catch(error){
+    status.textContent=translatePhrase(controller.signal.aborted && !timedOut?"Export cancelled.":error.message==="chat_export_too_large"?"This conversation is too large to export here.":error.message==="chat_conversation_changed"?"The active conversation changed. Reload it before sending.":"Export could not finish. No partial file was downloaded.");
+  }finally{clearTimeout(timer);chatUi.exportController=null;byId("chat-export-all").textContent=translatePhrase("Export full conversation");updateChatComposer();}
+}
+function scrollToChatTarget(target) {
+  const thread=byId("chat-thread");chatUi.follow=false;
+  thread.scrollTop+=target.getBoundingClientRect().top-thread.getBoundingClientRect().top-24;
+  byId("chat-jump").hidden=chatAtBottom();
+}
+function toggleChatNavigation(mode) {
+  const open=Boolean(mode);byId("chat-navigator").hidden=!open;
+  byId("chat-find-toggle").setAttribute("aria-expanded",String(open));
+  if(!open){clearChatFindMarks();chatUi.findHits=[];byId("chat-find-toggle").focus();return;}
+  byId("chat-options").open=false;chatUi.navigationMode=mode;
+  for(const name of ["find","outline"]){
+    const selected=mode===name;byId(`chat-${name}-panel`).hidden=!selected;
+    byId(`chat-${name}-tab`).setAttribute("aria-selected",String(selected));byId(`chat-${name}-tab`).tabIndex=selected?0:-1;
+  }
+  refreshChatNavigation();
+  (mode==="find"?byId("chat-find-input"):byId("chat-outline-tab")).focus();
+}
+function clearChatFindMarks() {
+  for(const mark of byId("chat-thread").querySelectorAll("mark.chat-find-mark")){
+    const parent=mark.parentNode;mark.replaceWith(document.createTextNode(mark.textContent));parent.normalize();
+  }
+}
+function refreshChatNavigation() {
+  byId("chat-navigation-older").hidden=!chatUi.hasMore;
+  byId("chat-navigation-scope").textContent=translatePhrase(chatUi.hasMore?"Loaded messages":"All retained messages loaded");
+  if(byId("chat-navigator").hidden)return;
+  if(chatUi.navigationMode==="find")findChatMatches(false);
+  else {clearChatFindMarks();renderChatOutline();}
+}
+function findChatMatches(jump=true) {
+  clearChatFindMarks();chatUi.findHits=[];
+  const query=byId("chat-find-input").value.trim();
+  if(query){
+    const pattern=new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"giu");
+    for(const markdown of byId("chat-thread").querySelectorAll(".message:not(.pending) .message-markdown")){
+      const walker=document.createTreeWalker(markdown,NodeFilter.SHOW_TEXT,{acceptNode:node=>node.parentElement.closest(".chat-code-head,button")?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
+      const nodes=[];let text="",node;
+      while((node=walker.nextNode())){nodes.push({node,start:text.length,end:text.length+node.length});text+=node.textContent;}
+      const matches=[];pattern.lastIndex=0;let match;
+      while((match=pattern.exec(text)) && chatUi.findHits.length<1000){const hit={start:match.index,end:match.index+match[0].length,marks:[]};matches.push(hit);chatUi.findHits.push(hit);}
+      for(const entry of nodes){
+        const intersections=matches.filter(hit=>hit.start<entry.end && hit.end>entry.start);if(!intersections.length)continue;
+        const fragment=document.createDocumentFragment();let offset=0;
+        for(const hit of intersections){
+          const start=Math.max(0,hit.start-entry.start),end=Math.min(entry.node.length,hit.end-entry.start);
+          fragment.append(document.createTextNode(entry.node.textContent.slice(offset,start)));
+          const mark=document.createElement("mark");mark.className="chat-find-mark";mark.textContent=entry.node.textContent.slice(start,end);fragment.append(mark);hit.marks.push(mark);offset=end;
+        }
+        fragment.append(document.createTextNode(entry.node.textContent.slice(offset)));entry.node.replaceWith(fragment);
+      }
+      if(chatUi.findHits.length>=1000)break;
+    }
+  }
+  chatUi.findIndex=chatUi.findHits.length?Math.max(0,Math.min(chatUi.findIndex,chatUi.findHits.length-1)):-1;
+  focusChatMatch(0,jump);
+}
+function focusChatMatch(direction,jump=true) {
+  const hits=chatUi.findHits;
+  if(hits.length)chatUi.findIndex=(chatUi.findIndex+direction+hits.length)%hits.length;
+  hits.forEach((hit,index)=>hit.marks.forEach(mark=>mark.classList.toggle("current",index===chatUi.findIndex)));
+  byId("chat-find-status").textContent=hits.length?`${chatUi.findIndex+1} / ${hits.length}${hits.length===1000?"+":""}`:byId("chat-find-input").value.trim()?translatePhrase("No matches"):"";
+  byId("chat-find-status").title=hits.length===1000?translatePhrase("First 1000 matches"):"";
+  byId("chat-find-prev").disabled=byId("chat-find-next").disabled=!hits.length;
+  if(jump && hits.length)scrollToChatTarget(hits[chatUi.findIndex].marks[0]);
+}
+function renderChatOutline() {
+  const root=byId("chat-outline-list");root.replaceChildren();
+  for(const message of byId("chat-thread").querySelectorAll(".message:not(.pending):not(.error)")){
+    const targets=message.classList.contains("user")?[message.querySelector(".message-markdown")]:[...message.querySelectorAll(".message-markdown h1,.message-markdown h2,.message-markdown h3")];
+    for(const target of targets){
+      if(!target)continue;const text=target.textContent.trim();if(!text)continue;
+      const button=controlButton("",()=>{scrollToChatTarget(target);target.tabIndex=-1;target.focus({preventScroll:true});});
+      button.className="chat-outline-item";button.classList.toggle("question",message.classList.contains("user"));
+      button.append(controlData("span",text.slice(0,160)));button.title=text.slice(0,500);root.append(button);
+    }
+  }
+  if(!root.children.length)root.append(controlNode("p","Questions and reply headings will appear here.","inline-hint"));
+}
+
 function updateChatComposer() {
-  const input=byId("chat-input");const bytes=new TextEncoder().encode(input.value).length;
+  const input=byId("chat-input");const bytes=new TextEncoder().encode(chatOutgoingMessage()).length;
+  renderChatQuote();
   input.disabled=chatUi.loading;
   if(!CSS.supports("field-sizing", "content")){input.rows=1;const lineHeight=parseFloat(getComputedStyle(input).lineHeight)||24;input.rows=Math.min(7,Math.max(1,Math.ceil((input.scrollHeight-24)/lineHeight)));}
   byId("chat-count").textContent=bytes.toLocaleString(localeTag());byId("chat-limit").hidden=bytes<6000;
@@ -7193,6 +7357,10 @@ function updateChatComposer() {
   byId("new-chat").disabled=chatBusy || chatUi.loading || !chatUi.ready;
   byId("chat-new-shortcut").disabled=byId("new-chat").disabled;
   byId("chat-reload").disabled=chatBusy || chatUi.loading;
+  byId("chat-export-all").disabled=!chatUi.exportController && (chatBusy || chatUi.loading || !chatUi.id);
+  byId("chat-navigation-older").disabled=chatBusy || chatUi.loading;
+  byId("chat-quote-remove").disabled=chatUi.loading;
+  byId("chat-thread").querySelectorAll("[data-quote-message]").forEach(button=>button.disabled=chatUi.loading);
   byId("chat-export").disabled=!byId("chat-thread").querySelector(".message:not(.pending)");
   byId("chat-thread").setAttribute("aria-busy",String(chatBusy || chatUi.loading));
   document.querySelectorAll(".chat-history-item").forEach(button=>button.disabled=chatBusy || chatUi.loading);
@@ -7238,7 +7406,7 @@ async function loadChatConversations() {
 }
 function rememberChatDraft() {chatUi.drafts.set(chatUi.id || "",byId("chat-input").value);}
 function applyChatHistory(history) {
-  stopSpeaking();const thread=byId("chat-thread");thread.replaceChildren();chatUi.id=history.conversation_id || null;chatUi.follow=false;
+  stopSpeaking();chatUi.findIndex=-1;const thread=byId("chat-thread");thread.replaceChildren();chatUi.id=history.conversation_id || null;chatUi.follow=false;
   for(const message of history.messages || [])appendMessage(message.role,message.content,message.created_at_ms,{id:message.id});
   for(const action of history.pending_actions || [])appendMessage("assistant","This action is still awaiting your decision.",Date.now(),{action,localized:true});
   if(!thread.children.length)thread.append(createWelcome());
@@ -7250,6 +7418,7 @@ function applyChatHistory(history) {
   renderChatConversations();scrollChatLatest();updateChatComposer();
 }
 function addOlderChatButton() {
+  refreshChatNavigation();
   byId("chat-older")?.remove();if(!chatUi.hasMore)return;
   const button=controlButton("Load earlier messages",loadOlderChatMessages);button.id="chat-older";byId("chat-thread").prepend(button);
 }
@@ -7489,15 +7658,16 @@ function initializeVoiceSupport() {
 byId("chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if(chatBusy || chatUi.loading || !chatUi.ready)return;
-  stopVoiceInput();const input=byId("chat-input"),message=input.value.trim();
-  if(!message || new TextEncoder().encode(message).length>8192)return;
-  chatBusy=true;chatUi.drafts.delete(chatUi.id || "");appendMessage("user",message);input.value="";updateChatComposer();scrollChatLatest();
+  stopVoiceInput();const input=byId("chat-input"),draft=input.value.trim(),quote=chatUi.quotes.get(chatUi.id || ""),message=chatOutgoingMessage(),originalId=chatUi.id;
+  if(!draft || new TextEncoder().encode(message).length>8192)return;
+  chatBusy=true;chatUi.quotes.delete(chatUi.id || "");chatUi.drafts.delete(chatUi.id || "");appendMessage("user",message);input.value="";updateChatComposer();scrollChatLatest();
   const pending=appendPendingMessage(),started=performance.now();
   const timer=setInterval(()=>{const seconds=Math.max(1,Math.round((performance.now()-started)/1000));const label=pending.querySelector(".chat-pending-label");if(label)label.textContent=`${translatePhrase("Thinking…")} ${seconds}s`;},1000);
   byId("chat-state").textContent=translatePhrase("Monique is working…");
   try {
     const answer=await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message,profile:byId("chat-profile").value,expected_conversation:chatUi.id || ""})});
     pending.remove();chatUi.id=answer.conversation_id || chatUi.id;
+    if(chatUi.id!==originalId && chatUi.quotes.has(originalId || "")){chatUi.quotes.set(chatUi.id,chatUi.quotes.get(originalId || ""));chatUi.quotes.delete(originalId || "");}
     const sources=Array.isArray(answer.live_sources)?answer.live_sources:[];
     appendMessage("assistant",answer.answer,Date.now(),{sources,durationMs:answer.duration_ms,action:answer.action,speak:true});
     byId("chat-memory-count").textContent=count(answer.memory_evidence);byId("chat-source-count").textContent=count(sources.length);
@@ -7505,7 +7675,7 @@ byId("chat-form").addEventListener("submit", async (event) => {
     byId("chat-state").textContent=translatePhrase("Ready");await loadChatConversations();
   }catch(error){
     pending.remove();appendMessage("assistant",humanChatError(error.message),Date.now(),{error:true});
-    if(!input.value.trim())input.value=message;
+    if(!input.value.trim() && !chatUi.quotes.has(chatUi.id || "")){input.value=draft;if(quote)chatUi.quotes.set(chatUi.id || "",quote);}
     byId("chat-state").textContent=translatePhrase("Reply unavailable · your draft is kept");
   }finally{clearInterval(timer);chatBusy=false;updateChatComposer();}
 });
@@ -7522,7 +7692,7 @@ byId("new-chat").addEventListener("click",async()=>{
   rememberChatDraft();chatUi.loading=true;updateChatComposer();
   try {
     const history=await api("/api/chat/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({expected_conversation:chatUi.id || ""})});
-    chatUi.drafts.delete("");applyChatHistory(history);await loadChatConversations();
+    chatUi.drafts.delete("");chatUi.quotes.delete("");applyChatHistory(history);await loadChatConversations();
     if(matchMedia("(max-width: 1000px)").matches)toggleChatHistory(false);byId("chat-input").focus();
   }catch(error){toast(humanChatError(error.message),"error");}
   finally{chatUi.loading=false;updateChatComposer();}
@@ -7534,10 +7704,27 @@ for(const id of ["chat-history-close","chat-history-backdrop"])byId(id).addEvent
 byId("chat-jump").addEventListener("click",scrollChatLatest);
 byId("chat-thread").addEventListener("scroll",()=>{chatUi.follow=chatAtBottom();if(chatUi.follow)byId("chat-jump").hidden=true;});
 byId("chat-reload").addEventListener("click",()=>{byId("chat-options").open=false;loadChatHistory(true);});
+byId("chat-export-all").addEventListener("click",exportChatConversation);
+byId("chat-quote-remove").addEventListener("click",()=>{chatUi.quotes.delete(chatUi.id || "");updateChatComposer();byId("chat-input").focus();});
+byId("chat-find-toggle").addEventListener("click",()=>toggleChatNavigation(byId("chat-navigator").hidden?"find":null));
+byId("chat-outline-toggle").addEventListener("click",()=>toggleChatNavigation("outline"));
+byId("chat-navigator-close").addEventListener("click",()=>toggleChatNavigation(null));
+for(const mode of ["find","outline"])byId(`chat-${mode}-tab`).addEventListener("click",()=>toggleChatNavigation(mode));
+byId("chat-navigator").addEventListener("keydown",event=>{
+  if(event.key==="Escape"){event.preventDefault();event.stopPropagation();toggleChatNavigation(null);}
+  if(event.target.getAttribute("role")==="tab" && ["ArrowLeft","ArrowRight","Home","End"].includes(event.key)){
+    event.preventDefault();const mode=event.key==="Home"?"find":event.key==="End"?"outline":chatUi.navigationMode==="find"?"outline":"find";toggleChatNavigation(mode);byId(`chat-${mode}-tab`).focus();
+  }
+});
+byId("chat-find-input").addEventListener("input",()=>{chatUi.findIndex=0;findChatMatches();});
+byId("chat-find-input").addEventListener("keydown",event=>{if(event.key==="Enter" && !event.isComposing){event.preventDefault();focusChatMatch(event.shiftKey?-1:1);}});
+byId("chat-find-prev").addEventListener("click",()=>focusChatMatch(-1));
+byId("chat-find-next").addEventListener("click",()=>focusChatMatch(1));
+byId("chat-navigation-older").addEventListener("click",loadOlderChatMessages);
 byId("chat-export").addEventListener("click",()=>{
   const messages=[...byId("chat-thread").querySelectorAll(".message:not(.pending)")].filter(node=>node._chatContent!==undefined);
   const content=["# Monique",translatePhrase("Visible messages from this conversation."),...messages.map(node=>`## ${node.classList.contains("user")?translatePhrase("You"):"Monique"}\n\n${node._chatContent}`)].join("\n\n");
-  const url=URL.createObjectURL(new Blob([content],{type:"text/markdown;charset=utf-8"}));const link=document.createElement("a");link.href=url;link.download="monique-conversation.md";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);byId("chat-options").open=false;
+  downloadChatMarkdown(content,"monique-conversation.md");byId("chat-options").open=false;
 });
 const chatNarrowMedia=matchMedia("(max-width: 1000px)");chatNarrowMedia.addEventListener("change",()=>toggleChatHistory(!chatNarrowMedia.matches));toggleChatHistory(!chatNarrowMedia.matches);
 document.addEventListener("keydown",event=>{

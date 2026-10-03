@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=26">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=27">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=27" defer></script>
+    <script src="/assets/dashboard.js?v=28" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -186,17 +186,29 @@
                 <button class="chat-icon-button" id="chat-history-toggle" type="button" aria-controls="chat-history" aria-expanded="true" aria-label="Toggle conversation history" title="Conversation history">☰</button>
                 <div class="chat-heading"><h1 id="chat-title">Monique</h1><p id="chat-conversation-title" data-i18n-skip></p></div>
                 <div class="chat-model-actions">
+                  <button class="chat-icon-button" id="chat-find-toggle" type="button" aria-label="Find in conversation" title="Find in conversation" aria-controls="chat-navigator" aria-expanded="false">⌕</button>
                   <button class="chat-icon-button" id="chat-new-shortcut" type="button" aria-label="New chat" title="New chat">＋</button>
                   <details class="chat-options" id="chat-options"><summary aria-label="Conversation options" title="Conversation options">···</summary><div class="chat-options-menu">
                     <strong>Conversation context</strong>
                     <div class="chat-context-summary"><span><b id="chat-memory-count">-</b> memory</span><span><b id="chat-source-count">0</b> live</span><span><b id="chat-latency">-</b> last turn</span><span id="chat-manage-state" hidden>Actions ready</span></div>
                     <button class="button ghost small voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
                     <button class="button ghost small" id="chat-export" type="button">Export visible messages</button>
+                    <button class="button ghost small" id="chat-export-all" type="button">Export full conversation</button>
+                    <small id="chat-export-status" role="status" hidden></small>
+                    <button class="button ghost small" id="chat-outline-toggle" type="button" aria-controls="chat-navigator">Conversation outline</button>
                     <button class="button ghost small" id="chat-reload" type="button">Reload conversation</button>
                     <small>GENERAL HELP</small><p>For work on a task, reply inside that task instead.</p>
                   </div></details>
                 </div>
               </header>
+              <section class="chat-navigator" id="chat-navigator" aria-label="Navigate conversation" hidden>
+                <div class="chat-navigator-head"><div role="tablist" aria-label="Navigation mode"><button id="chat-find-tab" type="button" role="tab" aria-selected="true" aria-controls="chat-find-panel">Find</button><button id="chat-outline-tab" type="button" role="tab" aria-selected="false" aria-controls="chat-outline-panel" tabindex="-1">Outline</button></div><button class="chat-icon-button" id="chat-navigator-close" type="button" aria-label="Close conversation navigation">×</button></div>
+                <div id="chat-find-panel" role="tabpanel" aria-labelledby="chat-find-tab">
+                  <div class="chat-find-row"><input id="chat-find-input" type="search" maxlength="200" placeholder="Find in this conversation…" aria-label="Find in this conversation" autocomplete="off"><span id="chat-find-status" role="status" data-i18n-skip></span><button class="chat-icon-button" id="chat-find-prev" type="button" aria-label="Previous match">↑</button><button class="chat-icon-button" id="chat-find-next" type="button" aria-label="Next match">↓</button></div>
+                </div>
+                <div id="chat-outline-panel" role="tabpanel" aria-labelledby="chat-outline-tab" hidden><div id="chat-outline-list" class="chat-outline-list"></div></div>
+                <div class="chat-navigator-foot"><small id="chat-navigation-scope">Loaded messages</small><button class="text-button" id="chat-navigation-older" type="button" hidden>Load earlier messages</button></div>
+              </section>
               <div class="chat-reading-area">
                 <div class="chat-thread" id="chat-thread" aria-label="Conversation messages" aria-busy="true">
                   <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Think it through, find an answer, or get something done.</p></div>
@@ -206,6 +218,7 @@
               <div class="chat-compose-area">
                 <div class="chat-compose-status"><span id="chat-state" role="status">Loading conversation…</span><span class="composer-hint"><span id="chat-limit" hidden><b id="chat-count">0</b>/8192 · </span><span id="chat-keyboard-hint">Shift + Enter for a new line</span></span></div>
                 <form class="composer" id="chat-form">
+                  <div class="chat-quote" id="chat-quote" hidden><div><strong>Quoted excerpt</strong><p id="chat-quote-text" data-i18n-skip></p></div><button class="chat-icon-button" id="chat-quote-remove" type="button" aria-label="Remove quote">×</button></div>
                   <textarea id="chat-input" maxlength="8192" rows="1" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
                   <div class="composer-row">
                     <label class="chat-mode"><span class="sr-only">Mode</span><select id="chat-profile" aria-label="Response mode"><option value="conversation">Fast conversation</option><option value="operational">Operational reasoning</option></select></label>
