@@ -8,7 +8,7 @@ function date(s){return new Date(s).toLocaleDateString('fr-FR',{day:'numeric',mo
 function kind(f){const p=(f&&f.path||'').split('.').pop().toUpperCase();return p.length<7?p:'FICHIER';}
 function inferType(path,type){return type||({'html':'text/html','htm':'text/html','css':'text/css','js':'text/javascript','md':'text/markdown','json':'application/json','svg':'image/svg+xml','txt':'text/plain','csv':'text/csv'}[path.split('.').pop().toLowerCase()]||'application/octet-stream');}
 function mount(root,options){
- root.classList.add('aw');let items=[],current=null,version=0,selected='',urls=[],generation=0,query='',filter='all',typeFilter='all',projectFilter='all';
+ root.classList.add('aw');let items=[],current=null,version=0,selected='',urls=[],generation=0,query='',filter='all',typeFilter='all',projectFilter='all',fileQuery='',fileLimit=8;
  const api=async body=>{const result=await options.api(body);if(result.public_base)options.publicBase=result.public_base;return result;};
  function cleanup(){generation++;urls.forEach(u=>URL.revokeObjectURL(u));urls=[];}
  function objectUrl(blob){const u=URL.createObjectURL(blob);urls.push(u);return u;}
@@ -73,7 +73,15 @@ function mount(root,options){
  sharing.append(select([['private','Privé · accès authentifié'],['public','Public · accessible avec le lien']],a.visibility,async value=>{try{current=(await api({action:'update',id:a.id,revision:a.revision,visibility:value})).artifact;detail();}catch(e){detail();error(e);}},'Visibilité du bundle'));
  if(a.legacy_notice)sharing.append(el('p',a.legacy_notice,'aw-note'));
  sharing.append(el('p','Le réglage s’applique aussi aux fichiers et aux anciennes versions. Les copies déjà téléchargées restent chez leur destinataire.','aw-sub'));aside.append(sharing);}
- const files=el('section');files.append(el('h3','FICHIERS · '+v.files.length));v.files.forEach(f=>{const row=el('div',undefined,'aw-file');const open=button(f.path,()=>{selected=f.path;detail();},selected===f.path?'aw-active':'');open.append(el('small',bytes(f.bytes)+(f.path===v.entry?' · principal':'')));const dl=button('↓',()=>download(a,v.number,f));dl.setAttribute('aria-label','Télécharger '+f.path);row.append(open,dl);files.append(row);});aside.append(files);
+ const files=el('section');files.append(el('h3','FICHIERS · '+v.files.length));const fileRows=el('div');
+ const search=el('input');search.type='search';search.placeholder='Rechercher un fichier…';search.setAttribute('aria-label','Rechercher un fichier');search.value=fileQuery;
+ function drawFiles(){fileRows.replaceChildren();const ordered=[...v.files].sort((x,y)=>(y.path===v.entry?1:0)-(x.path===v.entry?1:0));const matches=ordered.filter(f=>f.path.toLowerCase().includes(fileQuery.toLowerCase()));
+ matches.slice(0,fileLimit).forEach(f=>{const row=el('div',undefined,'aw-file');const open=button(f.path,()=>{selected=f.path;detail();},selected===f.path?'aw-active':'');open.append(el('small',bytes(f.bytes)+(f.path===v.entry?' · principal':'')));const dl=button('↓',()=>download(a,v.number,f));dl.setAttribute('aria-label','Télécharger '+f.path);row.append(open,dl);fileRows.append(row);});
+ if(matches.length>fileLimit)fileRows.append(button('Afficher plus · '+(matches.length-fileLimit)+' fichiers',()=>{fileLimit+=12;drawFiles();}));
+ if(!matches.length)fileRows.append(el('p','Aucun fichier trouvé.','aw-note'));
+ }
+ search.addEventListener('input',()=>{fileQuery=search.value;fileLimit=8;drawFiles();});if(v.files.length>8)files.append(search);files.append(fileRows);drawFiles();aside.append(files);
+
  if(a.can_manage){const context=el('section');context.append(el('h3','CONTEXTE'));[a.project,a.agent,a.run_id?'Exécution '+a.run_id:''].filter(Boolean).forEach(t=>context.append(el('p',t,'aw-sub')));if(a.issue_url)context.append(link('Ticket GitHub ↗',a.issue_url));context.append(button('Modifier les informations',()=>editForm(a)));aside.append(context);}
  const f=v.files.find(f=>f.path===selected)||v.files.find(f=>f.path===v.entry);if(f)preview(box,a,v,f);
  }

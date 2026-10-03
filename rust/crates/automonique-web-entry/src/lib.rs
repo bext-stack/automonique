@@ -142,7 +142,13 @@ const INTEGRATION_CONFIG_LIMIT: u64 = 4 * 1024;
 const PROVIDER_AUTH_HEALTH_LIMIT: u64 = 4 * 1024;
 const PROCESS_SNAPSHOT_LIMIT: u64 = 256 * 1024;
 const BODY_LIMIT: usize = MAX_PLATFORM_REQUEST_CANONICAL_BYTES;
-const REQUEST_LIMIT: usize = HEADER_LIMIT + PlatformV2Lane::V2.request_limit();
+const ARTIFACT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const REQUEST_LIMIT: usize = HEADER_LIMIT
+    + if ARTIFACT_BODY_LIMIT > PlatformV2Lane::V2.request_limit() {
+        ARTIFACT_BODY_LIMIT
+    } else {
+        PlatformV2Lane::V2.request_limit()
+    };
 const MANAGE_PLATFORM_RESPONSE_LIMIT: u64 = 64 * 1024;
 const MAX_MANAGE_RESULT_CONTEXT_BYTES: usize = 8 * 1024;
 const MAX_PENDING_MANAGE_ACTIONS: usize = 32;
@@ -7192,7 +7198,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                 PlatformV2Lane::request_limit,
             )
     } else if path.split('?').next() == Some("/api/artifacts") {
-        2 * 1024 * 1024
+        ARTIFACT_BODY_LIMIT
     } else {
         BODY_LIMIT
     };
@@ -12100,6 +12106,14 @@ mod tests {
                 String::from_utf8_lossy(&response)
             );
         }
+        let chunk = "x".repeat(1_864_000);
+        let request = format!(
+            "POST /api/artifacts HTTP/1.1\r\nHost: {CANONICAL_HOST}\r\nX-Forwarded-Proto: https\r\nAuthorization: {basic}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{chunk}",
+            chunk.len()
+        );
+        let response = exchange_without_integration(request.as_bytes());
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(parse_request(request.replace("/api/artifacts", "/api/chat").as_bytes()).is_err());
         let preview = String::from_utf8(response_bytes(
             Response::static_asset("text/html; charset=utf-8", "preview"),
             false,

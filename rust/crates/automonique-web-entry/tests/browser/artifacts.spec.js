@@ -44,3 +44,7 @@ test('a stale sharing edit keeps the conflict visible instead of claiming succes
  await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await expect(page.getByRole('combobox',{name:'Visibilité du bundle'})).toHaveValue('private');artifact.revision=2;
  await page.getByRole('combobox',{name:'Visibilité du bundle'}).selectOption('public');await expect(page.locator('.aw-error')).toContainText('Ce livrable a changé');await expect(page.locator('.aw-badge').first()).toHaveText('Privé');
 });
+test('large bundles keep the file list compact and let users find any attachment',async({page})=>{
+ artifact.versions[0].files.push(...Array.from({length:40},(_,i)=>({path:`evidence/check-${i}.txt`,type:'text/plain',bytes:0,chunks:0})));
+ await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await expect(page.locator('.aw-file')).toHaveCount(8);await page.getByRole('searchbox',{name:'Rechercher un fichier'}).fill('check-39');await expect(page.locator('.aw-file')).toHaveCount(1);await expect(page.locator('.aw-file')).toContainText('check-39.txt');
+});
