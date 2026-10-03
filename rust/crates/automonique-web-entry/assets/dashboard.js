@@ -78,6 +78,9 @@ let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
 let agentAccountsPollTimer = null;
+let agentAccountsView = null;
+let agentAccountsRequest = 0;
+let agentAccountMutation = false;
 let statusRefreshTimer = null;
 let lastNotifiedAttentionKey = null;
 
@@ -380,6 +383,64 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "The connection was lost. These readings may be out of date.": "La connexion a été perdue. Ces relevés peuvent être périmés.",
+  "Sign-in required": "Connexion nécessaire",
+  "Account overview": "Vue d’ensemble des comptes",
+  "Refresh accounts & usage": "Actualiser les comptes et l’utilisation",
+  "Find an account": "Rechercher un compte",
+  "Search account names…": "Rechercher un nom de compte…",
+  "Show accounts": "Afficher les comptes",
+  "All accounts": "Tous les comptes",
+  "Connected": "Connectés",
+  "Needs attention": "À vérifier",
+  "Usage is shared with other apps using the same subscription. Readings refresh at most every five minutes.": "L’utilisation est partagée avec les autres applications du même abonnement. Les relevés sont actualisés au maximum toutes les cinq minutes.",
+  "Account name": "Nom du compte",
+  "Enter an account name.": "Saisissez un nom de compte.",
+  "Use a name between 1 and 48 characters.": "Utilisez un nom de 1 à 48 caractères.",
+  "Reconnect account": "Reconnecter le compte",
+  "Connect a subscription": "Connecter un abonnement",
+  "Choose a name, then sign in securely on the provider’s website.": "Choisissez un nom, puis connectez-vous sur le site sécurisé du fournisseur.",
+  "Continue to sign-in": "Continuer la connexion",
+  "Subscription usage": "Utilisation de l’abonnement",
+  "Checking usage…": "Vérification de l’utilisation…",
+  "Usage unavailable": "Utilisation indisponible",
+  "Latest reading": "Dernier relevé",
+  "5-hour window": "Fenêtre de 5 heures",
+  "Weekly limit": "Limite hebdomadaire",
+  "Usage window": "Période d’utilisation",
+  "used": "utilisés",
+  "Resets": "Réinitialisation",
+  "Reset time passed; refresh pending": "Échéance passée ; actualisation en attente",
+  "Reset time not provided": "Date de réinitialisation non fournie",
+  "Sign in to view subscription usage.": "Connectez-vous pour voir l’utilisation de cet abonnement.",
+  "The provider has limited usage checks. We’ll retry after the cooldown.": "Le fournisseur limite les vérifications. Une nouvelle tentative aura lieu après le délai d’attente.",
+  "The provider took too long to respond. Try again later.": "Le fournisseur met trop de temps à répondre. Réessayez plus tard.",
+  "The provider has not returned usage limits for this account.": "Le fournisseur n’a pas renvoyé de limites d’utilisation pour ce compte.",
+  "Usage could not be retrieved. Try again later.": "L’utilisation n’a pas pu être récupérée. Réessayez plus tard.",
+  "Previous reading — usage may have changed.": "Relevé précédent — l’utilisation a pu évoluer.",
+  "Usage has not been checked yet.": "L’utilisation n’a pas encore été vérifiée.",
+  "Checked": "Vérifié",
+  "Worker account": "Compte sélectionné pour l’agent",
+  "Available account": "Compte disponible",
+  "Last verified": "Dernière vérification",
+  "Not verified yet": "Pas encore vérifié",
+  "Selected for worker": "Sélectionné pour l’agent",
+  "Verify connection": "Vérifier la connexion",
+  "Manage account": "Gérer le compte",
+  "Rename": "Renommer",
+  "Rename account": "Renommer le compte",
+  "This name is only used in Monique.": "Ce nom est utilisé uniquement dans Monique.",
+  "Account renamed.": "Compte renommé.",
+  "Sign out account": "Déconnecter le compte",
+  "This account is selected for the worker. New work may require signing in again.": "Ce compte est sélectionné pour l’agent. Les prochaines tâches pourront nécessiter une nouvelle connexion.",
+  "Remove account": "Supprimer le compte",
+  "No accounts match these filters.": "Aucun compte ne correspond à ces filtres.",
+  "accounts": "comptes",
+  "Connected accounts": "Comptes connectés",
+  "Need sign-in": "À connecter",
+  "Approaching a limit": "Proches d’une limite",
+  "Connect your first subscription to see its usage and choose an account for the worker.": "Connectez votre premier abonnement pour suivre son utilisation et choisir le compte de l’agent.",
+
   "Skip to workspace": "Aller à l’espace de travail",
   "Primary navigation": "Navigation principale",
   "Open retained sessions": "Ouvrir les sessions conservées",
@@ -1161,12 +1222,12 @@ const frenchUi = Object.freeze({
   "Continue with Claude.ai ↗": "Continuer avec Claude.ai ↗",
   "Cancel": "Annuler",
   "ACTIVE WORKER": "WORKER ACTIF",
-  "Use for worker": "Utiliser pour le worker",
+  "Use for worker": "Utiliser pour l’agent",
   "Verify": "Vérifier",
   "Sign in again": "Se reconnecter",
   "Sign out": "Se déconnecter",
   "Remove": "Supprimer",
-  "Worker account selected.": "Compte du worker sélectionné.",
+  "Worker account selected.": "Compte de l’agent sélectionné.",
   "Account status refreshed.": "État du compte actualisé.",
   "Account signed out.": "Compte déconnecté.",
   "Account removed.": "Compte supprimé.",
@@ -1709,7 +1770,7 @@ const frenchUi = Object.freeze({
   "Agent accounts": "Comptes des agents",
   "Sign agents in with your Claude or ChatGPT subscription. No API keys needed.": "Connectez les agents avec votre abonnement Claude ou ChatGPT. Aucune clé d’API nécessaire.",
   "Loading accounts…": "Chargement des comptes…",
-  "Each account is kept separate. Monique only switches the worker account when you ask.": "Chaque compte reste séparé. Monique ne change de compte de worker que si vous le demandez.",
+  "Each account is kept separate. Monique only switches the worker account when you ask.": "Chaque compte reste séparé. Monique ne change le compte de l’agent qu’à votre demande.",
   "System settings": "Réglages du système",
   "Read from the running server. Change them on the server.": "Lus sur le serveur en marche. Modifiez-les sur le serveur.",
   "Loading settings…": "Chargement des réglages…",
@@ -5487,11 +5548,18 @@ function agentAccountButton(text, action, disabled = false) {
   button.type = "button";
   button.textContent = translatePhrase(text);
   button.disabled = disabled;
-  button.addEventListener("click", action);
+  button.addEventListener("click", async () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    try { await action(); } finally { if (button.isConnected) button.disabled = disabled; }
+  });
   return button;
 }
 
 async function mutateAgentAccounts(payload, successMessage) {
+  if (agentAccountMutation) return null;
+  agentAccountMutation = true;
+  ++agentAccountsRequest;
   try {
     const view = await api("/api/agent-accounts/action", {
       method: "POST",
@@ -5504,6 +5572,7 @@ async function mutateAgentAccounts(payload, successMessage) {
     return view;
   } catch (error) {
     const messages = {
+      account_label_invalid: "Use a name between 1 and 48 characters.",
       account_not_authenticated: "Complete native sign-in before selecting this account.",
       selected_account_cannot_be_removed: "Select another worker account before removing this one.",
       confirmation_required: "Confirmation is required for this account change.",
@@ -5512,14 +5581,63 @@ async function mutateAgentAccounts(payload, successMessage) {
     };
     toast(messages[error.message] || `Agent account action failed (${error.message}).`, "error");
     return null;
-  }
+  } finally { agentAccountMutation = false; }
+}
+
+function agentAccountDialog(titleText, description, { value = null, submit = "Save" } = {}) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "agent-dialog";
+    const form = document.createElement("form");
+    const title = document.createElement("h2");
+    title.id = "agent-dialog-title";
+    title.textContent = translatePhrase(titleText);
+    dialog.setAttribute("aria-labelledby", title.id);
+    const hint = document.createElement("p");
+    hint.textContent = translatePhrase(description);
+    form.append(title, hint);
+    let input;
+    if (value !== null) {
+      const field = document.createElement("label");
+      field.textContent = translatePhrase("Account name");
+      input = document.createElement("input");
+      input.value = value;
+      input.required = true;
+      input.maxLength = 48;
+      input.autocomplete = "off";
+      input.addEventListener("input", () => input.setCustomValidity(""));
+      field.append(input);
+      form.append(field);
+    }
+    const buttons = document.createElement("div");
+    buttons.className = "agent-dialog-actions";
+    buttons.append(agentAccountButton("Cancel", () => dialog.close()));
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "button primary";
+    save.textContent = translatePhrase(submit);
+    buttons.append(save);
+    form.append(buttons);
+    let result = null;
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (input && !input.value.trim()) { input.setCustomValidity(translatePhrase("Enter an account name.")); input.reportValidity(); return; }
+      result = input ? input.value.trim() : true;
+      dialog.close();
+    });
+    dialog.addEventListener("close", () => { dialog.remove(); resolve(result); }, { once: true });
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+    if (input) { input.focus(); input.select(); }
+  });
 }
 
 async function startAgentLogin(provider, account = null) {
-  const proposed = account?.label || `${agentProviderName(provider)} ${new Date().toLocaleDateString(localeTag(), { month: "short", day: "numeric" })}`;
-  const alias = window.prompt(translatePhrase("Choose a local alias for this subscription account."), proposed);
-  if (alias === null || !alias.trim()) return;
-  await mutateAgentAccounts({ action: "start_login", provider, label: alias.trim(), account_id: account?.id || null }, "Native sign-in started.");
+  const proposed = account?.label || agentProviderName(provider);
+  const alias = await agentAccountDialog(account ? "Reconnect account" : "Connect a subscription", "Choose a name, then sign in securely on the provider’s website.", { value: proposed, submit: "Continue to sign-in" });
+  if (!alias) return;
+  await mutateAgentAccounts({ action: "start_login", provider, label: alias, account_id: account?.id || null }, "Native sign-in started.");
   scheduleAgentAccountsPoll(true);
 }
 
@@ -5585,88 +5703,234 @@ function renderAgentLoginSession(session) {
   return card;
 }
 
+function agentUsageDate(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(date) : null;
+}
+
+function renderAgentUsage(usage = {}) {
+  const root = document.createElement("div");
+  root.className = "agent-usage";
+  const header = document.createElement("div");
+  header.className = "agent-usage-heading";
+  const title = document.createElement("strong");
+  title.textContent = translatePhrase("Subscription usage");
+  const state = document.createElement("span");
+  const stale = usage.status !== "available" || !usage.checked_at_ms || Date.now() - usage.checked_at_ms > 360000;
+  state.textContent = translatePhrase(usage.status === "loading" ? "Checking usage…" : stale ? "Usage unavailable" : "Latest reading");
+  header.append(title, state);
+  root.append(header);
+  const windows = Array.isArray(usage.windows) ? usage.windows : [];
+  for (const window of windows) {
+    if (typeof window.used_percent !== "number" || !Number.isFinite(window.used_percent) || window.used_percent < 0 || window.used_percent > 100) continue;
+    const row = document.createElement("div");
+    row.className = "agent-usage-window";
+    const used = Math.round(window.used_percent * 10) / 10;
+    row.dataset.level = stale ? "stale" : used >= 95 ? "critical" : used >= 80 ? "warning" : "normal";
+    const line = document.createElement("div");
+    line.className = "agent-usage-line";
+    const labelNode = document.createElement("span");
+    const minutes = window.duration_minutes;
+    const duration = minutes === 300 ? "5-hour window" : minutes === 10080 ? "Weekly limit" : minutes ? `${minutes} min` : "Usage window";
+    labelNode.textContent = `${window.name === "codex" ? "Codex" : window.name || ""} · ${translatePhrase(duration)}`;
+    const amount = document.createElement("strong");
+    amount.textContent = `${new Intl.NumberFormat(localeTag(), { maximumFractionDigits: 1 }).format(used)}% ${translatePhrase("used")}`;
+    line.append(labelNode, amount);
+    const bar = document.createElement("progress");
+    bar.max = 100;
+    bar.value = used;
+    bar.setAttribute("aria-label", labelNode.textContent);
+    const detail = document.createElement("small");
+    const resetValue = window.resets_at_ms || window.resets_at;
+    const reset = agentUsageDate(resetValue);
+    detail.textContent = reset ? `${translatePhrase(new Date(resetValue).getTime() <= Date.now() ? "Reset time passed; refresh pending" : "Resets")} · ${reset}` : translatePhrase("Reset time not provided");
+    row.append(line, bar, detail);
+    root.append(row);
+  }
+  const note = document.createElement("p");
+  note.className = "agent-usage-note";
+  const reasons = {
+    sign_in_required: "Sign in to view subscription usage.",
+    provider_rate_limited: "The provider has limited usage checks. We’ll retry after the cooldown.",
+    provider_timeout: "The provider took too long to respond. Try again later.",
+    not_reported: "The provider has not returned usage limits for this account.",
+    provider_unavailable: "Usage could not be retrieved. Try again later.",
+    dashboard_unavailable: "The connection was lost. These readings may be out of date.",
+  };
+  const messages = [];
+  if (stale && windows.length) messages.push(translatePhrase("Previous reading — usage may have changed."));
+  if (usage.status === "unavailable") messages.push(translatePhrase(reasons[usage.reason] || "Usage has not been checked yet."));
+  if (usage.checked_at_ms) messages.push(`${translatePhrase("Checked")} · ${agentUsageDate(usage.checked_at_ms)}`);
+  note.textContent = messages.join(" ");
+  if (note.textContent) root.append(note);
+  return root;
+}
+
+function agentAccountConnected(account) {
+  return ["authenticated", "configured_unverified"].includes(account.status) && account.usage?.reason !== "sign_in_required";
+}
+
 function renderAgentAccount(account) {
   const card = document.createElement("div");
   card.className = "agent-account-card";
+  card.dataset.accountId = account.id;
+  card.dataset.worker = String(account.worker_selected === true);
   const head = document.createElement("div");
   head.className = "agent-account-head";
   const identity = document.createElement("div");
   identity.className = "agent-account-identity";
+  const provider = document.createElement("small");
+  provider.textContent = account.provider === "claude" ? "Claude · Claude Code" : "ChatGPT · Codex";
   const labelNode = document.createElement("strong");
   labelNode.dataset.i18nSkip = "";
   labelNode.textContent = account.label;
-  const provider = document.createElement("small");
-  provider.textContent = `${account.provider_name} · ${account.method === "claude_ai" ? "Claude.ai" : "ChatGPT"}${account.worker_selected ? ` · ${translatePhrase("ACTIVE WORKER")}` : ""}`;
-  identity.append(labelNode, provider);
+  identity.append(provider, labelNode);
   const status = document.createElement("span");
   status.className = "agent-account-status";
-  status.dataset.state = account.status;
-  status.textContent = authenticationLabel(account.status);
+  const needsLogin = account.usage?.reason === "sign_in_required";
+  status.dataset.state = needsLogin ? "expired" : account.status;
+  status.textContent = needsLogin ? translatePhrase("Sign-in required") : authenticationLabel(account.status);
   head.append(identity, status);
-  const meta = document.createElement("div");
+  const role = document.createElement("div");
+  role.className = "agent-account-role";
+  role.textContent = translatePhrase(account.worker_selected ? "Worker account" : "Available account");
+  const meta = document.createElement("p");
   meta.className = "agent-account-meta";
-  meta.textContent = `${translatePhrase("Evidence")}: ${label(account.evidence)}${account.last_verified_at_ms ? ` · ${new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(account.last_verified_at_ms)}` : ""}`;
+  meta.textContent = account.last_verified_at_ms ? `${translatePhrase("Last verified")} · ${agentUsageDate(account.last_verified_at_ms)}` : translatePhrase("Not verified yet");
   const actions = document.createElement("div");
   actions.className = "agent-account-buttons";
-  actions.append(
-    agentAccountButton("Use for worker", () => mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected."), account.worker_selected || !["authenticated", "configured_unverified"].includes(account.status)),
-    agentAccountButton("Verify", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")),
-    agentAccountButton("Sign in again", () => startAgentLogin(account.provider, account)),
-    agentAccountButton("Sign out", () => {
-      if (window.confirm(translatePhrase("Sign out this native subscription account?"))) mutateAgentAccounts({ action: "logout", account_id: account.id, confirm: true }, "Account signed out.");
+  const connected = agentAccountConnected(account);
+  actions.append(agentAccountButton(connected ? (account.worker_selected ? "Selected for worker" : "Use for worker") : "Sign in", () => connected ? mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected.") : startAgentLogin(account.provider, account), connected && account.worker_selected));
+  actions.append(agentAccountButton("Verify connection", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")));
+  const more = document.createElement("details");
+  more.className = "agent-account-manage";
+  const summary = document.createElement("summary");
+  summary.textContent = translatePhrase("Manage account");
+  const management = document.createElement("div");
+  management.append(
+    agentAccountButton("Rename", async () => {
+      const name = await agentAccountDialog("Rename account", "This name is only used in Monique.", { value: account.label });
+      if (name) await mutateAgentAccounts({ action: "rename", account_id: account.id, label: name }, "Account renamed.");
     }),
-    agentAccountButton("Remove", () => {
-      if (window.confirm(translatePhrase("Remove this local account profile and its native credentials?"))) mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
+    agentAccountButton("Sign in again", () => startAgentLogin(account.provider, account)),
+    agentAccountButton("Sign out", async () => {
+      if (await agentAccountDialog("Sign out account", account.worker_selected ? "This account is selected for the worker. New work may require signing in again." : "Sign out this native subscription account?", { submit: "Sign out" })) await mutateAgentAccounts({ action: "logout", account_id: account.id, confirm: true }, "Account signed out.");
+    }, account.status === "signed_out"),
+    agentAccountButton("Remove", async () => {
+      if (await agentAccountDialog("Remove account", "Remove this local account profile and its native credentials?", { submit: "Remove" })) await mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
     }, account.worker_selected),
   );
-  card.append(head, meta, actions);
+  more.append(summary, management);
+  card.append(head, role, renderAgentUsage(account.usage), meta, actions, more);
   return card;
 }
 
+function filterAgentAccounts() {
+  const query = byId("agent-account-search").value.trim().toLocaleLowerCase();
+  const filter = byId("agent-account-filter").value;
+  const accounts = agentAccountsView?.accounts || [];
+  let visible = 0;
+  for (const card of byId("agent-account-list").querySelectorAll("[data-account-id]")) {
+    const account = accounts.find((entry) => entry.id === card.dataset.accountId);
+    if (!account) continue;
+    const connected = agentAccountConnected(account);
+    const attention = !connected || account.usage?.status === "unavailable" || account.usage?.windows?.some((window) => window.used_percent >= 80);
+    card.hidden = !`${account.label} ${account.provider} ${account.provider_name}`.toLocaleLowerCase().includes(query) || !(filter === "all" || filter === account.provider || (filter === "connected" && connected) || (filter === "attention" && attention));
+    if (!card.hidden) visible++;
+  }
+  const empty = byId("agent-account-no-matches");
+  if (empty) empty.hidden = visible > 0 || accounts.length === 0;
+}
+
 function renderAgentAccounts(view) {
+  agentAccountsView = view;
   const sessionsRoot = byId("agent-login-sessions");
   const accountsRoot = byId("agent-account-list");
-  sessionsRoot.replaceChildren(...(view.login_sessions || []).map(renderAgentLoginSession));
+  // Keep unchanged login nodes in place: polling must not erase a pasted code,
+  // collapse account controls, or steal keyboard focus.
+  const reconcile = (root, items, key, render) => {
+    const existing = new Map([...root.children].map((node) => [node.dataset.itemKey, node]));
+    const nodes = items.map((item) => {
+      const signature = `${currentLanguage}:${Math.floor(Date.now() / 60000)}:${JSON.stringify(item)}`;
+      let node = existing.get(item[key]);
+      if (!node || node._accountSignature !== signature) {
+        const previousInput = node?.querySelector(".agent-authorization-input");
+        const wasFocused = previousInput && document.activeElement === previousInput;
+        const draft = previousInput?.value;
+        const replacement = render(item);
+        replacement.dataset.itemKey = item[key];
+        replacement._accountSignature = signature;
+        if (draft && replacement.querySelector(".agent-authorization-input")) replacement.querySelector(".agent-authorization-input").value = draft;
+        if (node) node.replaceWith(replacement);
+        node = replacement;
+        if (wasFocused) requestAnimationFrame(() => node.querySelector(".agent-authorization-input")?.focus());
+      }
+      return node;
+    });
+    for (const node of [...root.children]) if (!nodes.includes(node)) node.remove();
+    nodes.forEach((node, index) => { if (root.children[index] !== node) root.insertBefore(node, root.children[index] || null); });
+  };
+  reconcile(sessionsRoot, view.login_sessions || [], "id", renderAgentLoginSession);
   const accounts = Array.isArray(view.accounts) ? view.accounts : [];
   const providers = Array.isArray(view.providers) ? view.providers : [];
   const maximum = Number.isSafeInteger(view.max_accounts) && view.max_accounts > 0 ? view.max_accounts : null;
   const atCapacity = maximum !== null && accounts.length >= maximum;
-  const capacity = byId("agent-account-capacity");
-  if (capacity) capacity.textContent = maximum === null ? `${accounts.length} accounts` : `${accounts.length} / ${maximum} accounts`;
+  byId("agent-account-capacity").textContent = `${accounts.length}${maximum ? ` / ${maximum}` : ""} ${translatePhrase("accounts")}`;
   document.querySelectorAll("[data-add-agent-provider]").forEach((button) => {
     const provider = providers.find((item) => item?.id === button.dataset.addAgentProvider);
     button.disabled = atCapacity || provider?.available !== true;
   });
-  if (accounts.length) {
-    accountsRoot.replaceChildren(...accounts.map(renderAgentAccount));
-  } else {
-    const empty = document.createElement("div");
-    empty.className = "agent-account-empty";
-    empty.textContent = translatePhrase("No native subscription account is configured yet.");
-    accountsRoot.replaceChildren(empty);
-  }
+  const connected = accounts.filter(agentAccountConnected).length;
+  const limited = accounts.filter((a) => a.usage?.status === "available" && a.usage.windows?.some((w) => w.used_percent >= 80)).length;
+  const overview = byId("agent-account-overview");
+  overview.replaceChildren(...[[connected, "Connected accounts"], [accounts.length - connected, "Need sign-in"], [limited, "Approaching a limit"]].map(([value, caption]) => {
+    const tile = document.createElement("div");
+    const number = document.createElement("strong");
+    number.textContent = value;
+    const text = document.createElement("span");
+    text.textContent = translatePhrase(caption);
+    tile.append(number, text);
+    return tile;
+  }));
+  reconcile(accountsRoot, accounts, "id", renderAgentAccount);
+  const empty = document.createElement("div");
+  empty.className = "agent-account-empty";
+  empty.id = "agent-account-no-matches";
+  empty.textContent = translatePhrase(accounts.length ? "No accounts match these filters." : "Connect your first subscription to see its usage and choose an account for the worker.");
+  accountsRoot.append(empty);
+  filterAgentAccounts();
   const activeLogin = (view.login_sessions || []).some((session) => !["authenticated", "failed", "cancelled"].includes(session.status));
-  if (activeLogin) scheduleAgentAccountsPoll();
+  scheduleAgentAccountsPoll(false, activeLogin || accounts.some((a) => a.usage?.status === "loading") ? 2000 : 30000);
 }
 
-function scheduleAgentAccountsPoll(immediate = false) {
+function scheduleAgentAccountsPoll(immediate = false, delay = 2000) {
   if (agentAccountsPollTimer !== null) window.clearTimeout(agentAccountsPollTimer);
-  agentAccountsPollTimer = window.setTimeout(() => loadAgentAccounts(true), immediate ? 100 : 2000);
+  agentAccountsPollTimer = window.setTimeout(() => {
+    if (location.hash === "#configuration" && !document.hidden) loadAgentAccounts(true);
+    else scheduleAgentAccountsPoll(false, 30000);
+  }, immediate ? 100 : delay);
 }
 
 async function loadAgentAccounts(polling = false) {
+  if (agentAccountMutation) { scheduleAgentAccountsPoll(); return; }
+  const request = ++agentAccountsRequest;
+  const refresh = byId("agent-accounts-refresh");
+  if (!polling) refresh.disabled = true;
   try {
     const view = await api("/api/agent-accounts");
-    renderAgentAccounts(view);
+    if (request === agentAccountsRequest) renderAgentAccounts(view);
   } catch (error) {
-    if (!polling) {
-      const empty = document.createElement("div");
-      empty.className = "agent-account-empty";
-      empty.textContent = translatePhrase("Native account management is unavailable.");
-      byId("agent-account-list").replaceChildren(empty);
-    }
-  }
+    if (request !== agentAccountsRequest) return;
+    if (!polling) toast("Native account management is unavailable.", "error");
+    if (!agentAccountsView) byId("agent-account-list").textContent = translatePhrase("Native account management is unavailable.");
+    else renderAgentAccounts({ ...agentAccountsView, accounts: (agentAccountsView.accounts || []).map((account) => ({ ...account, usage: { ...account.usage, status: "unavailable", reason: account.usage?.reason === "sign_in_required" ? "sign_in_required" : "dashboard_unavailable" } })) });
+    scheduleAgentAccountsPoll(false, 30000);
+  } finally { if (!polling) refresh.disabled = false; }
 }
+
+byId("agent-account-search").addEventListener("input", filterAgentAccounts);
+byId("agent-account-filter").addEventListener("change", filterAgentAccounts);
+byId("agent-accounts-refresh").addEventListener("click", () => loadAgentAccounts());
 
 async function loadConfiguration(force = false) {
   const root = byId("configuration-grid");
@@ -6617,7 +6881,7 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (document.querySelector(".memory-dialog[open]")) return;
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
   if (event.key === "Escape" && voiceListening) {
     stopVoiceInput();
@@ -6939,7 +7203,7 @@ byId("pairing-copy").addEventListener("click", async () => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (document.querySelector(".memory-dialog[open]")) return;
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   if (event.key === "Escape" && !byId("pairing-panel").hidden) pairingOpen(false);
 });
 document.addEventListener("click", (event) => {
@@ -7098,7 +7362,7 @@ function consoleEditing(target) {
 }
 
 document.addEventListener("keydown", (event) => {
-  if (document.querySelector(".memory-dialog[open]")) return;
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     consolePaletteOpen(byId("command-palette").hidden);

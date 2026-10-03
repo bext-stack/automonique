@@ -8,10 +8,10 @@
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
     <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=18">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=19">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=20" defer></script>
+    <script src="/assets/dashboard.js?v=21" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -511,9 +511,12 @@
 
               <article class="settings-group agent-accounts" id="agent-accounts-manager" data-config-card data-config-category="ai security">
                 <div class="config-card-heading"><div><h2>Agent accounts</h2><p>Sign agents in with your Claude or ChatGPT subscription. No API keys needed.</p></div><span class="config-scope" id="agent-account-capacity">0 accounts</span></div>
-                <div class="agent-account-actions"><button class="button ghost small" type="button" data-add-agent-provider="codex">Add Codex account</button><button class="button ghost small" type="button" data-add-agent-provider="claude">Add Claude account</button></div>
+                <div class="agent-account-overview" id="agent-account-overview" aria-label="Account overview"></div>
+                <div class="agent-account-actions"><button class="button ghost small" type="button" data-add-agent-provider="codex">Add Codex account</button><button class="button ghost small" type="button" data-add-agent-provider="claude">Add Claude account</button><button class="button ghost small" type="button" id="agent-accounts-refresh">Refresh accounts &amp; usage</button></div>
+                <div class="agent-account-filters"><label for="agent-account-search">Find an account<input type="search" id="agent-account-search" placeholder="Search account names…" autocomplete="off"></label><label for="agent-account-filter">Show accounts<select id="agent-account-filter"><option value="all">All accounts</option><option value="codex">ChatGPT</option><option value="claude">Claude</option><option value="connected">Connected</option><option value="attention">Needs attention</option></select></label></div>
                 <div class="agent-login-sessions" id="agent-login-sessions" aria-live="polite"></div>
                 <div class="agent-account-list" id="agent-account-list"><div class="agent-account-empty">Loading accounts…</div></div>
+                <p class="inline-hint">Usage is shared with other apps using the same subscription. Readings refresh at most every five minutes.</p>
                 <p class="inline-hint agent-account-boundary">Each account is kept separate. Monique only switches the worker account when you ask.</p>
               </article>
 

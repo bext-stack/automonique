@@ -51,6 +51,8 @@ pub enum CodexUsageUnavailable {
     ProviderRefused,
     TimedOut,
     InvalidResponse,
+    AuthenticationRequired,
+    RateLimited,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,10 +77,17 @@ pub fn configured_usage(state_dir: &std::path::Path) -> CodexUsageRead {
 }
 
 fn read_codex_usage(provider: &ProviderConfig) -> CodexUsageRead {
-    let mut child = match Command::new(provider.binary())
+    account_usage(provider.binary(), provider.home())
+}
+
+/// Read quota windows for one isolated native account, without starting a turn.
+#[must_use]
+pub fn account_usage(binary: &std::path::Path, home: &std::path::Path) -> CodexUsageRead {
+    let mut child = match Command::new(binary)
         .args(["app-server", "--stdio"])
         .env_clear()
-        .env("CODEX_HOME", provider.home())
+        .env("CODEX_HOME", home)
+        .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -93,12 +102,14 @@ fn read_codex_usage(provider: &ProviderConfig) -> CodexUsageRead {
         "{\"method\":\"initialized\"}\n",
         "{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":null}\n"
     );
-    let wrote = child
-        .stdin
-        .take()
-        .ok_or(())
-        .and_then(|mut stdin| stdin.write_all(request.as_bytes()).map_err(|_| ()))
-        .is_ok();
+    // Keep stdin open until the response: EOF asks app-server to shut down.
+    let mut input = child.stdin.take();
+    let wrote = input.as_mut().is_some_and(|stdin| {
+        stdin
+            .write_all(request.as_bytes())
+            .and_then(|()| stdin.flush())
+            .is_ok()
+    });
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -116,9 +127,14 @@ fn read_codex_usage(provider: &ProviderConfig) -> CodexUsageRead {
         .spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
+            let mut refreshed = false;
             loop {
                 line.clear();
-                match reader.read_line(&mut line) {
+                match reader
+                    .by_ref()
+                    .take((MAX_RESPONSE_LINE_BYTES + 1) as u64)
+                    .read_line(&mut line)
+                {
                     Ok(0) | Err(_) => {
                         let _ = sender.send(None);
                         return;
@@ -131,7 +147,20 @@ fn read_codex_usage(provider: &ProviderConfig) -> CodexUsageRead {
                         let Ok(value) = serde_json::from_str::<Value>(&line) else {
                             continue;
                         };
-                        if value.get("id").and_then(Value::as_u64) == Some(2) {
+                        let id = value.get("id").and_then(Value::as_u64);
+                        if id == Some(2) && !refreshed && matches!(decode_response(&value), CodexUsageRead::Unavailable(CodexUsageUnavailable::AuthenticationRequired)) {
+                            // Let the native client renew its own session once.
+                            refreshed = true;
+                            if let Some(stdin) = input.as_mut() {
+                                let _ = stdin.write_all(b"{\"id\":3,\"method\":\"account/read\",\"params\":{\"refreshToken\":true}}\n");
+                                let _ = stdin.flush();
+                            }
+                        } else if id == Some(3) {
+                            if let Some(stdin) = input.as_mut() {
+                                let _ = stdin.write_all(b"{\"id\":4,\"method\":\"account/rateLimits/read\",\"params\":null}\n");
+                                let _ = stdin.flush();
+                            }
+                        } else if id == Some(2) || id == Some(4) {
                             let _ = sender.send(Some(value));
                             return;
                         }
@@ -151,9 +180,8 @@ fn read_codex_usage(provider: &ProviderConfig) -> CodexUsageRead {
     };
     let _ = child.kill();
     let _ = child.wait();
-    if let Ok(reader) = reader {
-        let _ = reader.join();
-    }
+    // The child is reaped; never wait on a descendant that inherited stdout.
+    drop(reader);
     result
 }
 
@@ -297,6 +325,25 @@ fn jcode_window_duration(name: &str) -> Option<u64> {
 }
 
 fn decode_response(value: &Value) -> CodexUsageRead {
+    if let Some(error) = value.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let reason = if message.contains("401")
+            || message.contains("unauthorized")
+            || message.contains("not authenticated")
+            || message.contains("requires chatgpt")
+        {
+            CodexUsageUnavailable::AuthenticationRequired
+        } else if message.contains("429") || message.contains("too many requests") {
+            CodexUsageUnavailable::RateLimited
+        } else {
+            CodexUsageUnavailable::ProviderRefused
+        };
+        return CodexUsageRead::Unavailable(reason);
+    }
     let Some(result) = value.get("result").and_then(Value::as_object) else {
         return CodexUsageRead::Unavailable(CodexUsageUnavailable::InvalidResponse);
     };
@@ -371,6 +418,44 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn native_usage_keeps_transport_open_and_renews_an_expired_session_once() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("provider");
+        fs::write(&binary, concat!(
+            "#!/bin/sh\n",
+            "read -r first && read -r second && read -r third || exit 9\n",
+            "printf '%s\\n' '{\"id\":2,\"error\":{\"message\":\"401 Unauthorized private-provider-detail\"}}'\n",
+            "read -r refresh || exit 10\n",
+            "printf '%s' \"$refresh\" > \"$CODEX_HOME/refresh\"\n",
+            "printf '%s\\n' '{\"id\":3,\"result\":{}}'\n",
+            "read -r retry || exit 11\n",
+            "printf '%s\\n' '{\"id\":4,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":37,\"windowDurationMins\":300}}}}'\n",
+        )).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let CodexUsageRead::Available(snapshot) = account_usage(&binary, root.path()) else {
+            panic!("usage should recover after native renewal");
+        };
+        assert_eq!(snapshot.windows[0].used_percent, 37);
+        let refresh: Value =
+            serde_json::from_str(&fs::read_to_string(root.path().join("refresh")).unwrap())
+                .unwrap();
+        assert_eq!(refresh["method"], "account/read");
+        assert_eq!(refresh["params"]["refreshToken"], true);
+        for (message, expected) in [
+            (
+                "401 Unauthorized private",
+                CodexUsageUnavailable::AuthenticationRequired,
+            ),
+            ("429 Too Many Requests", CodexUsageUnavailable::RateLimited),
+        ] {
+            assert_eq!(
+                decode_response(&serde_json::json!({"error":{"message":message}})),
+                CodexUsageRead::Unavailable(expected)
+            );
+        }
+    }
 
     #[test]
     fn exact_rate_limit_response_decodes_without_account_identity() {

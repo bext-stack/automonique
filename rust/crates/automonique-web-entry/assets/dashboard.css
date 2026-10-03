@@ -1176,30 +1176,72 @@ html[data-config-details="concise"] .config-list [data-config-technical="true"] 
 .config-inline-action:hover { text-decoration: underline; }
 .loading-panel { color: var(--quiet); }
 .config-empty { display: grid; gap: 4px; padding: 20px; color: var(--quiet); text-align: center; }
-.agent-accounts { display: grid; gap: 10px; padding-bottom: 12px; }
-.agent-account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.agent-account-list, .agent-login-sessions { display: grid; gap: 0; }
+.agent-accounts { display: grid; gap: 18px; padding-bottom: 20px; }
+.agent-account-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.agent-account-overview > div { display: grid; gap: 3px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+.agent-account-overview strong { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.agent-account-overview span { color: var(--muted); font-size: var(--font-xs); }
+.agent-account-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+#agent-accounts-refresh { margin-left: auto; }
+.agent-account-filters { display: flex; flex-wrap: wrap; gap: 12px; }
+.agent-account-filters label, .agent-dialog label { display: grid; flex: 1; gap: 6px; color: var(--muted); font-size: var(--font-xs); }
+.agent-account-filters label:first-child { flex: 2; }
+.agent-account-filters input, .agent-account-filters select, .agent-dialog input { width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text); }
+.agent-account-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 330px), 1fr)); gap: 14px; align-items: start; }
+.agent-login-sessions { display: grid; gap: 12px; }
 .agent-login-sessions:empty { display: none; }
-.agent-account-card, .agent-login-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 14px; align-items: center; padding: 10px 0; border-top: 1px solid var(--line); }
-.agent-login-card { grid-template-columns: minmax(0, 1fr); padding: 10px 12px; border: 0; border-radius: 8px; background: var(--accent-softer); }
-.agent-account-head { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
-.agent-account-identity { display: grid; min-width: 0; gap: 1px; }
-.agent-account-identity strong { overflow: hidden; font-size: var(--font-sm); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.agent-account-card, .agent-login-card { display: grid; min-width: 0; gap: 14px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.agent-account-card[data-worker="true"] { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.agent-login-card { background: var(--accent-softer); }
+.agent-account-head { display: flex; gap: 10px; align-items: start; justify-content: space-between; }
+.agent-account-identity { display: grid; min-width: 0; gap: 4px; }
+.agent-account-identity strong { overflow-wrap: anywhere; font-size: var(--font-md); font-weight: 600; }
 .agent-account-identity small, .agent-account-meta, .agent-account-empty { color: var(--quiet); font-size: var(--font-xs); }
-.agent-account-meta { grid-column: 1; }
-.agent-account-status { padding: 0 7px; border-radius: 999px; color: var(--muted); background: var(--panel-2); font-size: var(--font-2xs); font-weight: 600; line-height: 20px; text-transform: uppercase; }
+.agent-account-role { width: fit-content; color: var(--quiet); font-size: var(--font-xs); }
+.agent-account-card[data-worker="true"] .agent-account-role { color: var(--accent-text); }
+.agent-account-status { flex-shrink: 0; padding: 2px 8px; border-radius: 999px; color: var(--muted); background: var(--panel-2); font-size: var(--font-2xs); font-weight: 600; line-height: 20px; }
 .agent-account-status[data-state="authenticated"] { color: var(--green); background: var(--ok-soft); }
 .agent-account-status[data-state="configured_unverified"], .agent-account-status[data-state="authenticating"], .agent-account-status[data-state="awaiting_user"], .agent-account-status[data-state="verifying"] { color: var(--amber); background: var(--warn-soft); }
 .agent-account-status[data-state="expired"], .agent-account-status[data-state="signed_out"], .agent-account-status[data-state="unavailable"], .agent-account-status[data-state="failed"] { color: var(--red); background: var(--danger-soft); }
-.agent-account-buttons { display: flex; flex-wrap: wrap; grid-column: 2; grid-row: 1 / span 2; gap: 4px; justify-content: flex-end; }
-.agent-account-buttons button, .agent-login-link, .agent-login-instructions > button { height: 26px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: transparent; font-size: var(--font-xs); text-decoration: none; }
-.agent-account-buttons button:hover, .agent-login-instructions > button:hover { background: var(--row-hover); }
-.agent-account-buttons button:disabled { opacity: .4; }
+.agent-account-buttons, .agent-account-manage > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.agent-account-buttons button, .agent-account-manage button, .agent-login-link, .agent-login-instructions > button, .agent-dialog-actions > button { min-height: 34px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--panel); font-size: var(--font-xs); text-decoration: none; }
+.agent-account-buttons button:hover, .agent-account-manage button:hover, .agent-login-instructions > button:hover { background: var(--row-hover); }
+.agent-account-card button:disabled { opacity: .5; cursor: default; }
+.agent-account-manage { padding-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--font-xs); }
+.agent-account-manage summary { width: fit-content; cursor: pointer; }
+.agent-account-manage[open] > div { margin-top: 12px; }
 .agent-login-instructions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.agent-authorization-input { min-width: 0; max-width: 100%; }
 .agent-login-link { display: inline-flex; align-items: center; color: var(--accent-text); }
 .agent-login-code { padding: 4px 8px; border-radius: 6px; background: var(--panel); font: 700 var(--font-md) var(--font-code); letter-spacing: .05em; }
-.agent-account-empty { padding: 14px 0; border-top: 1px solid var(--line); }
-.agent-account-boundary { margin: 0; }
+.agent-account-empty { grid-column: 1 / -1; padding: 24px 14px; border: 1px dashed var(--line); border-radius: 10px; text-align: center; }
+.agent-account-boundary, .agent-account-meta { margin: 0; }
+.agent-usage { display: grid; gap: 14px; padding: 14px; border-radius: 9px; background: var(--panel-2); }
+.agent-usage-heading, .agent-usage-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; font-size: var(--font-xs); }
+.agent-usage-heading > span, .agent-usage-window small, .agent-usage-note { color: var(--quiet); font-size: var(--font-2xs); }
+.agent-usage-note { margin: 0; line-height: 1.6; }
+.agent-usage-window { display: grid; gap: 7px; }
+.agent-usage-window progress { display: block; width: 100%; height: 7px; overflow: hidden; border: 0; border-radius: 99px; appearance: none; --usage-color: var(--green); background: var(--line); }
+.agent-usage-window[data-level="warning"] progress { --usage-color: var(--amber); }
+.agent-usage-window[data-level="critical"] progress { --usage-color: var(--red); }
+.agent-usage-window[data-level="stale"] progress { --usage-color: var(--quiet); }
+.agent-usage-window progress::-webkit-progress-bar { background: var(--line); border-radius: 99px; }
+.agent-usage-window progress::-webkit-progress-value { background: var(--usage-color); border-radius: 99px; }
+.agent-usage-window progress::-moz-progress-bar { background: var(--usage-color); border-radius: 99px; }
+.agent-dialog { width: min(460px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 24px; overflow-y: auto; border: 1px solid var(--line); border-radius: 14px; color: var(--text); background: var(--panel); box-shadow: 0 24px 80px #0005; }
+.agent-dialog::backdrop { background: #0007; }
+.agent-dialog form { display: grid; gap: 18px; }
+.agent-dialog h2, .agent-dialog p { margin: 0; }
+.agent-dialog p { color: var(--muted); font-size: var(--font-sm); line-height: 1.6; }
+.agent-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 560px) {
+  .agent-account-overview { gap: 6px; }
+  .agent-account-overview > div { padding: 10px; }
+  .agent-account-overview strong { font-size: 20px; }
+  .agent-account-card { padding: 14px; }
+  .agent-account-head { flex-wrap: wrap; }
+  #agent-accounts-refresh { margin-left: 0; }
+}
 .config-aside { display: none; }
 
 /* ------------------------------------------------------------------- chat */
