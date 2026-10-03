@@ -217,3 +217,13 @@ test("a terminal status with no receipt never invents a completion report",async
   await expect(page.locator('#run-pane-overview')).toContainText('No failure details are included in this snapshot.');
   await expect(page.locator('#run-pane-overview').getByRole('button',{name:'Copy response'})).toHaveCount(0);
 });
+
+test("opening a run on a phone keeps its title and close control below navigation",async({page,isMobile})=>{
+  test.skip(!isMobile,'The mobile panel opens in the page flow.');
+  await openProcesses(page,detailedFixture());
+  await expect.poll(async()=>{
+    const head=await page.locator('#ops-drawer .drawer-head').boundingBox();
+    const navigation=await page.locator('.topbar').boundingBox();
+    return head.y>=navigation.y+navigation.height;
+  }).toBe(true);
+});

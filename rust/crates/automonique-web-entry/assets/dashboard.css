@@ -1709,7 +1709,7 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 }
 @media (max-width: 1099px) { .run-expand { display: none; } }
 @media (max-width: 760px) {
-  #ops-drawer.is-run-panel { --run-gap: 14px; }
+  #ops-drawer.is-run-panel { --run-gap: 14px; scroll-margin-top: calc(var(--topbar-h) + 12px); }
   .is-run-panel .drawer-head { padding-left: 14px; }
   .is-run-panel .drawer-head h2 { font-size: var(--font-md); }
   .run-header-tools { gap: 0; }
