@@ -4,9 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 const id='abcdefghijklmnopqrstuvwx';
 const content='<!doctype html><html><style>body{background:rgb(245, 245, 240)}</style><h1>Verified report</h1><button onclick="this.textContent=\'Changed\'">Interactive preview</button><script>try{parent.document.body.dataset.compromised="yes"}catch(e){document.body.dataset.isolated="yes"}</script></html>';
-let artifact, calls;
+let artifact, calls, extra;
 test.beforeEach(async({page})=>{
- calls=[];artifact={id,title:'Website delivery',description:'Verified changes and evidence',project:'Website',run_id:'fixture-job-0001',conversation_id:'chat-one',agent:'Example agent',visibility:'private',revision:1,can_manage:true,version_count:1,url:'/artifacts?id='+id,created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',versions:[{number:1,created_at:'2026-01-01T00:00:00Z',entry:'index.html',note:'Verified version',files:[{path:'index.html',type:'text/html',bytes:Buffer.byteLength(content),chunks:1}]}]};
+ calls=[];extra=[];artifact={id,title:'Website delivery',description:'Verified changes and evidence',project:'Website',run_id:'fixture-job-0001',conversation_id:'chat-one',agent:'Example agent',visibility:'private',revision:1,can_manage:true,version_count:1,url:'/artifacts?id='+id,created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',versions:[{number:1,created_at:'2026-01-01T00:00:00Z',entry:'index.html',note:'Verified version',files:[{path:'index.html',type:'text/html',bytes:Buffer.byteLength(content),chunks:1}]}]};
  const names=['dashboard.html','dashboard.js','dashboard.css','platform-cockpit-core.js','artifacts.js','artifacts.css','artifact-preview.html'];const files=Object.fromEntries(await Promise.all(names.map(async n=>[n,await readFile(new URL('../../assets/'+n,import.meta.url),'utf8')])));
  await page.route('**/*',async route=>{
   const path=new URL(route.request().url()).pathname;
@@ -16,8 +16,8 @@ test.beforeEach(async({page})=>{
   if(path==='/api/artifacts'){
    const b=route.request().postDataJSON();calls.push(b);
    const base={public_base:'https://share.example.test'};
-   if(b.action==='list')return route.fulfill({json:{...base,items:[artifact]}});
-   if(b.action==='get')return route.fulfill({json:{...base,artifact}});
+   if(b.action==='list')return route.fulfill({json:{...base,items:[artifact,...extra]}});
+   if(b.action==='get')return route.fulfill({json:{...base,artifact:extra.find(a=>a.id===b.id)||artifact}});
    if(b.action==='read')return route.fulfill({json:{...base,content_base64:Buffer.from(content).toString('base64'),bytes:Buffer.byteLength(content),sha256:createHash('sha256').update(content).digest('hex')}});
    if(b.action==='update'){if(b.revision!==artifact.revision)return route.fulfill({status:409,json:{error:'revision_conflict'}});artifact={...artifact,...b,revision:artifact.revision+1};return route.fulfill({json:{...base,artifact}});}
   }
@@ -94,4 +94,33 @@ test('upload shows selected files, locks edits during transfer and publishes pri
  await page.getByRole('button',{name:'Créer le livrable'}).click();await expect(page.getByRole('button',{name:'Annuler',exact:true})).toBeDisabled();await expect(page.getByLabel('Choisir des fichiers',{exact:true})).toBeDisabled();
  expect(manifest.title).toBe('A report');expect(manifest.visibility).toBeUndefined();expect(manifest.entry).toBe('index.html');releaseChunk();
  await expect(page.locator('.aw-details-title h1')).toHaveText('Website delivery');await expect(page.locator('.aw-badge')).toHaveText('Privé');
+});
+
+test('deliverable navigation respects filters and keeps separate revision drafts',async({page})=>{
+ extra=[{...artifact,id:'bcdefghijklmnopqrstuvwxy',title:'Website proposal',updated_at:'2026-01-02T00:00:00Z'},{...artifact,id:'cdefghijklmnopqrstuvwxyz',title:'Other report',project:'Other'}];
+ await page.goto('https://artifacts.test/#artifacts');await page.getByRole('searchbox',{name:'Rechercher les livrables'}).fill('Website');await page.getByRole('combobox',{name:'Trier les livrables'}).selectOption('title');await page.getByRole('button',{name:/Website delivery/}).click();
+ await expect(page.getByRole('button',{name:'Livrable précédent',exact:true})).toBeDisabled();await expect(page.getByRole('combobox',{name:'Choisir un livrable'}).locator('option')).toHaveCount(2);
+ await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await page.getByRole('textbox',{name:'Modifications à demander à Monique'}).fill('Change the heading');
+ await page.getByRole('button',{name:'Livrable suivant',exact:true}).click();await expect(page.locator('.aw-details-title h1')).toHaveText('Website proposal');await expect(page.getByRole('button',{name:'Livrable suivant',exact:true})).toBeDisabled();await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('');
+ await page.getByRole('button',{name:'Livrable précédent',exact:true}).click();await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('Change the heading');
+ await page.getByRole('button',{name:'← Tous les livrables'}).click();await expect(page.getByRole('searchbox',{name:'Rechercher les livrables'})).toHaveValue('Website');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
+test('inline revision sends selected version and file in a dedicated conversation and preserves a failed draft',async({page})=>{
+ let active='chat-one',created=0,requests=[],fail=true;
+ await page.route('**/api/chat/history',route=>route.fulfill({json:{conversation_id:active,messages:[]}}));
+ await page.route('**/api/chat/new',route=>{created++;expect(route.request().postDataJSON()).toEqual({expected_conversation:'chat-one'});active='revision-one';return route.fulfill({json:{conversation_id:active,messages:[]}});});
+ await page.route('**/api/chat',route=>{requests.push(route.request().postDataJSON());return fail?route.fulfill({status:503,json:{error:'chat_lane_busy'}}):route.fulfill({json:{conversation_id:active,answer:'I will refine the **heading** and retain the prior version.'}});});
+ artifact.versions.push({...artifact.versions[0],number:2,note:'New version'});artifact.version_count=2;artifact.versions[0].files.push({path:'styles.css',type:'text/css',bytes:0,chunks:0});
+ await page.goto('https://artifacts.test/#artifacts?artifact='+id+'&revise=1');await expect(page.getByRole('tab',{name:'Monique',exact:true})).toHaveAttribute('aria-selected','true');
+ await page.getByRole('tab',{name:'Versions',exact:true}).click();await page.getByRole('combobox',{name:'Version du livrable'}).selectOption('1');await page.getByRole('tab',{name:'Fichiers',exact:true}).click();await page.locator('.aw-file>button:first-child').filter({hasText:'styles.css'}).click();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();
+ await expect(page.locator('.aw-revise-context')).toContainText('Version 1 · styles.css');const input=page.getByRole('textbox',{name:'Modifications à demander à Monique'});await input.fill('Make the heading clearer');await page.getByRole('button',{name:'Envoyer à Monique',exact:true}).click();await expect(page.locator('.aw-revise-composer [role=alert]')).toBeVisible();await expect(input).toHaveValue('Make the heading clearer');
+ fail=false;await page.getByRole('button',{name:'Envoyer à Monique',exact:true}).click();await expect(page.locator('.aw-revise-message.assistant')).toContainText('retain the prior version');await expect(input).toHaveValue('');expect(created).toBe(1);expect(requests).toHaveLength(2);expect(requests[1].expected_conversation).toBe('revision-one');expect(requests[1].message).toContain('"version":1');expect(requests[1].message).toContain('"file":"styles.css"');expect(requests[1].message).toContain('"id":"'+id+'"');expect(requests[1].message).toContain('Preserve its bundle ID and visibility');
+ await expect(page.locator('.aw-preview')).toBeVisible();await expect(page.locator('.aw-revise-message.assistant strong').last()).toHaveText('heading');await page.screenshot({path:'/tmp/artifact-iteration-'+test.info().project.name+'.png'});
+});
+test('revision cannot double-send and retains its result when switching deliverables',async({page})=>{
+ extra=[{...artifact,id:'bcdefghijklmnopqrstuvwxy',title:'Second delivery'}];let finish;const pending=new Promise(resolve=>finish=resolve);let requests=0;
+ await page.route('**/api/chat/new',route=>route.fulfill({json:{conversation_id:'revision-two',messages:[]}}));await page.route('**/api/chat',async route=>{requests++;await pending;return route.fulfill({json:{conversation_id:'revision-two',answer:'Revision request received.'}});});
+ await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await page.getByRole('textbox',{name:'Modifications à demander à Monique'}).fill('Improve the layout');await page.getByRole('button',{name:'Envoyer à Monique',exact:true}).click();await expect(page.getByRole('button',{name:'Envoyer à Monique',exact:true})).toBeDisabled();
+ await page.getByRole('combobox',{name:'Choisir un livrable'}).selectOption(extra[0].id);await expect(page.locator('.aw-details-title h1')).toHaveText('Second delivery');finish();await expect.poll(()=>requests).toBe(1);
+ await page.getByRole('combobox',{name:'Choisir un livrable'}).selectOption(id);await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.locator('.aw-revise-message.assistant')).toContainText('Revision request received.');expect(requests).toBe(1);
 });
