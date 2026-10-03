@@ -33,7 +33,7 @@ const MAX_THREAD_CONTEXT_FILE_BYTES: u64 = 512 * 1024;
 /// Per-section ceilings. The whole brief stays well under the provider's
 /// prompt budget even when every section is full.
 const MAX_THREAD_EXCERPT_BYTES: usize = 3 * 1024;
-const MAX_PREFERENCES_BYTES: usize = 1_600;
+const MAX_PREFERENCES_BYTES: usize = 2_400;
 const MAX_MEMORY_MATCH_BYTES: usize = 1_200;
 const MAX_KNOWLEDGE_BYTES: usize = 2_400;
 const MAX_SKILLS_BYTES: usize = 4 * 1024;
