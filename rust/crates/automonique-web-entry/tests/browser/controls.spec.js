@@ -83,3 +83,15 @@ test("MCP network failures clear a previous verified result and allow retry",asy
  await page.route("**/api/controls/action",route=>route.fulfill({status:503,json:{error:"unavailable"}}));
  await card.getByRole("button",{name:"Refresh tools"}).click();await expect(card).toContainText("Discovery failed");await expect(card).not.toContainText("Tools discovered: 2");await expect(card.getByRole("button",{name:"Refresh tools"})).toBeEnabled();
 });
+
+test("finishing one response test unlocks unchanged accounts",async({page})=>{
+ await page.evaluate(()=>{
+  const view={...agentAccountsView,accounts:[...agentAccountsView.accounts,{...agentAccountsView.accounts[0],id:"two",provider:"claude",label:"Second account"}]};
+  renderAgentAccounts(view);
+  view.accounts[0].response_test={status:"checking"};renderAgentAccounts(view);
+ });
+ await expect(page.locator('[data-agent-response-test="two"]')).toBeDisabled();
+ await page.evaluate(()=>{agentAccountsView.accounts[0].response_test={status:"verified",model:"test-model"};renderAgentAccounts(agentAccountsView);});
+ await expect(page.locator('[data-agent-response-test="one"]')).toBeEnabled();
+ await expect(page.locator('[data-agent-response-test="two"]')).toBeEnabled();
+});

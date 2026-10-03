@@ -6021,6 +6021,7 @@ function renderAgentAccount(account) {
   actions.append(agentAccountButton(connected ? (account.worker_selected ? "Selected for worker" : "Use for worker") : "Sign in", () => connected ? mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected.") : startAgentLogin(account.provider, account), connected && account.worker_selected));
   actions.append(agentAccountButton("Verify connection", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")));
   const responseTest = agentAccountButton("Test response", () => mutateAgentAccounts({action:"test_response",account_id:account.id}, "Response test started."), !connected || (agentAccountsView?.accounts || []).some((a)=>a.response_test?.status==="checking"));
+  responseTest.dataset.agentResponseTest = account.id;
   responseTest.title = translatePhrase("Sends a small test prompt using this subscription.");
   actions.append(responseTest);
   const more = document.createElement("details");
@@ -6121,6 +6122,11 @@ function renderAgentAccounts(view) {
     return tile;
   }));
   reconcile(accountsRoot, accounts, "id", renderAgentAccount);
+  const responseTestBusy = accounts.some((account) => account.response_test?.status === "checking");
+  for (const button of accountsRoot.querySelectorAll("[data-agent-response-test]")) {
+    const account = accounts.find((item) => item.id === button.dataset.agentResponseTest);
+    button.disabled = responseTestBusy || !account || !agentAccountConnected(account);
+  }
   const empty = document.createElement("div");
   empty.className = "agent-account-empty";
   empty.id = "agent-account-no-matches";
