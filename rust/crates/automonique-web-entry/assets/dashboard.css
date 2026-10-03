@@ -1700,7 +1700,7 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
 .run-reference code { color: var(--text); font: var(--font-xs)/1.6 var(--font-code); overflow-wrap: anywhere; }
 @media (min-width: 1100px) {
   .view-split:has(> .is-run-panel.is-open) { grid-template-columns: minmax(0, 1fr) minmax(460px, 43%); }
-  .view-split.has-expanded-run { grid-template-columns: minmax(0, 1fr); }
+  .view-split.has-expanded-run:has(> .is-run-panel.is-open) { grid-template-columns: minmax(0, 1fr); }
   .view-split.has-expanded-run > .view-main { display: none; }
   #ops-drawer.is-expanded { width: min(100%, 1060px); justify-self: center; }
   #ops-drawer.is-expanded .run-pane { padding-right: 28px; padding-left: 28px; }

@@ -177,7 +177,8 @@ test("long events expand as text and retain their disclosure across refresh",asy
 
 test("expanded details restore the list on close",async({page,isMobile})=>{
   test.skip(isMobile,'Expansion is a desktop control.');
-  await openProcesses(page,detailedFixture());await page.getByRole('button',{name:'Expand panel',exact:true}).click();
+  await openProcesses(page,detailedFixture());const width=await page.locator('#ops-drawer').evaluate(node=>node.clientWidth);await page.getByRole('button',{name:'Expand panel',exact:true}).click();
+  expect(await page.locator('#ops-drawer').evaluate(node=>node.clientWidth)).toBeGreaterThan(width);
   await expect(page.locator('#ops-drawer')).toHaveClass(/is-expanded/);await expect(page.locator('#process-list')).toBeHidden();
   await page.getByRole('button',{name:'Close details',exact:true}).click();
   await expect(page.locator('#process-list')).toBeVisible();await expect(page.locator('.has-expanded-run')).toHaveCount(0);
