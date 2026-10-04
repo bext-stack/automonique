@@ -158,3 +158,34 @@
 /* Deliverable navigation and contextual iteration stay inside the workspace. */
 .aw-deliverable-nav{display:flex;align-items:center;gap:4px;margin-left:auto;min-width:0;max-width:45%}.aw-deliverable-nav select{max-width:280px;min-width:0;text-overflow:ellipsis;font-size:var(--font-xs,12px);background:transparent}.aw-deliverable-nav button{font-size:20px;line-height:1;min-width:32px;padding:4px 8px}.aw-deliverable-nav button:disabled{cursor:default}.aw-trail:has(.aw-deliverable-nav) .aw-badge{margin-left:4px}.aw-inspector-tabs{overflow-x:auto}.aw-inspector-tabs button{flex-shrink:0}.aw-revise-pane{display:flex;flex-direction:column;gap:12px;flex:1;padding:14px}.aw-revise-pane>.aw-note{margin:0!important}.aw-revise-context{background:var(--aw-soft);border-radius:6px;padding:7px 9px;font-size:11px;color:var(--aw-muted);overflow-wrap:anywhere}.aw-revise-thread{display:flex;flex-direction:column;gap:14px;overflow:auto;min-height:120px;max-height:45vh;flex:1 0 120px}.aw-revise-thread:empty{display:none}.aw-revise-thread>*{flex-shrink:0}.aw-revise-message{font-size:12px;overflow-wrap:anywhere}.aw-revise-message>strong{display:block;font-weight:600;margin-bottom:4px}.aw-revise-message.user>div{white-space:pre-wrap}.aw-revise-message.user{padding:10px;border-radius:8px;background:var(--aw-soft)}.aw-revise-message pre{white-space:pre-wrap}.aw-revise-message p{margin:5px 0}.aw-revise-message h1,.aw-revise-message h2,.aw-revise-message h3{font-size:14px}.aw-revise-message a{color:var(--aw-accent)}.aw-revise-message table{display:block;overflow:auto}.aw-revise-suggestions{display:flex;flex-direction:column;gap:5px}.aw-revise-suggestions button{font-size:12px;text-align:left;border-color:transparent;background:var(--aw-soft)}.aw-revise-composer{flex-shrink:0}.aw-revise-composer textarea{width:100%;resize:vertical;min-height:90px;max-height:200px;background:var(--field-surface,var(--aw-bg))}.aw-revise-composer textarea:focus{outline:2px solid var(--aw-accent);outline-offset:1px}.aw-revise-send{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px}.aw-revise-send small{font-size:10px;color:var(--aw-muted)}.aw-revise-send button{font-size:12px}.aw-revise-status{font-size:12px;color:var(--aw-muted);margin-top:6px!important}.aw-revise-status:empty{display:none}.aw-revise-composer .aw-error{font-size:12px;margin-top:8px!important}.aw-revise-pane>.aw-download-all{margin-top:0;font-size:12px}
 @media(max-width:760px){.aw-trail{flex-wrap:wrap}.aw-deliverable-nav{order:2;max-width:none;width:100%}.aw-deliverable-nav select{max-width:none;flex:1}.aw-trail:has(.aw-deliverable-nav) .aw-badge{margin-left:auto}.aw-revise-pane{max-height:none}.aw-revise-thread{max-height:320px}.aw-revise-send small{font-size:11px}.aw-inspector-tabs{gap:5px}}
+
+/* A single header spans both the document and its inspector. */
+.aw-topbar{display:flex;align-items:center;gap:12px;min-height:62px;padding:10px 14px;border:1px solid var(--aw-line);border-radius:10px 10px 0 0;background:var(--aw-bg)}
+.aw-topbar .aw-back{display:grid;place-items:center;flex-shrink:0;min-width:32px;height:32px;padding:0;font-size:18px;border:0;background:transparent;color:var(--aw-muted)}
+.aw-topbar-mark{font-size:22px;color:var(--aw-muted);width:28px;text-align:center}
+.aw-topbar .aw-details-title{flex:1;min-width:0;margin:0;padding:0;border:0;display:block}
+.aw-topbar .aw-details-title h1{font-size:14px;font-weight:550;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;overflow-wrap:normal}
+.aw-topbar .aw-details-title .aw-sub{font-size:11px;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aw-topbar .aw-deliverable-nav{margin:0;max-width:none;width:auto;flex-shrink:0;order:0;gap:2px}
+.aw-topbar .aw-deliverable-nav select{width:70px;max-width:70px;min-width:0;padding:4px 6px;border-color:transparent;background:transparent;font-variant-numeric:tabular-nums}
+.aw-topbar .aw-deliverable-nav button{border-color:transparent;background:transparent}
+.aw-topbar .aw-badge{padding-left:10px;border-left:1px solid var(--aw-line)}
+.aw-topbar .aw-actions{gap:6px;flex-wrap:nowrap}
+.aw-topbar .aw-actions button,.aw-topbar .aw-actions a{white-space:nowrap;font-size:12px}
+.aw-topbar+.aw-detail{border-top:0;border-radius:0 0 10px 10px}
+#artifact-library .aw-topbar+.aw-detail{height:calc(100dvh - 180px)}
+.artifact-dialog .aw-topbar{padding-right:46px}
+.artifact-dialog .aw-topbar+.aw-detail{height:calc(92dvh - 106px)}
+@media(max-width:760px){
+ .aw-topbar{display:grid;grid-template-columns:32px minmax(0,1fr) auto;gap:8px;padding:10px}
+ .aw-topbar .aw-details-title{grid-column:2;align-self:center}
+ .aw-topbar .aw-deliverable-nav{grid-column:3;grid-row:1}
+ .aw-topbar .aw-deliverable-nav button{min-width:32px;min-height:36px}
+ .aw-topbar .aw-deliverable-nav select{width:58px;max-width:58px;padding:4px 0}
+ .aw-topbar .aw-badge{grid-row:2;grid-column:1 / 3;border:0;padding:0}
+ .aw-topbar .aw-actions{grid-row:2;grid-column:2 / 4;justify-self:end}
+ .aw-topbar .aw-actions button,.aw-topbar .aw-actions a{min-height:36px;font-size:11px;padding:6px 8px}
+ #artifact-library .aw-topbar+.aw-detail,.artifact-dialog .aw-topbar+.aw-detail{height:auto}
+ .artifact-dialog .aw-topbar{padding-right:10px}
+ .artifact-dialog .aw-topbar .aw-deliverable-nav{margin-right:28px}
+}
