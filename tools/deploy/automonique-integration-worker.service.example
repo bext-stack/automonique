@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Elastic-2.0
+# Replace every @...@ path before installing as a user service.
+[Unit]
+Description=Monique artifact jobs and signed event delivery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @RELEASE@/monique_integration_worker.py --state-dir @STATE@ --agent-auth-dir @ACCOUNTS@ --runtime-dir @RUNTIME@ --claude-binary @CLAUDE@ --codex-binary @CODEX@
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

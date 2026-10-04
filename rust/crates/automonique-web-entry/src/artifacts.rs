@@ -50,6 +50,18 @@ impl WebIntegration {
         ) {
             return json_error("400 Bad Request", "invalid_request");
         }
+        self.share_request(body, "/api/artifacts")
+    }
+    pub(super) fn integration_action(&self, body: &[u8]) -> Response {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return json_error("400 Bad Request", "invalid_json");
+        };
+        if !integration_action_allowed(&value) {
+            return json_error("400 Bad Request", "invalid_request");
+        }
+        self.share_request(body, "/api/v1/control")
+    }
+    fn share_request(&self, body: &[u8], path: &str) -> Response {
         let (base, secret) = match configuration(&self.state_dir) {
             Ok(config) => config,
             Err(code) => return json_error("503 Service Unavailable", code),
@@ -61,7 +73,7 @@ impl WebIntegration {
             .proxy(None)
             .build()
             .new_agent()
-            .post(format!("{base}/api/artifacts"))
+            .post(format!("{base}{path}"))
             .header("content-type", "application/json")
             .header("user-agent", "MoniqueArtifact/1.0")
             .header("x-share-ingest-secret", secret.as_str())
@@ -95,10 +107,39 @@ impl WebIntegration {
         json_response(status, &value)
     }
 }
+fn integration_action_allowed(value: &Value) -> bool {
+    let action = value["action"].as_str().unwrap_or("");
+    match value["section"].as_str() {
+        None => matches!(action, "overview" | "test"),
+        Some("apps") => matches!(action, "list" | "create" | "rotate" | "revoke"),
+        Some("events") => matches!(
+            action,
+            "subscriptions" | "subscribe" | "unsubscribe" | "deliveries" | "retry" | "list"
+        ),
+        Some("jobs") => matches!(action, "list" | "get" | "submit" | "cancel"),
+        _ => false,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn integration_broker_excludes_worker_and_unknown_actions() {
+        for value in [
+            serde_json::json!({"section":"jobs","action":"worker_claim"}),
+            serde_json::json!({"section":"events","action":"worker_ack"}),
+            serde_json::json!({"section":"worker","action":"heartbeat"}),
+        ] {
+            assert!(!integration_action_allowed(&value));
+        }
+        assert!(integration_action_allowed(
+            &serde_json::json!({"section":"jobs","action":"submit"})
+        ));
+        assert!(integration_action_allowed(
+            &serde_json::json!({"action":"overview"})
+        ));
+    }
     #[test]
     fn artifact_configuration_requires_private_https_credentials() {
         let root = tempfile::tempdir().unwrap();

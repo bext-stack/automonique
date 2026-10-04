@@ -7,6 +7,7 @@ mod artifacts;
 mod chat_conversations;
 mod connection_tests;
 mod controls;
+mod integration_events;
 mod jev;
 mod mobile_auth;
 mod mobile_task;
@@ -175,6 +176,8 @@ pub enum Route {
     ArtifactPdfEngine,
     ArtifactViewerLicense,
     ApiArtifacts,
+    ApiIntegrations,
+    ApiIntegrationEvents,
     PlatformCockpitScript,
     QrCodeScript,
     Favicon,
@@ -247,6 +250,8 @@ pub struct Request<'a> {
     forwarded_proto: Option<&'a str>,
     content_type: Option<&'a str>,
     accept: Option<&'a str>,
+    share_timestamp: Option<&'a str>,
+    share_signature: Option<&'a str>,
     content_length: usize,
     header_length: usize,
 }
@@ -7131,6 +7136,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
     let mut forwarded_proto = None;
     let mut content_type = None;
     let mut accept = None;
+    let mut share_timestamp = None;
+    let mut share_signature = None;
     let mut content_length = None;
     for header in parsed.headers.iter() {
         if header.name.eq_ignore_ascii_case("host") {
@@ -7181,6 +7188,18 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                         .trim(),
                 );
             }
+        } else if header.name.eq_ignore_ascii_case("x-share-timestamp") {
+            if share_timestamp.is_some() {
+                return Err(Route::BadRequest);
+            }
+            share_timestamp =
+                Some(std::str::from_utf8(header.value).map_err(|_| Route::BadRequest)?);
+        } else if header.name.eq_ignore_ascii_case("x-share-signature") {
+            if share_signature.is_some() {
+                return Err(Route::BadRequest);
+            }
+            share_signature =
+                Some(std::str::from_utf8(header.value).map_err(|_| Route::BadRequest)?);
         } else if header.name.eq_ignore_ascii_case("content-length") {
             if content_length.is_some() {
                 return Err(Route::BadRequest);
@@ -7200,7 +7219,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
                 PlatformV2Lane::V2.request_limit(),
                 PlatformV2Lane::request_limit,
             )
-    } else if path.split('?').next() == Some("/api/artifacts") {
+    } else if matches!(
+        path.split('?').next(),
+        Some("/api/artifacts" | "/api/integrations")
+    ) {
         ARTIFACT_BODY_LIMIT
     } else {
         BODY_LIMIT
@@ -7221,6 +7243,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request<'_>, Route> {
         forwarded_proto,
         content_type,
         accept,
+        share_timestamp,
+        share_signature,
         content_length: content_length.unwrap_or(0),
         header_length,
     })
@@ -7290,6 +7314,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                 "/artifact-pdf.js" => Route::ArtifactPdfEngine,
                 "/artifact-viewer-LICENSE.txt" => Route::ArtifactViewerLicense,
                 "/api/artifacts" => Route::ApiArtifacts,
+                "/api/integrations" => Route::ApiIntegrations,
+                "/api/integration-events" => Route::ApiIntegrationEvents,
                 "/api/chat/conversations" => Route::ApiChatConversations,
                 "/api/chat/conversations/action" => Route::ApiChatConversationAction,
                 "/api/chat/new" => Route::ApiChatNew,
@@ -7326,6 +7352,8 @@ pub fn route(request: &Request<'_>, hosts: &DashboardHosts) -> Route {
                     | Route::ApiChat
                     | Route::ApiChatAction
                     | Route::ApiArtifacts
+                    | Route::ApiIntegrations
+                    | Route::ApiIntegrationEvents
                     | Route::ApiChatConversationAction
                     | Route::ApiChatNew
                     | Route::ApiManageChatHistory
@@ -7816,6 +7844,8 @@ fn response_for(route: Route, state: &AppState, hosts: &DashboardHosts) -> Respo
         | Route::ApiChatHistory
         | Route::ApiChatConversations
         | Route::ApiArtifacts
+        | Route::ApiIntegrations
+        | Route::ApiIntegrationEvents
         | Route::ApiChatConversationAction
         | Route::ApiChatNew
         | Route::ApiManageChatHistory
@@ -8193,6 +8223,8 @@ fn api_response(
             Err(_) => json_error("400 Bad Request", "invalid_json"),
         },
         Route::ApiArtifacts => integration.artifact_action(body),
+        Route::ApiIntegrations => integration.integration_action(body),
+        Route::ApiIntegrationEvents => integration.integration_event_receive(body),
         Route::ApiChatConversations => match integration.chat_conversations() {
             Ok(view) => json_response("200 OK", &view),
             Err(reason) => json_error("503 Service Unavailable", reason),
@@ -8585,12 +8617,20 @@ fn handle(
                                     })
                                 },
                             );
+                let webhook_authorized = requested_route == Route::ApiIntegrationEvents
+                    && integration.is_some_and(|integration| {
+                        integration.integration_event_authorized(
+                            request.share_timestamp,
+                            request.share_signature,
+                            &bytes[request.header_length..total],
+                        )
+                    });
                 let credentials_authorized = request_credentials_authorized(
                     mobile_access_presented,
                     route_mobile_authorized,
                     basic_authorized,
                     session_authorized,
-                    bearer_authorized,
+                    bearer_authorized || webhook_authorized,
                 );
                 let manage_chat_route = matches!(
                     requested_route,
@@ -8605,6 +8645,8 @@ fn handle(
                     && mobile_authorization.is_none()
                 {
                     Route::MobileAccessUnauthorized
+                } else if requested_route == Route::ApiIntegrationEvents && !webhook_authorized {
+                    Route::Unauthorized
                 } else if manage_chat_route && !manage_chat_auth.authorize(request.authorization) {
                     Route::ManageUnauthorized
                 } else if operator_mobile && !basic_authorized {
@@ -8725,6 +8767,8 @@ fn handle(
             | Route::ApiChatHistory
             | Route::ApiChatConversations
             | Route::ApiArtifacts
+            | Route::ApiIntegrations
+            | Route::ApiIntegrationEvents
             | Route::ApiChatConversationAction
             | Route::ApiChatNew
             | Route::ApiManageChatHistory

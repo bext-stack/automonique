@@ -1889,3 +1889,16 @@ body:has([data-panel="artifacts"].is-visible .aw-detail-open) [data-panel="artif
 #artifact-dialog:has(.aw-compact.aw-detail-open){padding:0;overflow:hidden}
 #artifact-dialog .aw-compact .aw-topbar{padding-right:46px}
 #artifact-dialog .aw-compact.aw-detail-open{height:100%}
+
+/* App integrations: compact rows, shared dashboard tokens. */
+.integration-manager{grid-column:1/-1;min-width:0;padding:20px}
+.integration-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.integration-toolbar h2{margin:0;font-size:17px}.integration-toolbar p{margin:5px 0;color:var(--muted);font-size:13px}
+.integration-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.integration-actions a{color:var(--muted);font-size:12px}
+.integration-manager button,.integration-dialog button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--panel);color:var(--text);padding:7px 10px;border-radius:7px;cursor:pointer}
+.integration-manager button:hover,.integration-dialog button:hover{border-color:var(--green)}
+.integration-tabs{display:flex;gap:18px;border-bottom:1px solid var(--line);margin-top:18px;overflow:auto}.integration-tabs button{border:0;border-radius:0;background:transparent;padding:12px 0;color:var(--muted);white-space:nowrap}.integration-tabs button[aria-selected=true]{color:var(--text);box-shadow:inset 0 -2px var(--green)}
+.integration-worker{font-size:12px;color:var(--muted);margin:12px 0}
+.integration-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:14px 0;border-bottom:1px solid var(--line)}.integration-row>div{flex:1;min-width:220px}.integration-row strong{display:block;font-size:13px;overflow-wrap:anywhere}.integration-row small{display:block;color:var(--muted);font-size:12px;line-height:1.7;margin-top:3px}.integration-row details{font-size:12px;margin-top:5px;color:var(--muted)}.integration-row details p{overflow-wrap:anywhere}.integration-empty{padding:24px 0;color:var(--muted);font-size:13px}
+.integration-dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;width:min(540px,calc(100vw - 32px));max-height:85dvh;overflow:auto;padding:22px}.integration-dialog::backdrop{background:#0008}.integration-dialog form{display:grid;gap:14px;margin-top:18px}.integration-dialog p,.integration-dialog small{font-size:13px;line-height:1.6;color:var(--muted)}.integration-field{display:grid;gap:6px;font-size:13px}.integration-dialog input:not([type=checkbox]),.integration-dialog textarea{box-sizing:border-box;width:100%;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);font:inherit}.integration-dialog textarea{min-height:90px;overflow-wrap:anywhere}.integration-dialog fieldset{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:10px}.integration-dialog fieldset label{display:flex;gap:8px;align-items:center;font-size:13px}.integration-dialog fieldset legend{font-size:12px;color:var(--muted)}.integration-dialog .integration-error{color:var(--red)}
+@media(max-width:600px){.integration-manager{padding:14px}.integration-row>div{flex-basis:100%}.integration-actions{width:100%}.integration-tabs{gap:16px}}
