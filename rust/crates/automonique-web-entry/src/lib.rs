@@ -3751,12 +3751,7 @@ impl WebIntegration {
         let routed_agent_tool = direct_answer.is_none()
             && issue_lookup.is_none()
             && matches!(github_tool, GitHubToolDecision::None)
-            && matches!(slack_tool, SlackToolDecision::Snapshot { .. })
-            && trace.slack
-                == (ReadTrigger {
-                    keyword: false,
-                    router: true,
-                });
+            && matches!(slack_tool, SlackToolDecision::Snapshot { .. });
         if unrouted_agent_tool || routed_agent_tool {
             trace.agent_tool = ReadTrigger {
                 keyword: unrouted_agent_tool,
@@ -6249,6 +6244,9 @@ fn compose_chat_prompt(
         "off"
     });
     prompt.push_str("] Support and Manage are distinct authenticated services. The dashboard may use safe reads from either and can stage an exact discovered mutation for explicit operator approval. Never merge support-ticket state, Manage job state, or GitHub delivery evidence, and never claim an action completed before its approved result proves it.\n[/manage_integration]\n");
+    prompt.push_str("[configured_app_servers]");
+    prompt.push_str(&context.manage.mcp_servers.join(", "));
+    prompt.push_str("[/configured_app_servers] These are configured connections, not proof of any particular permission or result. Do not claim an app is absent merely because this turn did not attach its data.\n");
     if let Some(manage_page) = context.manage_page {
         prompt.push_str("[manage_page_context trust=untrusted_typed_reference]\n");
         push_bounded(&mut prompt, manage_page, 1_000);
