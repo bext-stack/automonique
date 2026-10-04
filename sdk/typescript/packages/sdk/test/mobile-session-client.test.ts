@@ -275,6 +275,17 @@ describe("mobile session client", () => {
       .toThrow(MobileSessionError);
   });
 
+  test("newly issued credentials can enter a session gateway with bounded clock skew", () => {
+    const never = new RecordingAdapter([]);
+    const descriptor = {...authorization(), expires_at_ms: MobileEpochMillis(20_000n)};
+    expect(() => new MobileSessionClient(never,
+      {...descriptor, issued_at_ms: MobileEpochMillis(6_000n)}, identity, () => 1_000))
+      .not.toThrow();
+    expect(() => new MobileSessionClient(never,
+      {...descriptor, issued_at_ms: MobileEpochMillis(6_001n)}, identity, () => 1_000))
+      .toThrow(MobileSessionError);
+  });
+
   test("counts UTF-8 bytes at the authorization boundary and rejects blank text", async () => {
     const adapter = new RecordingAdapter([
       {kind: "receipt", value: receipt("follow_up", session)},
