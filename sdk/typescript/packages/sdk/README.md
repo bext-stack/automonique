@@ -52,6 +52,12 @@ import {fetch as expoFetch} from "expo/fetch";
 const transport = new HttpsPlatformTransport(endpoint, token, expoFetch as typeof fetch);
 ```
 
+Mobile credential admission permits at most five seconds of device/server clock
+skew for issuance timestamps and invite lifetime checks. Expiry stays exact:
+expired invites and access credentials are refused without a grace period.
+Consumers that persist credentials must use the same `MOBILE_CLOCK_SKEW_MILLIS`
+bound when validating issuance after saving or reloading them.
+
 Protocol integer fields use JavaScript `bigint` so revisions and cursor sequences remain lossless above `Number.MAX_SAFE_INTEGER`. Resource summaries are deliberately opaque strings in Platform v1; consumers must not infer structured state from them.
 
 Platform v2 must be negotiated before any structured operation. A downgrade or

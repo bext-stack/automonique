@@ -14,7 +14,7 @@ import {
   type SessionApprovalDecision,
   type SessionCommandState,
 } from "../../protocol/src/index.js";
-import {mobilePlatformClientId} from "./mobile-auth-client.js";
+import {MOBILE_CLOCK_SKEW_MILLIS, mobilePlatformClientId} from "./mobile-auth-client.js";
 import {
   PlatformTransportError,
   type PlatformAdapter,
@@ -239,7 +239,7 @@ export class MobileSessionClient {
     const authorization = this.authorization;
     if (
       authorization.server_identity !== this.expectedServerIdentity
-      || authorization.issued_at_ms > now
+      || authorization.issued_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)
       || authorization.issued_at_ms >= authorization.expires_at_ms
       || authorization.expires_at_ms <= now
       || authorization.actions.length === 0

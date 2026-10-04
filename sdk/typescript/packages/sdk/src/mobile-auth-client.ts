@@ -70,6 +70,9 @@ export type {
   MobileRevocation,
 };
 
+/** Allow a small device/server clock difference at issuance, never at expiry. */
+export const MOBILE_CLOCK_SKEW_MILLIS = 5_000;
+
 export class MobileLifecycleError extends Error {
   readonly status: number;
   readonly category: string;
@@ -295,7 +298,7 @@ function verifyAuthorization(
   }
   const now = BigInt(Date.now());
   if (
-    authorization.issued_at_ms > now
+    authorization.issued_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)
     || authorization.issued_at_ms >= authorization.expires_at_ms
     || authorization.expires_at_ms <= now
     || authorization.actions.length === 0
@@ -425,7 +428,7 @@ export class MobileLifecycleClient {
       || offer.server_identity !== this.discovery.server_identity
       || offer.exchange_endpoint !== this.discovery.pairing_exchange_endpoint
       || offer.expires_at_ms <= now
-      || offer.expires_at_ms > now + BigInt(MOBILE_PAIRING_TTL_MILLIS)
+      || offer.expires_at_ms > now + BigInt(MOBILE_PAIRING_TTL_MILLIS + MOBILE_CLOCK_SKEW_MILLIS)
     ) {
       throw new MobileLifecycleError(0, "mobile_pairing_invalid");
     }
@@ -469,13 +472,14 @@ export class MobileLifecycleClient {
       const authorization = summary.authorization;
       if (
         authorization.server_identity !== this.discovery.server_identity
-        || authorization.issued_at_ms > now
+        || authorization.issued_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)
         || authorization.issued_at_ms >= authorization.expires_at_ms
         || summary.refresh_expires_at_ms < authorization.expires_at_ms
         || new Set(authorization.actions).size !== authorization.actions.length
         || new Set(authorization.session_scope).size !== authorization.session_scope.length
         || (summary.revoked_at_ms !== null
-          && (summary.revoked_at_ms < authorization.issued_at_ms || summary.revoked_at_ms > now))
+          && (summary.revoked_at_ms < authorization.issued_at_ms
+            || summary.revoked_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)))
       ) {
         throw new MobileLifecycleError(0, "mobile_auth_invalid_body");
       }
@@ -619,7 +623,7 @@ export class MobileLifecycleClient {
     if (
       admitted.server_identity !== this.discovery.server_identity
       || admitted.credential_id !== request.credential_id
-      || admitted.issued_at_ms > now
+      || admitted.issued_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)
       || admitted.issued_at_ms >= admitted.expires_at_ms
       || admitted.expires_at_ms <= now
       || admitted.actions.length !== expectedActions.length
@@ -665,7 +669,7 @@ export class MobileLifecycleClient {
       || admitted.credential_id !== expected.credential_id
       || admitted.credential_revision !== expected.credential_revision
       || admitted.authorization_revision !== expected.authorization_revision
-      || admitted.issued_at_ms > now
+      || admitted.issued_at_ms > now + BigInt(MOBILE_CLOCK_SKEW_MILLIS)
       || admitted.issued_at_ms >= admitted.expires_at_ms
       || admitted.expires_at_ms !== expected.expires_at_ms
       || admitted.expires_at_ms <= now

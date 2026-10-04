@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import {describe, expect, test} from "bun:test";
+import {describe, expect, spyOn, test} from "bun:test";
 
 import {
   MAX_MOBILE_PROTOCOL_VERSIONS,
@@ -15,6 +15,7 @@ import {
 } from "../../protocol/src/index.ts";
 import {
   MobileLifecycleClient,
+  MOBILE_CLOCK_SKEW_MILLIS,
   MobileLifecycleError,
   MobileProtocolUnsupportedError,
   SUPPORTED_MOBILE_PROTOCOL_VERSIONS,
@@ -103,6 +104,36 @@ function issued(
 }
 
 describe("mobile credential lifecycle client", () => {
+  test("pairing tolerates bounded clock skew without accepting expired or far-future credentials", async () => {
+    const now = 1_777_000_000_000;
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      for (const offset of [1_400, MOBILE_CLOCK_SKEW_MILLIS, MOBILE_CLOCK_SKEW_MILLIS + 1]) {
+        const responses = [response(discovery()), response(issued(access, refresh, 1, identity,
+          BigInt(now + 900_000), BigInt(now + offset)), 201)];
+        const client = await MobileLifecycleClient.discover(origin, (async () => responses.shift()!) as typeof fetch);
+        const exchange = client.exchangePairing({
+          pairing_id: `pi_${"P".repeat(43)}` as never,
+          pairing_token: `mp_${"Q".repeat(43)}` as never,
+          server_identity: identity as never,
+        });
+        if (offset <= MOBILE_CLOCK_SKEW_MILLIS) {
+          expect((await exchange).authorization.issued_at_ms).toBe(BigInt(now + offset));
+        } else {
+          await expect(exchange).rejects.toMatchObject({category: "mobile_auth_invalid_body"});
+        }
+      }
+      const responses = [response(discovery()), response(issued(access, refresh, 1, identity,
+        BigInt(now), BigInt(now - 1)), 201)];
+      const client = await MobileLifecycleClient.discover(origin, (async () => responses.shift()!) as typeof fetch);
+      await expect(client.exchangePairing({pairing_id: `pi_${"P".repeat(43)}` as never,
+        pairing_token: `mp_${"Q".repeat(43)}` as never, server_identity: identity as never}))
+        .rejects.toMatchObject({category: "mobile_auth_invalid_body"});
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   test("discovers, provisions, refreshes, authorizes, and revokes with exact contracts", async () => {
     const requests: {url: string; init: RequestInit | undefined}[] = [];
     const responses = [
