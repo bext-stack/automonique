@@ -46,7 +46,7 @@ test('a stale sharing edit keeps the conflict visible instead of claiming succes
 });
 test('large bundles keep the file list compact and let users find any attachment',async({page})=>{
  artifact.versions[0].files.push(...Array.from({length:40},(_,i)=>({path:`evidence/check-${i}.txt`,type:'text/plain',bytes:0,chunks:0})));
- await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await expect(page.locator('.aw-file')).toHaveCount(8);await page.getByRole('searchbox',{name:'Rechercher un fichier'}).fill('check-39');await expect(page.locator('.aw-file')).toHaveCount(1);await expect(page.locator('.aw-file')).toContainText('check-39.txt');
+ await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await expect(page.locator('.aw-file')).toHaveCount(8);await page.getByRole('button',{name:'Afficher ou masquer les fichiers',exact:true}).click();await page.getByRole('searchbox',{name:'Rechercher un fichier'}).fill('check-39');await expect(page.locator('.aw-file')).toHaveCount(1);await expect(page.locator('.aw-file')).toContainText('check-39.txt');
 });
 
 test('preview tools preserve selection and expose source without executing it',async({page})=>{
@@ -55,7 +55,7 @@ test('preview tools preserve selection and expose source without executing it',a
  expect(await page.locator('body').getAttribute('data-compromised')).toBeNull();
  await page.getByRole('button',{name:'Aperçu',exact:true}).click();await expect(page.locator('.aw-preview > iframe')).toBeVisible();
  await page.getByRole('button',{name:'Mobile',exact:true}).click();await expect(page.locator('.aw-preview')).toHaveClass(/aw-mobile-preview/);
- await page.getByRole('button',{name:'Agrandir',exact:true}).click();await expect(page.locator('.aw-aside')).not.toBeVisible();
+ await page.getByRole('button',{name:'Afficher ou masquer les fichiers',exact:true}).click();await expect(page.locator('.aw-aside')).toBeVisible();await page.getByRole('button',{name:'Fermer le panneau du livrable'}).click();await expect(page.locator('.aw-aside')).not.toBeVisible();
  await page.getByRole('button',{name:'Partager',exact:true}).click();await expect(page.getByRole('combobox',{name:'Visibilité du bundle'})).toBeVisible();await expect(page.getByRole('tab',{name:'Partage',exact:true})).toBeFocused();
  await page.getByRole('tab',{name:'Partage',exact:true}).press('ArrowLeft');await expect(page.getByRole('tab',{name:'Versions',exact:true})).toHaveAttribute('aria-selected','true');
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
@@ -67,7 +67,7 @@ test('library filters can be reset and search survives opening a report',async({
 });
 test('version history opens the requested version and new uploads inherit access',async({page})=>{
  artifact.versions.push({...artifact.versions[0],number:2,note:'Second iteration',created_at:'2026-01-02T00:00:00Z'});artifact.version_count=2;
- await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await page.getByRole('tab',{name:'Versions',exact:true}).click();
+ await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await page.getByRole('button',{name:'Afficher ou masquer les fichiers',exact:true}).click();await page.getByRole('tab',{name:'Versions',exact:true}).click();
  await expect(page.getByRole('combobox',{name:'Version du livrable'})).toHaveValue('2');await page.getByRole('combobox',{name:'Version du livrable'}).selectOption('1');await expect(page.locator('.aw-version.aw-active')).toContainText('Version 1');await expect.poll(()=>calls.filter(c=>c.action==='read').at(-1)?.version).toBe(1);
  await page.getByRole('button',{name:'＋ Nouvelle version'}).click();await expect(page.locator('.aw-form')).toContainText('La visibilité actuelle');
 });
@@ -99,10 +99,10 @@ test('upload shows selected files, locks edits during transfer and publishes pri
 test('deliverable navigation respects filters and keeps separate revision drafts',async({page})=>{
  extra=[{...artifact,id:'bcdefghijklmnopqrstuvwxy',title:'Website proposal',updated_at:'2026-01-02T00:00:00Z'},{...artifact,id:'cdefghijklmnopqrstuvwxyz',title:'Other report',project:'Other'}];
  await page.goto('https://artifacts.test/#artifacts');await page.getByRole('searchbox',{name:'Rechercher les livrables'}).fill('Website');await page.getByRole('combobox',{name:'Trier les livrables'}).selectOption('title');await page.getByRole('button',{name:/Website delivery/}).click();
- await expect(page.getByRole('button',{name:'Livrable précédent',exact:true})).toBeDisabled();await expect(page.getByRole('combobox',{name:'Choisir un livrable'}).locator('option')).toHaveCount(2);
+ await expect(page.getByRole('button',{name:'Livrable précédent',exact:true})).toBeDisabled();expect(await page.locator('.aw-topbar').evaluate(bar=>[...bar.querySelectorAll('button,select')].every(e=>{const r=e.getBoundingClientRect();return !r.width||!r.height||(r.left>=0&&r.right<=innerWidth+1);}))).toBe(true);await expect(page.getByRole('combobox',{name:'Choisir un livrable'}).locator('option')).toHaveCount(2);
  await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await page.getByRole('textbox',{name:'Modifications à demander à Monique'}).fill('Change the heading');
- await page.getByRole('button',{name:'Livrable suivant',exact:true}).click();await expect(page.locator('.aw-details-title h1')).toHaveText('Website proposal');await expect(page.getByRole('button',{name:'Livrable suivant',exact:true})).toBeDisabled();await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('');
- await page.getByRole('button',{name:'Livrable précédent',exact:true}).click();await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('Change the heading');
+ await page.getByRole('button',{name:'Livrable suivant',exact:true}).click();await expect(page.locator('.aw-details-title h1')).toHaveText('Website proposal');await expect(page.getByRole('button',{name:'Livrable suivant',exact:true})).toBeDisabled();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('');
+ await page.getByRole('button',{name:'Livrable précédent',exact:true}).click();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await expect(page.getByRole('textbox',{name:'Modifications à demander à Monique'})).toHaveValue('Change the heading');
  await page.getByRole('button',{name:'← Tous les livrables'}).click();await expect(page.getByRole('searchbox',{name:'Rechercher les livrables'})).toHaveValue('Website');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });
 test('inline revision sends selected version and file in a dedicated conversation and preserves a failed draft',async({page})=>{
@@ -122,5 +122,13 @@ test('revision cannot double-send and retains its result when switching delivera
  await page.route('**/api/chat/new',route=>route.fulfill({json:{conversation_id:'revision-two',messages:[]}}));await page.route('**/api/chat',async route=>{requests++;await pending;return route.fulfill({json:{conversation_id:'revision-two',answer:'Revision request received.'}});});
  await page.goto('https://artifacts.test/#artifacts');await page.getByRole('button',{name:/Website delivery/}).click();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await page.getByRole('textbox',{name:'Modifications à demander à Monique'}).fill('Improve the layout');await page.getByRole('button',{name:'Envoyer à Monique',exact:true}).click();await expect(page.getByRole('button',{name:'Envoyer à Monique',exact:true})).toBeDisabled();
  await page.getByRole('combobox',{name:'Choisir un livrable'}).selectOption(extra[0].id);await expect(page.locator('.aw-details-title h1')).toHaveText('Second delivery');finish();await expect.poll(()=>requests).toBe(1);
- await page.getByRole('combobox',{name:'Choisir un livrable'}).selectOption(id);await page.getByRole('tab',{name:'Monique',exact:true}).click();await expect(page.locator('.aw-revise-message.assistant')).toContainText('Revision request received.');expect(requests).toBe(1);
+ await page.getByRole('combobox',{name:'Choisir un livrable'}).selectOption(id);await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await expect(page.locator('.aw-revise-message.assistant')).toContainText('Revision request received.');expect(requests).toBe(1);
+});
+
+test('compact reader fills the viewport, has one document toolbar and preserves drafts when closed',async({page})=>{
+ await page.goto('https://artifacts.test/#artifacts?artifact='+id);const frame=page.frameLocator('.aw-preview>iframe');await expect(frame.frameLocator('iframe').locator('h1')).toHaveText('Verified report');await expect(page.locator('.aw-aside')).not.toBeVisible();await expect(page.locator('.aw-topbar .aw-preview-toolbar')).toHaveCount(1);await expect(page.locator('.aw-stage>.aw-preview-toolbar')).toHaveCount(0);
+ const geometry=await page.locator('.aw-preview').evaluate(e=>({left:e.getBoundingClientRect().left,right:e.getBoundingClientRect().right,bottom:e.getBoundingClientRect().bottom,width:innerWidth,height:innerHeight,scroll:document.documentElement.scrollHeight}));expect(geometry.left).toBe(0);expect(geometry.right).toBe(geometry.width);expect(Math.abs(geometry.bottom-geometry.height)).toBeLessThan(2);expect(geometry.scroll).toBeLessThanOrEqual(geometry.height+1);
+ expect(await frame.locator('body').evaluate(()=>document.documentElement.scrollHeight<=innerHeight)).toBe(true);
+ await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();const input=page.getByRole('textbox',{name:'Modifications à demander à Monique'});await input.fill('Keep this draft');await input.press('Escape');await expect(page.locator('.aw-aside')).not.toBeVisible();await page.getByRole('button',{name:'Demander à Monique',exact:true}).click();await expect(input).toHaveValue('Keep this draft');await page.getByRole('button',{name:'Fermer le panneau du livrable'}).click();
+ await page.getByRole('button',{name:'← Tous les livrables',exact:true}).click();await expect(page.locator('.aw-row')).toHaveCount(1);await expect(page.locator('#artifact-library')).not.toHaveClass(/aw-detail-open/);
 });

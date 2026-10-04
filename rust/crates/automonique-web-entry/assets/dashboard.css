@@ -1879,3 +1879,13 @@ body.chat-page [data-panel="chat"] { height: 100%; margin: 0; }
  .artifact-dialog { padding:16px; width:100vw; max-width:100vw; height:100dvh; max-height:100dvh; border-radius:0; }
  .artifact-dialog .aw-detail { height:auto; }
 }
+
+/* Artifact detail occupies the space below the global navigation. */
+body:has([data-panel="artifacts"].is-visible .aw-detail-open){height:100dvh;min-height:0;overflow:hidden}
+body:has([data-panel="artifacts"].is-visible .aw-detail-open) .app-shell{display:grid;height:100%;grid-template-rows:auto minmax(0,1fr);grid-template-columns:minmax(0,1fr)}
+body:has([data-panel="artifacts"].is-visible .aw-detail-open) .topbar{position:relative}
+body:has([data-panel="artifacts"].is-visible .aw-detail-open) main{height:100%;min-height:0;padding:0;overflow:hidden}
+body:has([data-panel="artifacts"].is-visible .aw-detail-open) [data-panel="artifacts"]{height:100%;min-height:0;animation:none}
+#artifact-dialog:has(.aw-compact.aw-detail-open){padding:0;overflow:hidden}
+#artifact-dialog .aw-compact .aw-topbar{padding-right:46px}
+#artifact-dialog .aw-compact.aw-detail-open{height:100%}

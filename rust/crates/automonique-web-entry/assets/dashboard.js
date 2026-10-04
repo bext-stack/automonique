@@ -2750,7 +2750,7 @@ async function artifactApi(body) {
   return result;
 }
 function artifactOptions(context={}) {
-  const options={context,previewUrl:"/artifact-preview",publicBase:artifactPublicBase,
+  const options={context,compact:true,previewUrl:"/artifact-preview",publicBase:artifactPublicBase,
     api:async body=>{const result=await artifactApi(body);options.publicBase=artifactPublicBase;if(body.action==="list" && (context.run_id || context.conversation_id))result.items=(result.items||[]).filter(a=>context.run_id?a.run_id===context.run_id:a.conversation_id===context.conversation_id);return result;},
     onRevise:reviseArtifact,
     renderAnswer:renderMarkdown,
