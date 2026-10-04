@@ -6507,7 +6507,7 @@ function renderControls() {
   if (!view.mcp?.servers?.length) mcp.append(controlNode("p", view.mcp?.status === "unavailable" ? "MCP configuration is unavailable." : "No MCP servers configured.", "inline-hint"));
   for (const server of view.mcp?.servers || []) {
     const item = controlNode("details", undefined, "control-disclosure"); item.dataset.controlDetails = `mcp:${server}`;
-    const summary = controlNode("summary", server); summary.dataset.i18nSkip = ""; item.append(summary);
+    const summary = controlNode("summary", ({business:"Manage",support:"Support","support-workflows":"Support · suivi",designer:"Designer · site source","designer-app":"Designer · projets",seo:"SEO",ads:"Ads",mail:"MailDesigner",sms:"SMSDesigner",onboarding:"Onboarding",share:"Share"})[server] || server); summary.dataset.i18nSkip = ""; item.append(summary);
     const result = controlResult(); const check = controlState.mcp.get(server);
     result.textContent = check?.status === "verified" ? `${translatePhrase("Tools discovered")}: ${check.tools.length} · ${controlTime(check.checked_at_ms)}` : check?.status === "failed" ? `${translatePhrase("Discovery failed")}: ${translatePhrase(connectionTestReasons[check.reason] || "The check could not finish. Try again.")}${check.checked_at_ms ? ` · ${controlTime(check.checked_at_ms)}` : ""}` : translatePhrase("Not checked yet");
     result.dataset.state = check?.status || "idle";
@@ -6520,6 +6520,16 @@ function renderControls() {
     discover.disabled = [...controlState.mcp.values()].some((check)=>check.status==="checking");
     if (check?.status==="checking") result.textContent=translatePhrase("Checking connection…");
     item.append(discover, result);
+    if (check?.status === "verified" && check.connection) {
+      const info=check.connection;
+      const usage=controlNode("p", `${info.calls ?? "—"} appels · ${info.errors ?? "—"} erreurs · ${check.duration_ms} ms`, "inline-hint");usage.dataset.appUsage=server;item.append(usage);
+      item.append(controlNode("p", info.scopes.join(" · "), "inline-hint"));
+      const access=controlNode("details",undefined,"app-access-details");access.append(controlNode("summary","Accès autorisés"),controlNode("p",`Espaces : ${info.tenants.join(", ")}`),controlNode("p",`Ressources : ${info.resources.join(", ")}`));
+      if(info.expires_at)access.append(controlNode("p",`Expire le ${new Date(info.expires_at).toLocaleDateString()}`));item.append(access);
+    }
+    if (check?.status === "verified") {
+      const ask=controlButton("Demander à Monique",()=>{});ask.dataset.chatPrompt=`Utilise la connexion ${server} pour présenter les données disponibles et les actions possibles. Commence par une lecture, sans modifier de données.`;item.append(ask);
+    }
     for (const tool of check?.tools || []) { const line = controlNode("div", undefined, "control-tool"); const name = controlNode("strong", tool.name); name.dataset.i18nSkip = ""; line.append(name, controlNode("span", tool.read_only ? "Read only" : "Changes data", "source-pill"), controlNode("small", tool.description)); item.append(line); }
     item.open = expanded.has(item.dataset.controlDetails); mcp.append(item);
   }

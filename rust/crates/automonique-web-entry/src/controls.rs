@@ -120,9 +120,32 @@ impl WebIntegration {
                 }
                 let started = Instant::now();
                 match registry.discover_server(&server) {
-                    Ok(tools) => Ok(
-                        json!({"server":server,"status":"verified","checked_at_ms":now_ms(),"duration_ms":started.elapsed().as_millis() as u64,"tools":tools.iter().map(|tool|json!({"name":tool.name,"description":redact_content(&tool.description),"read_only":tool.read_only})).collect::<Vec<_>>()}),
-                    ),
+                    Ok(tools) => {
+                        let mut connection = Value::Null;
+                        let mut status = "verified";
+                        let mut probe = "catalog";
+                        if tools
+                            .iter()
+                            .any(|tool| tool.name == "app_connection_info" && tool.read_only)
+                        {
+                            probe = "app";
+                            match registry.call(&server, "app_connection_info", json!({}), None) {
+                                Ok(McpCallResult::Complete {
+                                    value,
+                                    is_error: false,
+                                }) => {
+                                    connection = app_connection_view(&value);
+                                    if connection.is_null() {
+                                        status = "failed";
+                                    }
+                                }
+                                _ => status = "failed",
+                            }
+                        }
+                        Ok(
+                            json!({"server":server,"status":status,"probe":probe,"connection":connection,"checked_at_ms":now_ms(),"duration_ms":started.elapsed().as_millis() as u64,"reason":if status == "failed" {Some("service_unavailable")} else {None},"tools":tools.iter().map(|tool|json!({"name":tool.name,"description":redact_content(&tool.description),"read_only":tool.read_only})).collect::<Vec<_>>()}),
+                        )
+                    }
                     Err(error) => Ok(
                         json!({"server":server,"status":"failed","checked_at_ms":now_ms(),"reason":match error {automonique_daemon::mcp_client::McpFailure::NotAllowed=>"access_refused",automonique_daemon::mcp_client::McpFailure::Protocol=>"invalid_response",_=>"service_unavailable"},"tools":[]}),
                     ),
@@ -440,9 +463,46 @@ fn backup_timer() -> Value {
     json!({"status":if fields.get("LoadState")==Some(&"not-found"){"not_configured"}else if active{"active"}else{"inactive"},"next_run_at_ms":next_run_at_ms,"next_run":fields.get("NextElapseUSecRealtime").filter(|s|!s.is_empty()).copied()})
 }
 
+// Project only the public connection contract, never a remote server's raw config.
+fn app_connection_view(value: &Value) -> Value {
+    let Some(tenant) = value
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 160)
+    else {
+        return Value::Null;
+    };
+    let labels = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_str)
+                    .take(100)
+                    .map(|s| redact_content(&s.chars().take(160).collect::<String>()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let usage = value.get("usage").unwrap_or(&Value::Null);
+    json!({"tenant_id":redact_content(tenant),"tenants":labels("authorized_tenants"),"resources":labels("resources"),"scopes":labels("scopes"),"expires_at":value.get("expires_at").and_then(Value::as_str).filter(|s|s.len()<=40),"calls":usage.get("calls").and_then(Value::as_u64),"errors":usage.get("errors").and_then(Value::as_u64)})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn app_probe_projects_only_safe_contract_fields() {
+        let output = app_connection_view(
+            &json!({"tenant_id":"sample","authorized_tenants":["sample"],"scopes":["read"],"resources":["project"],"token":"never expose","usage":{"calls":12,"errors":1,"recent":[{"token":"hidden"}]}}),
+        );
+        assert_eq!(output["calls"], 12);
+        assert!(output.get("token").is_none());
+        assert!(output.get("recent").is_none());
+        assert!(app_connection_view(&json!({"status":"ok"})).is_null());
+    }
+
     #[test]
     fn control_requests_do_not_accept_paths_tools_or_extra_authority() {
         for body in [

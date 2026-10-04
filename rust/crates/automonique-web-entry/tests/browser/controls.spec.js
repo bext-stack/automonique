@@ -95,3 +95,12 @@ test("finishing one response test unlocks unchanged accounts",async({page})=>{
  await expect(page.locator('[data-agent-response-test="one"]')).toBeEnabled();
  await expect(page.locator('[data-agent-response-test="two"]')).toBeEnabled();
 });
+
+test("app probes show scoped usage and prepare a chat without sending",async({page})=>{
+ await page.route("**/api/controls/action",route=>route.fulfill({json:{server:"sample",status:"verified",probe:"app",checked_at_ms:now,duration_ms:42,connection:{calls:12,errors:1,tenants:["demo"],resources:["example-project"],scopes:["read","drafts.write"],expires_at:"2027-01-01T00:00:00Z"},tools:[{name:"read_records",description:"Read records",read_only:true}]}}));
+ const card=page.locator('[data-control-card="mcp"]');await card.locator('summary').first().click();await card.getByRole('button',{name:'Refresh tools'}).click();
+ await expect(card.locator('[data-app-usage="sample"]')).toContainText('12 appels · 1 erreurs');
+ await card.getByText('Accès autorisés',{exact:true}).click();await expect(card).toContainText('example-project');
+ await card.getByRole('button',{name:'Demander à Monique',exact:true}).click();await expect(page.locator('#chat-input')).toHaveValue(/connexion sample/);
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+});
