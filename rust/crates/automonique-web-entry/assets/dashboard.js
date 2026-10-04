@@ -6511,6 +6511,7 @@ function renderControls() {
     const result = controlResult(); const check = controlState.mcp.get(server);
     result.textContent = check?.status === "verified" ? `${translatePhrase("Tools discovered")}: ${check.tools.length} · ${controlTime(check.checked_at_ms)}` : check?.status === "failed" ? `${translatePhrase("Discovery failed")}: ${translatePhrase(connectionTestReasons[check.reason] || "The check could not finish. Try again.")}${check.checked_at_ms ? ` · ${controlTime(check.checked_at_ms)}` : ""}` : translatePhrase("Not checked yet");
     result.dataset.state = check?.status || "idle";
+    const compact=controlNode("small",check?.status==="verified"?`✓ ${check.tools.length}`:check?.status==="failed"?"!":check?.status==="checking"?"…":"—","app-connection-summary");compact.dataset.state=check?.status||"idle";summary.append(compact);
     const discover = controlButton("Refresh tools", async () => {
       controlState.mcp.set(server, {status:"checking",tools:[]}); item.open = true; renderControls();
       try { controlState.mcp.set(server, await controlAction({action:"discover_mcp",server})); }
