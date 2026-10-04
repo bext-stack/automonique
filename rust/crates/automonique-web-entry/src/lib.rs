@@ -4841,19 +4841,26 @@ impl WebIntegration {
             }
             match result {
                 McpCallResult::Complete { value, is_error } => {
-                    let prompt = manage_action_result_prompt(
+                    // The app operation already completed. A missing summary must never
+                    // turn its receipt into an apparent failed action or invite a retry.
+                    let fallback = || manage_action_receipt(&pending.tool, &value, is_error);
+                    match manage_action_result_prompt(
                         &pending.question,
                         &pending.tool,
                         &value,
                         is_error,
-                    )?;
-                    let mut lane = self.lane.try_lock().map_err(|_| "chat_lane_busy")?;
-                    run_web_question_to_completion(
-                        &mut *lane,
-                        &prompt,
-                        QuestionProfile::OperationalLookup,
-                    )
-                    .map_err(|error| lane_failure_category(&lane, error))?
+                    ) {
+                        Ok(prompt) => match self.lane.try_lock() {
+                            Ok(mut lane) => run_web_question_to_completion(
+                                &mut *lane,
+                                &prompt,
+                                QuestionProfile::OperationalLookup,
+                            )
+                            .unwrap_or_else(|_| fallback()),
+                            Err(_) => fallback(),
+                        },
+                        Err(_) => fallback(),
+                    }
                 }
                 McpCallResult::InputRequired { .. } => {
                     return Err("manage_action_additional_approval_refused");
@@ -6187,6 +6194,28 @@ fn label_words(value: &str) -> String {
         .join(" ")
 }
 
+fn manage_action_receipt(tool: &str, value: &Value, is_error: bool) -> String {
+    let status = if is_error {
+        "Service reported an error"
+    } else {
+        "Service operation completed"
+    };
+    let mut evidence =
+        serde_json::json!({"receipt":"Result too large; inspect the app operation history."});
+    for (items, chars, depth) in [(8, 800, 5), (4, 200, 4), (2, 96, 3)] {
+        let candidate = bounded_manage_value(value, 0, items, chars, depth);
+        if serde_json::to_vec(&candidate).is_ok_and(|v| v.len() < 4000) {
+            evidence = candidate;
+            break;
+        }
+    }
+    format!(
+        "{status}: {}. The automatic summary is unavailable. The tool was already called; check this receipt before retrying.\n\n```json\n{}\n```",
+        label_words(tool),
+        serde_json::to_string_pretty(&evidence).unwrap_or_default()
+    )
+}
+
 fn manage_action_result_prompt(
     question: &str,
     tool: &str,
@@ -6201,7 +6230,7 @@ fn manage_action_result_prompt(
          BEGIN_RESULT\n{result}\nEND_RESULT\n\n\
          BEGIN_ORIGINAL_REQUEST\n{question}\nEND_ORIGINAL_REQUEST\n"
     );
-    (prompt.len() <= 24 * 1024)
+    (prompt.len() <= CHAT_PROMPT_LIMIT - 1024)
         .then_some(prompt)
         .ok_or("manage_result_oversized")
 }
@@ -15574,6 +15603,27 @@ mod tests {
         assert_eq!(
             slack_read_plan("#deploys", &history, &labels),
             SlackReadPlan::PostRequest
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_action_receipt_tests {
+    use super::*;
+    #[test]
+    fn oversized_completed_actions_keep_a_truthful_bounded_receipt() {
+        let value = serde_json::json!({"id":"job-1","state":"queued","prompt":"x".repeat(CHAT_PROMPT_LIMIT * 2)});
+        assert!(
+            manage_action_result_prompt("Create a report", "create_report", &value, false).is_err()
+        );
+        let receipt = manage_action_receipt("create_report", &value, false);
+        assert!(receipt.contains("Service operation completed"));
+        assert!(receipt.contains("job-1"));
+        assert!(receipt.contains("queued"));
+        assert!(receipt.len() < 2000);
+        assert!(
+            manage_action_receipt("create_report", &value, true)
+                .contains("Service reported an error")
         );
     }
 }
