@@ -2055,6 +2055,7 @@ enum AgentToolDecision {
         content: String,
     },
     ManageSnapshot {
+        server: String,
         tool: String,
         content: String,
     },
@@ -3745,10 +3746,9 @@ impl WebIntegration {
             && issue_lookup.is_none()
             && matches!(github_tool, GitHubToolDecision::None)
             && matches!(slack_tool, SlackToolDecision::None);
-        // A Slack read only the router asked for must not crowd out the
-        // Manage tools when the router also says the turn is about Manage.
+        // An incidental Slack read must not hide capabilities of another app.
+        // The app router still decides semantically whether any tool applies.
         let routed_agent_tool = direct_answer.is_none()
-            && router_manage
             && issue_lookup.is_none()
             && matches!(github_tool, GitHubToolDecision::None)
             && matches!(slack_tool, SlackToolDecision::Snapshot { .. })
@@ -3796,7 +3796,7 @@ impl WebIntegration {
             _ => None,
         };
         let manage_context = match &agent_tool {
-            AgentToolDecision::ManageSnapshot { tool, content } => {
+            AgentToolDecision::ManageSnapshot { tool, content, .. } => {
                 Some((tool.as_str(), content.as_str()))
             }
             _ => None,
@@ -3850,8 +3850,8 @@ impl WebIntegration {
                 live_sources.push(String::from("slack:issue-references"));
             }
         }
-        if let Some((tool, _)) = manage_context {
-            live_sources.push(format!("manage:{tool}"));
+        if let AgentToolDecision::ManageSnapshot { server, tool, .. } = &agent_tool {
+            live_sources.push(format!("mcp:{server}:{tool}"));
         }
         live_sources.push(String::from("clock:utc"));
         if model_capability.is_some() {
@@ -4701,6 +4701,7 @@ impl WebIntegration {
                     is_error,
                 )?;
                 Ok(AgentToolDecision::ManageSnapshot {
+                    server: plan.server,
                     tool: plan.tool,
                     content,
                 })
@@ -4892,7 +4893,7 @@ impl WebIntegration {
             profile: "operational",
             memory_evidence: 0,
             live_sources: if approved {
-                vec![format!("manage:{}", pending.tool)]
+                vec![format!("mcp:{}:{}", pending.server, pending.tool)]
             } else {
                 Vec::new()
             },
