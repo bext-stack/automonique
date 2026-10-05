@@ -1429,11 +1429,21 @@ impl TicketActionSurface for FleetClient {
     fn ticket_status(&mut self, job_id: &str) -> Result<TicketStatus, String> {
         let request = TicketStatusRequest::new(job_id)
             .map_err(|_| String::from("ticket_status_request_refused"))?;
-        match FleetClient::ticket_status(self, &request)
-            .map_err(|_| String::from("manage_unavailable"))?
-        {
-            FleetOutcome::Accepted(status) => Ok(status),
-            FleetOutcome::Rejected(reason) => Err(reason.as_str().to_owned()),
+        // Every caller retries a failed read on its next poll; the journal is
+        // what makes a read that never succeeds visible.
+        match FleetClient::ticket_status(self, &request) {
+            Ok(FleetOutcome::Accepted(status)) => {
+                crate::status_read_journal::note(job_id, Ok(()));
+                Ok(status)
+            }
+            Ok(FleetOutcome::Rejected(reason)) => {
+                crate::status_read_journal::note(job_id, Err(reason.as_str()));
+                Err(reason.as_str().to_owned())
+            }
+            Err(failure) => {
+                crate::status_read_journal::note(job_id, Err(&format!("{failure:?}")));
+                Err(String::from("manage_unavailable"))
+            }
         }
     }
 
