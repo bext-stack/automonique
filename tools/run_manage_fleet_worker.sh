@@ -911,6 +911,13 @@ publish_process_snapshot() {
                     and (.kind | test("^[A-Za-z0-9._-]+$")) then (.kind | ascii_downcase) else null end),
                 provider: (.claimed_agent | safe_state),
                 runtime: (.claimed_runtime | safe_state),
+                # What this run itself uses, which need not be the engine of
+                # the worker: the model and effort it ran with (else the ones
+                # asked for) and why that engine was chosen.
+                model: ((.claimed_model // .model) | safe_text(100)),
+                effort: ((.claimed_effort // .effort)
+                    | if . == "low" or . == "medium" or . == "high" or . == "xhigh" then . else null end),
+                engine_reason: (.engine_reason | safe_text(200)),
                 assigned_to_worker: (.instance_id == $instance),
                 approved: ((.approved_by | type) == "string" and (.approved_by | length) > 0),
                 decision_count: (if (.decisions | type) == "array" then (.decisions | length) else 0 end),

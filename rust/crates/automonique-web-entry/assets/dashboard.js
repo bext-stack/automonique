@@ -1527,6 +1527,24 @@ const frenchUi = Object.freeze({
   "Run details": "Détails de l’exécution",
   "References": "Références",
   "Current worker": "Worker actuel",
+  "This run": "Cette exécution",
+  "Engine": "Moteur",
+  "Thinking effort": "Effort de réflexion",
+  "Why this engine": "Pourquoi ce moteur",
+  "Engine default": "Par défaut du moteur",
+  "Engine default settings": "Réglages par défaut du moteur",
+  "Light effort": "Effort léger",
+  "Medium effort": "Effort moyen",
+  "High effort": "Effort élevé",
+  "Maximum effort": "Effort maximal",
+  "Automatic triage": "Tri automatique",
+  "asked for by the ticket or its project": "Demandé par le ticket ou son projet",
+  "triage gave no verdict": "Le tri automatique n’a pas tranché",
+  "not triaged: the Claude account is signed out": "Pas de tri : le compte Claude est déconnecté",
+  "Worker hosting this run": "Worker qui héberge cette exécution",
+  "Default engine": "Moteur par défaut",
+  "Default model": "Modèle par défaut",
+  "The worker’s own default settings. The engine, effort and model of this run are listed under “This run”.": "Réglages par défaut du worker. Le moteur, l’effort et le modèle de cette exécution figurent dans « Cette exécution ».",
   "Current worker configuration, not a record of this run’s model or usage.": "Configuration actuelle du worker. Le modèle et l’utilisation propres à cette exécution ne sont pas renseignés ici.",
   "Copied.": "Copié.",
   "events": "événements",
@@ -3329,6 +3347,24 @@ function processStatusLabel(status) {
   return labels[status] || operationLabel(status);
 }
 
+const RUN_EFFORT_LABELS = { low: "Light effort", medium: "Medium effort", high: "High effort", xhigh: "Maximum effort" };
+
+// What the run itself uses, in one line under the engine's name.
+function runEngineSummary(job) {
+  const parts = [];
+  if (job.effort) parts.push(translatePhrase(RUN_EFFORT_LABELS[job.effort] || job.effort));
+  if (job.model) parts.push(job.model);
+  return parts.length ? parts.join(" · ") : translatePhrase("Engine default settings");
+}
+
+// The worker words its reason in English; the frequent ones are translated.
+function translateEngineReason(reason) {
+  const known = translatePhrase(reason);
+  if (known !== reason) return known;
+  if (reason.startsWith("triage: ")) return `${translatePhrase("Automatic triage")} : ${reason.slice(8)}`;
+  return reason;
+}
+
 function processSnapshotIsFresh(view = processesSnapshot) {
   return ["ready", "degraded"].includes(view?.health)
     && Number.isSafeInteger(view?.observed_at_ms)
@@ -3718,8 +3754,11 @@ const processPanel = (() => {
       const button=action("Copy",()=>copy(value),`copy-${label}`);button.setAttribute("aria-label",`${translatePhrase("Copy")} ${translatePhrase(label)}`);row.append(content,button);references.append(row);
     }
     root.append(references);
-    if(job.assigned_to_worker && processesSnapshot?.worker){const worker=processesSnapshot.worker;const sectionRoot=section("Current worker");sectionRoot.append(text("p","Current worker configuration, not a record of this run’s model or usage.","inline-hint"));const workerFacts=text("dl",undefined,"run-facts");
-      for(const [label,value] of [["Status",translatePhrase(operationLabel(worker.status))],["Agent",operationLabel(worker.provider)],["Model",worker.model],["Runtime",worker.runtime],["Version",worker.cli_version],["Active jobs",`${worker.active_jobs ?? 0} / ${worker.concurrency ?? "—"}`]])if(value)fact(workerFacts,label,value);
+    {const runRoot=section("This run");const runFacts=text("dl",undefined,"run-facts");
+      for(const [label,value] of [["Engine",operationLabel(job.provider)],["Thinking effort",job.effort?translatePhrase(RUN_EFFORT_LABELS[job.effort]||job.effort):translatePhrase("Engine default")],["Model",job.model||translatePhrase("Engine default")],["Why this engine",job.engine_reason?translateEngineReason(job.engine_reason):null]])if(value)fact(runFacts,label,value);
+      runRoot.append(runFacts);root.append(runRoot);}
+    if(job.assigned_to_worker && processesSnapshot?.worker){const worker=processesSnapshot.worker;const sectionRoot=section("Worker hosting this run");sectionRoot.append(text("p","The worker’s own default settings. The engine, effort and model of this run are listed under “This run”.","inline-hint"));const workerFacts=text("dl",undefined,"run-facts");
+      for(const [label,value] of [["Status",translatePhrase(operationLabel(worker.status))],["Default engine",operationLabel(worker.provider)],["Default model",worker.model],["Runtime",worker.runtime],["Version",worker.cli_version],["Active jobs",`${worker.active_jobs ?? 0} / ${worker.concurrency ?? "—"}`]])if(value)fact(workerFacts,label,value);
       sectionRoot.append(workerFacts);root.append(sectionRoot);}
     return root;
   }
@@ -3757,7 +3796,7 @@ const processPanel = (() => {
     header(job,state);
     const summary=text("section",undefined,"run-summary");
     const identity=text("div",undefined,"run-identity");const mark=raw("span",String(operationLabel(job.provider)).slice(0,1).toUpperCase(),"run-agent-mark");mark.setAttribute("aria-hidden","true");
-    const provider=text("div",undefined,"run-agent-name");provider.append(raw("strong",operationLabel(job.provider)),text("small",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):"Runtime not reported"));
+    const provider=text("div",undefined,"run-agent-name");provider.append(raw("strong",operationLabel(job.provider)),text("small",runEngineSummary(job)));
     const badge=consoleBadge(translatePhrase(processStatusLabel(displayStatus)),processStatusTone(displayStatus));identity.append(mark,provider,badge);summary.append(identity);
     const lede={pending:"Waiting for a free agent to pick it up.",pending_approval:"Waiting for your approval in Manage. Nothing runs until it is approved.",running:"An agent is working on this right now.",done:"The agent finished this run.",failed:"This run failed. Check the output below, then retry from Manage.",cancelled:"This run was cancelled.",unconfirmed:!fresh?"This snapshot is out of date. Current execution is unconfirmed.":"Manage reports a running job, but matching worker activity is not confirmed."}[displayStatus] || "Agent run.";
     summary.append(text("p",lede,displayStatus==="unconfirmed"||displayStatus==="failed"?"run-warning":"run-lede"));

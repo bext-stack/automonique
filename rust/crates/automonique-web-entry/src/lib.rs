@@ -1796,6 +1796,14 @@ struct ProcessJobView {
     kind: Option<String>,
     provider: String,
     runtime: String,
+    /// The model, effort and engine choice of this run itself. Absent from a
+    /// snapshot written by a worker that predates per-job engines.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    engine_reason: Option<String>,
     assigned_to_worker: bool,
     approved: bool,
     decision_count: u64,
@@ -7696,6 +7704,12 @@ fn process_snapshot(bytes: &[u8]) -> Option<ProcessSnapshotView> {
             || !job.kind.as_deref().is_none_or(process_state)
             || !process_state(&job.provider)
             || !process_state(&job.runtime)
+            || !optional_process_text(job.model.as_deref(), 100)
+            || !job
+                .effort
+                .as_deref()
+                .is_none_or(|effort| matches!(effort, "low" | "medium" | "high" | "xhigh"))
+            || !optional_process_text(job.engine_reason.as_deref(), 200)
             || job.decision_count > 1_000
             || !optional_process_text(job.created_at.as_deref(), 64)
             || !optional_process_text(job.updated_at.as_deref(), 64)
@@ -11208,6 +11222,25 @@ mod tests {
         let legacy = process_snapshot(legacy.as_bytes()).expect("legacy flat process snapshot");
         assert_eq!(None, legacy.jobs[0].parent_id);
         assert_eq!(None, legacy.jobs[0].kind);
+        // A snapshot from before per-job engines carries none of these.
+        assert_eq!(None, legacy.jobs[0].effort);
+
+        let routed = valid.replace(
+            "\"provider\":\"codex\",\"runtime\":\"worker\",",
+            "\"provider\":\"claude\",\"runtime\":\"unknown\",\"model\":\"claude-opus-5-5[1m]\",\"effort\":\"high\",\"engine_reason\":\"triage: redesign of a page\",",
+        );
+        let routed = process_snapshot(routed.as_bytes()).expect("per-job engine snapshot");
+        assert_eq!(Some("high"), routed.jobs[0].effort.as_deref());
+        assert_eq!(Some("claude-opus-5-5[1m]"), routed.jobs[0].model.as_deref());
+        assert_eq!(
+            Some("triage: redesign of a page"),
+            routed.jobs[0].engine_reason.as_deref()
+        );
+        let unknown_effort = valid.replace(
+            "\"provider\":\"codex\",",
+            "\"provider\":\"codex\",\"effort\":\"extreme\",",
+        );
+        assert!(process_snapshot(unknown_effort.as_bytes()).is_none());
 
         let queued = valid
             .replace("\"queued\":0,\"running\":1", "\"queued\":1,\"running\":0")
