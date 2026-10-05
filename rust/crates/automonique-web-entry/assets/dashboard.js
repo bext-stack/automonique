@@ -3696,7 +3696,7 @@ const processPanel = (() => {
     }
     root.append(outcome);
     const context=section("Execution context");const facts=text("dl",undefined,"run-facts");
-    fact(facts,"Agent",operationLabel(job.provider));fact(facts,"Runtime",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):null);
+    fact(facts,"Engine",operationLabel(job.provider));fact(facts,"Thinking effort",job.effort?translatePhrase(RUN_EFFORT_LABELS[job.effort]||job.effort):translatePhrase("Engine default"));fact(facts,"Model",job.model||translatePhrase("Engine default"));
     fact(facts,"Last activity",job.updated_at?ticketDateLabel(job.updated_at):null);
     context.append(facts);root.append(context);
     root.append(sourceCheck(job));

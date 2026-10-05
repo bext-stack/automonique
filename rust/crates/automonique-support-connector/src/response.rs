@@ -538,7 +538,7 @@ pub fn decode_ticket_status(bytes: &[u8]) -> Result<FleetOutcome<TicketStatus>, 
         issue_title: nonempty(row, "issue_title", 300)?,
         job_id: nonempty(row, "job_id", crate::MAX_FLEET_IDENTIFIER_BYTES)?,
         job_status: ticket_status(row, "job_status")?,
-        result: bounded_multiline(row, "result", MAX_TICKET_RESULT_BYTES)?,
+        result: clipped_multiline(row, "result", MAX_TICKET_RESULT_BYTES)?,
         created_at: timestamp(row, "created_at")?,
         updated_at: timestamp(row, "updated_at")?,
     }))
@@ -606,20 +606,33 @@ fn optional_bounded(
     }
 }
 
-fn bounded_multiline(
+/// Read free text written by an agent, clipped to `max_bytes` rather than
+/// refused.
+///
+/// A job's report is whatever the agent wrote. Refusing the whole status over
+/// the length or a stray control character of that text hides the one fact the
+/// caller needs, that the job ended: a result eleven bytes over the limit kept
+/// a finished job "running" until an operator looked. The text is cut between
+/// characters and a disallowed control character becomes a space.
+fn clipped_multiline(
     object: &Map<String, Value>,
     key: &str,
     max_bytes: usize,
 ) -> Result<String, FleetFailure> {
     let value = required_str(object, key)?;
-    if value.len() > max_bytes
-        || value
-            .chars()
-            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
-    {
-        return Err(FleetFailure::FieldOutOfBounds);
+    let mut clipped = String::with_capacity(value.len().min(max_bytes));
+    for character in value.chars() {
+        let character = if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+            ' '
+        } else {
+            character
+        };
+        if clipped.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        clipped.push(character);
     }
-    Ok(value.to_owned())
+    Ok(clipped)
 }
 
 /// Decode one support issue, requiring every field the contract names.
@@ -1114,6 +1127,46 @@ mod tests {
             decode_ticket_status(unknown.as_bytes()),
             Err(FleetFailure::FieldOutOfBounds)
         );
+    }
+
+    #[test]
+    fn an_overlong_or_untidy_result_never_hides_that_the_job_ended() {
+        let status = |result: &str| {
+            let body = serde_json::json!({"ok": true, "status": {
+                "issue_id": "issue-1",
+                "issue_url": "https://github.com/example/repo/issues/1007",
+                "issue_title": "Rendu avant/après",
+                "job_id": "job-1",
+                "job_status": "done",
+                "result": result,
+                "created_at": "2026-10-05T20:14:41.990Z",
+                "updated_at": "2026-10-05T20:51:36.535Z",
+            }})
+            .to_string();
+            decode_ticket_status(body.as_bytes())
+                .expect("decode")
+                .accepted()
+                .expect("accepted")
+                .clone()
+        };
+        // 2000 characters, 2011 bytes: what Manage sent for a French report.
+        let report = format!("{}{}", "« é ° » ".repeat(2), "a".repeat(1_984));
+        assert_eq!(report.chars().count(), 2_000);
+        assert!(report.len() > MAX_TICKET_RESULT_BYTES);
+        let read = status(&report);
+        assert_eq!(read.job_status, TicketJobStatus::Done);
+        assert!(read.result.len() <= MAX_TICKET_RESULT_BYTES);
+        assert!(report.starts_with(&read.result));
+
+        // Never cut inside a character.
+        let accents = status(&"é".repeat(1_500));
+        assert_eq!(accents.result.len(), MAX_TICKET_RESULT_BYTES);
+        assert_eq!(accents.result.chars().count(), 1_000);
+
+        // A stray control character is neutralised, not a reason to refuse.
+        let untidy = status("Done\u{1b}[0m\nVerified");
+        assert_eq!(untidy.job_status, TicketJobStatus::Done);
+        assert_eq!(untidy.result, "Done [0m\nVerified");
     }
 
     #[test]
