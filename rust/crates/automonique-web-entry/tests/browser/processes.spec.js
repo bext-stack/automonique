@@ -151,9 +151,9 @@ test("fresh running claims still need matching worker activity",async({page})=>{
   const snapshot=fixture();snapshot.worker.active_jobs=0;await openProcesses(page,snapshot);
   await expect(page.locator('#ops-drawer-kicker')).toContainText('Status unconfirmed');
   await expect(page.locator('.run-summary')).toContainText('matching worker activity is not confirmed');
-  snapshot.worker.active_jobs=1;snapshot.worker.provider='codex';await page.evaluate(()=>loadProcesses());
-  await expect(page.locator('#ops-drawer-kicker')).toContainText('Status unconfirmed');
-  snapshot.worker.provider='jcode';await page.evaluate(()=>loadProcesses());
+  // A worker runs each job on the engine chosen for it: a Claude job on a
+  // JCode worker is confirmed by that worker's activity like any other.
+  snapshot.worker.active_jobs=1;snapshot.jobs[0].provider='claude';snapshot.jobs[0].runtime='unknown';await page.evaluate(()=>loadProcesses());
   await expect(page.locator('#ops-drawer-kicker')).toHaveText('Agent run · Running');
 });
 

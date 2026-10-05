@@ -455,6 +455,22 @@ impl StoredTicket {
         })
     }
 
+    /// Whether a Monique job claimed after `finished_ms` is working now.
+    ///
+    /// A relaunch of a ticket already recorded finished is real work under
+    /// way, unlike a session that merely claimed the link it was shown.
+    fn relaunched_since(&self, finished_ms: i64) -> bool {
+        self.holders().any(|(holder, claim)| {
+            matches!(holder, ClaimHolder::MoniqueJob(_))
+                && claim.since_ms > finished_ms
+                && claim
+                    .job_status
+                    .as_deref()
+                    .and_then(parse_job_status)
+                    .is_some_and(job_is_working)
+        })
+    }
+
     fn claude_holder(&self) -> Option<String> {
         self.holders()
             .find(|(holder, _)| matches!(holder, ClaimHolder::Claude(_)))
@@ -546,12 +562,14 @@ impl StoredTicket {
     /// A finished ticket wants ✅ on the posts it was finished with; a post
     /// recorded after the finish gets nothing until the ticket is verified
     /// again, so a client re-posting a link as a reminder never receives 👀
-    /// (or a stale ✅) for work that is not visibly under way.
+    /// (or a stale ✅) for work that is not visibly under way. A Monique job
+    /// running on that new post is work visibly under way: it gets its 👀.
     fn desired(&self, post: &TicketPost) -> Option<ReactionName> {
         match self.finished_ms {
             Some(finished_ms) if post.recorded_ms <= finished_ms => {
                 Some(ReactionName::WhiteCheckMark)
             }
+            Some(finished_ms) if self.relaunched_since(finished_ms) => Some(ReactionName::Eyes),
             Some(_) => None,
             None if self.actively_claimed() => Some(ReactionName::Eyes),
             None => None,
@@ -2877,6 +2895,44 @@ mod tests {
         );
         let ledger = harness.reactor.ledger.lock().expect("ledger");
         assert!(ledger.is_queued(&ticket));
+        assert!(ledger.is_finished(&ticket));
+    }
+
+    #[test]
+    fn a_job_relaunched_on_a_finished_ticket_gets_eyes_on_its_new_post() {
+        let harness = harness(BTreeMap::new());
+        let (ticket, kind) = key();
+        let mut ledger = harness.reactor.ledger.lock().expect("ledger");
+        ledger
+            .record_post(&ticket, kind, CHANNEL, POST, NOW)
+            .expect("post");
+        ledger
+            .mark_finished(&ticket, false, NOW + 1)
+            .expect("finished");
+        ledger
+            .record_post(&ticket, kind, OTHER_CHANNEL, SECOND_POST, NOW + 2)
+            .expect("relaunch post");
+        ledger
+            .record_job(
+                &ticket,
+                kind,
+                "job-9",
+                Some(TicketJobStatus::Running),
+                NOW + 3,
+            )
+            .expect("job");
+        let pending = ledger.pending_reactions(None, 16);
+        assert!(
+            pending.iter().any(|reaction| {
+                reaction.name == ReactionName::Eyes && reaction.channel == OTHER_CHANNEL
+            }),
+            "{pending:?}"
+        );
+        // The post the ticket was finished with keeps its check mark.
+        assert!(pending.iter().all(|reaction| {
+            reaction.channel != CHANNEL || reaction.name == ReactionName::WhiteCheckMark
+        }));
+        // The earlier finish stands until GitHub is read again.
         assert!(ledger.is_finished(&ticket));
     }
 

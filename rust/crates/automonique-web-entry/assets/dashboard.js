@@ -3341,8 +3341,9 @@ function processDisplayStatus(job) {
   if (!processSnapshotIsFresh()) return "unconfirmed";
   if (job.status === "running") {
     const worker = processesSnapshot?.worker;
+    // A worker runs each job on the engine chosen for it (JCode, Claude or
+    // Codex), so the job's engine need not be the worker's own.
     const matching = job.assigned_to_worker && worker?.active_jobs > 0
-      && worker.provider === job.provider && worker.runtime === job.runtime
       && ["online", "ready", "busy", "running"].includes(worker.status);
     if (!matching) return "unconfirmed";
   }
