@@ -265,6 +265,7 @@ pub mod shutdown_signal;
 pub mod site_inventory;
 pub mod skill_runtime;
 pub mod slack;
+mod status_read_journal;
 mod structured_log;
 pub mod synthetic;
 mod systemd;
