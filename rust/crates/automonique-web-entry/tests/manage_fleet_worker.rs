@@ -50,7 +50,7 @@ finish() {
     printf '%s\n' "{\"type\":\"done\",\"text\":\"Finished. https://github.com/example/repo/issues/1#issuecomment-5\",\"model\":\"fake-model-1\",\"provider\":\"FakeAI\",\"upstream_provider\":null,\"usage\":{\"input_tokens\":200,\"output_tokens\":11,\"cache_read_input_tokens\":150,\"cache_creation_input_tokens\":null},\"session_id\":\"session_fake_$mode\"}"
 }
 case "$mode" in
-    done)
+    done|limit)
         finish
         ;;
     fail)
@@ -102,6 +102,11 @@ if [[ "$*" == *"--tools"* ]]; then
     exit 0
 fi
 printf '%s\n' "$*" >>"$dir/claude-run.args"
+if [[ "$prompt" == *MODE:limit* ]]; then
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude_session_1","model":"fake-claude-1"}'
+    printf '%s\n' '{"type":"result","subtype":"error","is_error":true,"session_id":"claude_session_1","result":"Claude usage limit reached. Your limit will reset at 9pm."}'
+    exit 1
+fi
 printf '%s\n' "$CLAUDE_CONFIG_DIR" >"$dir/claude-run.home"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude_session_1","model":"fake-claude-1"}'
 printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude_session_1","result":"Finished. https://github.com/example/repo/issues/1#issuecomment-5","total_cost_usd":0.25,"num_turns":4,"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}'
@@ -908,6 +913,38 @@ fn triage_names_the_effort_and_a_ticket_that_keeps_coming_back_is_escalated() {
 }
 
 #[test]
+fn a_run_claude_cannot_serve_goes_back_to_jcode_unless_the_ticket_named_claude() {
+    let routed = job_id(40);
+    let named = job_id(41);
+    let mut worker = Worker::start(THIRD_ENGINE, |platform, root| {
+        install_both_accounts(root, true);
+        platform.queue_job_with(&routed, "limit", "claude", json!({}));
+        platform.queue_job_with(&named, "limit", "jcode", json!({"engine": "claude"}));
+    });
+
+    // The triage chose Claude, Claude was at its limit: the job still gets done.
+    let report = worker.terminal_report(&routed);
+    assert_eq!("done", report["status"], "{report}");
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!(
+        "fell back from claude: it could not serve the run", report["engine_reason"],
+        "{report}"
+    );
+    assert_eq!("session_fake_limit", report["session_id"], "{report}");
+    assert!(last_heartbeat_detail(&worker.platform).contains("codex ready"));
+
+    // A ticket that asked for Claude by name fails rather than change engine.
+    let report = worker.terminal_report(&named);
+    assert_eq!("failed", report["status"], "{report}");
+    assert_eq!("claude", report["agent"], "{report}");
+    assert!(
+        report["result"].as_str().unwrap().contains("usage limit"),
+        "{report}"
+    );
+    assert!(worker.stop().success());
+}
+
+#[test]
 fn a_signed_out_claude_account_fails_the_ticket_that_asks_for_it_and_no_other() {
     let asked = job_id(26);
     let unmarked = job_id(27);
@@ -1190,7 +1227,13 @@ fn a_restarted_worker_hands_back_the_run_it_lost_as_interrupted() {
     assert_eq!("failed", report["status"], "{report}");
     assert_eq!(true, report["interrupted"], "{report}");
     assert!(report.get("timed_out").is_none(), "{report}");
-    assert!(worker.journal().contains("requeued interrupted job"));
+    // The worker writes its journal line after Manage answered the report.
+    worker.until("the requeue to be journalled", || {
+        worker
+            .journal()
+            .contains("requeued interrupted job")
+            .then_some(())
+    });
     assert!(worker.stop().success());
 }
 
