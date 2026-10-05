@@ -19,6 +19,10 @@
 //! command-line screenshot path, unchanged. No flag runs a script: a selector
 //! is data handed to the page as an argument.
 //!
+//! A screen behind a sign-in is captured with `--login`: for a host the
+//! operator configured, `shot_login` obtains one short-lived session cookie
+//! and the DevTools path presents it to that host before navigating.
+//!
 //! The contract is deliberately small and never hangs: success prints
 //! `MONIQUE_SHOT_OK: <png>` then `title: <title>`; any failure prints one
 //! `MONIQUE_SHOT_FAIL: <reason>` line and exits non-zero, with the browser
@@ -109,6 +113,11 @@ pub struct ShotRequest {
     pub action_timeout: Duration,
     /// Explicit settle delay after the last action (`--wait-ms`).
     pub settle: Option<Duration>,
+    /// Capture signed in (`--login`): the caller resolves [`Self::cookie`]
+    /// with `shot_login::sign_in` for [`Self::login_host`] before capturing.
+    pub login: bool,
+    /// The session cookie presented to the captured origin.
+    pub cookie: Option<crate::shot_login::SessionCookie>,
 }
 
 impl ShotRequest {
@@ -116,7 +125,13 @@ impl ShotRequest {
     /// not: it only bounds waits that an action, `--selector` or `--wait-ms`
     /// introduces.
     pub fn interactive(&self) -> bool {
-        !self.actions.is_empty() || self.selector.is_some() || self.settle.is_some()
+        !self.actions.is_empty() || self.selector.is_some() || self.settle.is_some() || self.login
+    }
+
+    /// The host a `--login` session belongs to: the virtual host when one is
+    /// pinned, the URL's own host otherwise.
+    pub fn login_host(&self) -> Option<&str> {
+        self.host.as_deref().or_else(|| url_host(&self.url))
     }
 }
 
@@ -128,7 +143,7 @@ pub struct ShotOutcome {
     pub bytes: u64,
 }
 
-/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S]`
+/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S] [--login]`
 /// and the interaction options `[--wait-for CSS] [--click CSS] [--hover CSS]
 /// [--scroll-to CSS]` (repeatable, kept in the order given), `[--selector CSS]`,
 /// `[--wait-ms N]` and `[--timeout-ms N]`.
@@ -144,6 +159,7 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
     let mut selector = None;
     let mut action_timeout = Duration::from_millis(DEFAULT_ACTION_TIMEOUT_MS);
     let mut settle = None;
+    let mut login = false;
     let mut values = values.iter();
     while let Some(value) = values.next() {
         let text = value
@@ -169,6 +185,7 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
             "--width" => width = dimension(values.next(), "--width")?,
             "--height" => height = dimension(values.next(), "--height")?,
             "--full" => full = true,
+            "--login" => login = true,
             "--timeout" => {
                 let seconds: u64 = values
                     .next()
@@ -247,6 +264,8 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
         selector,
         action_timeout,
         settle,
+        login,
+        cookie: None,
     })
 }
 
@@ -409,6 +428,11 @@ pub fn capture(request: &ShotRequest, browser: &Path) -> Result<ShotOutcome, Str
         ));
     }
     let _ = std::fs::remove_file(&request.out);
+    if request.login && request.cookie.is_none() {
+        return Err(String::from(
+            "--login was asked but no session was obtained",
+        ));
+    }
     if request.interactive() {
         return crate::shot_interact::capture(
             request,
@@ -541,6 +565,40 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_login_capture_takes_the_devtools_path_and_names_its_host() {
+        let out = PathBuf::from("/tmp/x.png");
+        let plain =
+            parse(&args(&["https://manage.example/manage/crm"]), out.clone()).expect("parses");
+        assert!(!plain.login && !plain.interactive());
+
+        let signed = parse(
+            &args(&["https://manage.example:8443/manage/crm", "--login"]),
+            out.clone(),
+        )
+        .expect("parses");
+        assert!(signed.login && signed.interactive());
+        assert!(signed.cookie.is_none());
+        assert_eq!(signed.login_host(), Some("manage.example"));
+
+        let pinned = parse(
+            &args(&[
+                "https://127.0.0.1/manage",
+                "--host",
+                "manage.example",
+                "--login",
+            ]),
+            out,
+        )
+        .expect("parses");
+        assert_eq!(pinned.login_host(), Some("manage.example"));
+        // A login that was asked for but never resolved is refused before any browser starts.
+        assert_eq!(
+            capture(&pinned, Path::new("/nonexistent-browser")).unwrap_err(),
+            "--login was asked but no session was obtained"
+        );
     }
 
     #[test]

@@ -263,9 +263,29 @@ token=<sent as authorization: Bearer>
 end=automonique.purge/v1
 ```
 
-Both files sit in a directory the agent's own user can read, so the agent can
-read what they hold. Give the share secret and the purge credentials only the
-reach these two verbs need.
+`automonique shot <url> --login` captures a screen behind a sign-in. For the
+host being captured (the `--host` virtual host when one is pinned) it reads
+`shot/logins/<host>.conf`, posts the service credential once to the
+application's own sign-in service, and presents the short-lived session cookie
+it gets back to that host only, whatever the answer says about a domain. A host
+with no file fails with `MONIQUE_SHOT_FAIL: login is not configured for <host>`.
+`endpoint` must be `https://`; the service answers
+`{"cookie":{"name","value","path","secure","http_only","same_site"}}`:
+
+```text
+schema=automonique.shot-login/v1
+endpoint=https://manage.example.test/api/v1/agent/session
+token=<service credential, sent as authorization: Bearer>
+end=automonique.shot-login/v1
+```
+
+The session is the application's verification account, with that account's
+rights: a `--click` in a signed-in capture acts as that account. Captures of
+protected screens stay local and are never passed to `share`.
+
+These files sit in a directory the agent's own user can read, so the agent can
+read what they hold. Give the share secret, the purge credentials and each
+sign-in credential only the reach these verbs need.
 
 The worker accepts a job as done only when the provider's final message names
 the completion comment's permalink on the expected issue and, when the comment
