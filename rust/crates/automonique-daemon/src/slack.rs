@@ -3510,6 +3510,25 @@ fn ticket_approval_failure(reason: &str) -> String {
     }
 }
 
+/// How old a Slack post must be before a job Manage no longer knows is taken
+/// as gone for good rather than as a passing read problem.
+const MISSING_JOB_SETTLE_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Whether a pending notification can never be delivered: Manage answers that
+/// the job does not exist and the post that asked for it is old.
+///
+/// The age matters. Manage also answers `job_missing` when it could not read
+/// its own job store for a moment, and settling a live job's notification on
+/// that would swallow its completion reply.
+fn notification_job_is_gone(reason: &str, thread_ts: &str, now_secs: u64) -> bool {
+    reason == "job_missing"
+        && thread_ts
+            .split('.')
+            .next()
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .is_some_and(|posted| now_secs.saturating_sub(posted) >= MISSING_JOB_SETTLE_AGE_SECS)
+}
+
 impl<P: SlackTicketPoster> SlackTicketRouter<P> {
     fn poll_ticket_notifications(&mut self, stop: &AtomicBool) {
         let notifications = self.gates.lock().map_or_else(
@@ -3520,8 +3539,23 @@ impl<P: SlackTicketPoster> SlackTicketRouter<P> {
             if stop.load(Ordering::Acquire) {
                 break;
             }
-            let Ok(status) = self.manage.ticket_status(&notification.job_id) else {
-                continue;
+            let status = match self.manage.ticket_status(&notification.job_id) {
+                Ok(status) => status,
+                Err(reason) => {
+                    // Manage keeps a bounded history of jobs. Once an old
+                    // job has left it there is nothing left to announce, and
+                    // polling it for ever only fills the journal.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs());
+                    if notification_job_is_gone(&reason, &notification.thread_ts, now_secs) {
+                        let _ = self
+                            .gates
+                            .lock()
+                            .map(|mut gates| gates.settle_slack_notification(&notification));
+                    }
+                    continue;
+                }
             };
             // The status read is shared with the reaction ledger, so a job
             // this poll sees finish is reacted to without a second read.
@@ -9409,6 +9443,25 @@ mod tests {
         assert!(progress.contains("Last updated: 2026-08-17T20:54:00Z"));
         assert!(progress.contains("Implementing the requested change."));
         assert!(!progress.contains("GitHub still marks this issue as open"));
+    }
+
+    #[test]
+    fn only_an_old_post_whose_job_manage_forgot_is_taken_as_gone() {
+        let now = 1_791_240_000_u64;
+        let old = "1787150220.775259";
+        let recent = format!("{}.000100", now - 3_600);
+        assert!(notification_job_is_gone("job_missing", old, now));
+        // A job posted an hour ago may be missing only for a moment.
+        assert!(!notification_job_is_gone("job_missing", &recent, now));
+        // Any other failure is a read problem, however old the post.
+        assert!(!notification_job_is_gone("manage_unavailable", old, now));
+        assert!(!notification_job_is_gone(
+            "job_missing",
+            "not-a-timestamp",
+            now
+        ));
+        let week = format!("{}.000100", now - MISSING_JOB_SETTLE_AGE_SECS);
+        assert!(notification_job_is_gone("job_missing", &week, now));
     }
 
     #[test]
