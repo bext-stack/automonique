@@ -67,6 +67,10 @@ claude_model=${AUTOMONIQUE_FLEET_CLAUDE_MODEL:-}
 codex_binary=${AUTOMONIQUE_FLEET_CODEX_BINARY:-}
 escalate_effort_after=${AUTOMONIQUE_FLEET_ESCALATE_EFFORT_AFTER:-2}
 [[ "$escalate_effort_after" =~ ^[1-9][0-9]{0,2}$ ]] || escalate_effort_after=2
+# How long a run on Claude may last and still be handed back to the worker's
+# own engine when Claude turns out unable to serve it.
+fallback_window_seconds=${AUTOMONIQUE_FLEET_FALLBACK_WINDOW_SECONDS:-180}
+[[ "$fallback_window_seconds" =~ ^[1-9][0-9]{0,3}$ ]] || fallback_window_seconds=180
 escalate_engine_after=${AUTOMONIQUE_FLEET_ESCALATE_ENGINE_AFTER:-4}
 [[ "$escalate_engine_after" =~ ^[1-9][0-9]{0,2}$ ]] || escalate_engine_after=4
 triage_model=${AUTOMONIQUE_FLEET_TRIAGE_MODEL:-haiku}
@@ -318,6 +322,13 @@ refresh_claude_route_note() {
     else
         claude_route_cached='claude signed out'
     fi
+    if load_job_codex_account; then
+        if job_codex_signed_in; then
+            claude_route_cached="$claude_route_cached; codex ready"
+        else
+            claude_route_cached="$claude_route_cached; codex signed out"
+        fi
+    fi
     claude_route_revision=$revision
     claude_route_checked=$now
     claude_route_note=$claude_route_cached
@@ -384,6 +395,19 @@ use_job_codex() {
     job_engine_reason=$1
 }
 
+# Whether a run on the second engine ended because that engine could not serve
+# at all: its subscription limit, an overload, or a lost sign-in. Read from the
+# run's own output, never from the ticket.
+alternate_engine_unavailable() {
+    local output_file=$1 error_file=$2
+    local pattern='usage limit|rate limit|limit reached|out of (extra )?usage|credit balance|overloaded|not logged in|please run /login|authentication[_ ]error|oauth token.*expired|quota'
+    jq -ers --arg pattern "$pattern" '
+        any(.[]; (.type == "result" and .is_error == true and ((.result // "") | ascii_downcase | test($pattern)))
+              or ((.type == "error" or .type == "turn.failed") and ((.message // .error.message // "") | ascii_downcase | test($pattern))))
+    ' "$output_file" >/dev/null 2>&1 \
+        || grep -Eqi "$pattern" "$error_file"
+}
+
 # The higher of two efforts; an empty one loses.
 effort_rank() {
     case "$1" in
@@ -406,14 +430,19 @@ job_engine_reason=
 job_engine_alternate=0
 job_model=
 job_effort=
+# 1 when the ticket or its project named the engine: such a job never changes
+# engine, whatever happens to the run.
+job_engine_named=0
 select_job_engine() {
     local requested=$1 prompt=$2 requested_model=${3:-} requested_effort=${4:-} prior_runs=${5:-0}
     local verdict engine reason triaged_effort claude_ready=0
     job_engine_reason=
     job_engine_alternate=0
+    job_engine_named=0
     job_model=
     job_effort=$requested_effort
     [[ "$provider_engine" == jcode ]] || return 0
+    [[ -z "$requested" ]] || job_engine_named=1
     case "$requested" in
         jcode)
             job_engine_reason='asked for by the ticket or its project'
@@ -1564,100 +1593,125 @@ run_job() {
     report_job "$job_id" running "${selected_provider} started by Monique." || return
     post_job_log "$job_id" lifecycle "${selected_provider} started by Monique.${job_engine_reason:+ Engine: $job_engine_reason.}${job_model:+ Model: $job_model.}${job_effort:+ Effort: $job_effort.}"
 
-    # Each provider is started through `setsid`: it becomes the leader of its
-    # own session and process group, whose id is the pid recorded below. A
-    # background pipeline member of a script is never a group leader, so
-    # setsid execs in place and `$!` is the provider itself.
-    started_ms=$(date +%s%3N)
-    set +e
-    # A model and an effort reach the provider only when the job carries them;
-    # otherwise each engine keeps its own configured default.
-    if [[ "$selected_provider" == codex ]]; then
-        codex_arguments=()
-        [[ -z "$job_model" ]] || codex_arguments+=(-m "$job_model")
-        [[ -z "$job_effort" ]] || codex_arguments+=(-c "model_reasoning_effort=\"$job_effort\"")
-        printf '%s\n' "$provider_prompt" \
-            | CODEX_HOME="$selected_home" setsid "$selected_binary" exec \
-                --json \
-                --dangerously-bypass-approvals-and-sandbox \
-                --skip-git-repo-check \
-                "${codex_arguments[@]}" \
-                -C "$cwd" \
-                - >"$output" 2>"$error_output" &
-    elif [[ "$selected_provider" == jcode ]]; then
-        cd -- "$cwd" || {
-            set -u
-            report_job "$job_id" failed 'JCode could not enter the selected workspace.' || true
-            return
-        }
-        jcode_arguments=()
-        [[ -z "$job_model" ]] || jcode_arguments+=(--model "$job_model")
-        if [[ -n "$job_effort" ]]; then
-            # This subshell runs one job, so the override ends with it.
-            export JCODE_OPENAI_REASONING_EFFORT="$job_effort" JCODE_ANTHROPIC_REASONING_EFFORT="$job_effort"
+    # One run, or two: a job the worker itself routed to Claude goes back to
+    # the worker's own engine when Claude could not serve it (subscription
+    # limit, overload, lost sign-in) and failed before doing any real work.
+    # A job that named its engine is never moved.
+    fallback_attempted=0
+    while :; do
+        # Each provider is started through `setsid`: it becomes the leader of its
+        # own session and process group, whose id is the pid recorded below. A
+        # background pipeline member of a script is never a group leader, so
+        # setsid execs in place and `$!` is the provider itself.
+        started_ms=$(date +%s%3N)
+        set +e
+        # A model and an effort reach the provider only when the job carries them;
+        # otherwise each engine keeps its own configured default.
+        if [[ "$selected_provider" == codex ]]; then
+            codex_arguments=()
+            [[ -z "$job_model" ]] || codex_arguments+=(-m "$job_model")
+            [[ -z "$job_effort" ]] || codex_arguments+=(-c "model_reasoning_effort=\"$job_effort\"")
+            printf '%s\n' "$provider_prompt" \
+                | CODEX_HOME="$selected_home" setsid "$selected_binary" exec \
+                    --json \
+                    --dangerously-bypass-approvals-and-sandbox \
+                    --skip-git-repo-check \
+                    "${codex_arguments[@]}" \
+                    -C "$cwd" \
+                    - >"$output" 2>"$error_output" &
+        elif [[ "$selected_provider" == jcode ]]; then
+            cd -- "$cwd" || {
+                set -u
+                report_job "$job_id" failed 'JCode could not enter the selected workspace.' || true
+                return
+            }
+            jcode_arguments=()
+            [[ -z "$job_model" ]] || jcode_arguments+=(--model "$job_model")
+            if [[ -n "$job_effort" ]]; then
+                # This subshell runs one job, so the override ends with it.
+                export JCODE_OPENAI_REASONING_EFFORT="$job_effort" JCODE_ANTHROPIC_REASONING_EFFORT="$job_effort"
+            fi
+            printf '%s\n' "$provider_prompt" \
+                | JCODE_HOME="$selected_home" \
+                    JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
+                    JCODE_SERVER_EXECUTABLE="$selected_binary" \
+                    setsid "$selected_binary" --quiet --no-update --no-selfdev "${jcode_arguments[@]}" run --ndjson \
+                        --disabled-tools browser,swarm,integration_tools - \
+                    >"$output" 2>"$error_output" &
+        else
+            cd -- "$cwd" || {
+                set -u
+                report_job "$job_id" failed 'Claude could not enter the selected workspace.' || true
+                return
+            }
+            claude_arguments=(--print --output-format stream-json --verbose --dangerously-skip-permissions)
+            if [[ -n "$job_model" ]]; then
+                claude_arguments+=(--model "$job_model")
+            elif [[ -n "$claude_model" ]]; then
+                claude_arguments+=(--model "$claude_model")
+            fi
+            [[ -z "$job_effort" ]] || claude_arguments+=(--effort "$job_effort")
+            printf '%s\n' "$provider_prompt" \
+                | CLAUDE_CONFIG_DIR="$selected_home" setsid "$selected_binary" \
+                    "${claude_arguments[@]}" \
+                    >"$output" 2>"$error_output" &
         fi
-        printf '%s\n' "$provider_prompt" \
-            | JCODE_HOME="$selected_home" \
-                JCODE_RUNTIME_DIR="$runtime_dir/jcode-runtime" \
-                JCODE_SERVER_EXECUTABLE="$selected_binary" \
-                setsid "$selected_binary" --quiet --no-update --no-selfdev "${jcode_arguments[@]}" run --ndjson \
-                    --disabled-tools browser,swarm,integration_tools - \
-                >"$output" 2>"$error_output" &
-    else
-        cd -- "$cwd" || {
-            set -u
-            report_job "$job_id" failed 'Claude could not enter the selected workspace.' || true
-            return
-        }
-        claude_arguments=(--print --output-format stream-json --verbose --dangerously-skip-permissions)
-        if [[ -n "$job_model" ]]; then
-            claude_arguments+=(--model "$job_model")
-        elif [[ -n "$claude_model" ]]; then
-            claude_arguments+=(--model "$claude_model")
+        provider_pid=$!
+        watchdog_pid=
+        trap abort_job_run TERM
+        start_job_watchdog
+        wait_for_provider "$provider_pid"
+        provider_status=$?
+        duration_ms=$(( $(date +%s%3N) - started_ms ))
+        # Disarm the limit. A watchdog that already fired ignores this and is
+        # waited for, so the stop it started is complete before the report.
+        kill "$watchdog_pid" 2>/dev/null
+        wait "$watchdog_pid" 2>/dev/null
+        # Agents leave type-check daemons and headless browsers behind. Whatever is
+        # still in this run's process group goes now, whichever way the run ended.
+        if process_group_alive "$provider_pid"; then
+            printf 'job %s left processes behind; stopping its process group\n' "$job_id" >&2
+            terminate_process_group "$provider_pid"
         fi
-        [[ -z "$job_effort" ]] || claude_arguments+=(--effort "$job_effort")
-        printf '%s\n' "$provider_prompt" \
-            | CLAUDE_CONFIG_DIR="$selected_home" setsid "$selected_binary" \
-                "${claude_arguments[@]}" \
-                >"$output" 2>"$error_output" &
-    fi
-    provider_pid=$!
-    watchdog_pid=
-    trap abort_job_run TERM
-    start_job_watchdog
-    wait_for_provider "$provider_pid"
-    provider_status=$?
-    duration_ms=$(( $(date +%s%3N) - started_ms ))
-    # Disarm the limit. A watchdog that already fired ignores this and is
-    # waited for, so the stop it started is complete before the report.
-    kill "$watchdog_pid" 2>/dev/null
-    wait "$watchdog_pid" 2>/dev/null
-    # Agents leave type-check daemons and headless browsers behind. Whatever is
-    # still in this run's process group goes now, whichever way the run ended.
-    if process_group_alive "$provider_pid"; then
-        printf 'job %s left processes behind; stopping its process group\n' "$job_id" >&2
-        terminate_process_group "$provider_pid"
-    fi
-    trap - TERM
-    set -u
+        trap - TERM
+        set -u
 
-    if [[ "$selected_provider" == codex ]]; then
-        session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
-        result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
-    elif [[ "$selected_provider" == jcode ]]; then
-        session_id=$(jq -rs '[.[] | select(.type == "done") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
-        result=$(jq -rs '[.[] | select(.type == "done") | .text] | last // ""' "$output" 2>/dev/null) || result=
-    else
-        session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
-        result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
-    fi
-    # The limit counts only when the watchdog really stopped the run; a
-    # provider that delivered its answer as the limit fell is a finished run.
-    timed_out=false
-    if [[ -e "$timeout_marker" ]] && ! { (( provider_status == 0 )) && [[ -n "$result" ]]; }; then
-        timed_out=true
-    fi
-    rm -f -- "$timeout_marker"
+        if [[ "$selected_provider" == codex ]]; then
+            session_id=$(jq -rs '[.[] | select(.type == "thread.started") | .thread_id] | first // ""' "$output" 2>/dev/null) || session_id=
+            result=$(jq -rs '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$output" 2>/dev/null) || result=
+        elif [[ "$selected_provider" == jcode ]]; then
+            session_id=$(jq -rs '[.[] | select(.type == "done") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
+            result=$(jq -rs '[.[] | select(.type == "done") | .text] | last // ""' "$output" 2>/dev/null) || result=
+        else
+            session_id=$(jq -rs '[.[] | select(.type == "result") | .session_id] | last // ""' "$output" 2>/dev/null) || session_id=
+            result=$(jq -rs '[.[] | select(.type == "result") | .result] | last // ""' "$output" 2>/dev/null) || result=
+        fi
+        # The limit counts only when the watchdog really stopped the run; a
+        # provider that delivered its answer as the limit fell is a finished run.
+        timed_out=false
+        if [[ -e "$timeout_marker" ]] && ! { (( provider_status == 0 )) && [[ -n "$result" ]]; }; then
+            timed_out=true
+        fi
+        rm -f -- "$timeout_marker"
+        if (( fallback_attempted == 0 && job_engine_alternate == 1 && job_engine_named == 0 )) \
+            && (( provider_status != 0 )) && [[ "$timed_out" != true ]] \
+            && (( duration_ms < fallback_window_seconds * 1000 )) \
+            && alternate_engine_unavailable "$output" "$error_output"; then
+            fallback_attempted=1
+            failed_provider=$selected_provider
+            post_job_log "$job_id" lifecycle "${failed_provider} could not serve this run (limit or sign-in); continuing on ${provider_engine}."
+            load_selected_account || break
+            job_engine_alternate=0
+            job_model=
+            job_engine_reason="fell back from ${failed_provider}: it could not serve the run"
+            export MONIQUE_ARTIFACT_AGENT="$selected_provider"
+            : >"$output"
+            : >"$error_output"
+            report_job "$job_id" running "${selected_provider} started by Monique." || return
+            continue
+        fi
+        break
+    done
     telemetry=$(run_telemetry "$output" "$duration_ms" "$timed_out") || telemetry='{}'
     [[ -n "$telemetry" ]] || telemetry='{}'
     # A run stopped before its final event still named its session when it
