@@ -19,6 +19,10 @@
 //! end=automonique.shot-login/v1
 //! ```
 //!
+//! `--login-site <id>` names the site whose space the session opens on, for
+//! an application that keeps several; it travels as `site_id` in the request
+//! and the service decides whether the account may enter it.
+//!
 //! The file is looked up by the host being captured and by nothing else, so
 //! a session can only ever be presented to the host it was configured for.
 //! The service answers `{"cookie":{"name","value","path","secure",
@@ -46,6 +50,18 @@ const MAX_ENDPOINT_BYTES: usize = 512;
 const MAX_COOKIE_NAME_BYTES: usize = 128;
 const MAX_COOKIE_VALUE_BYTES: usize = 8 * 1024;
 const MAX_COOKIE_PATH_BYTES: usize = 256;
+/// Longest site identifier accepted by `--login-site`.
+pub const MAX_SITE_BYTES: usize = 64;
+
+/// Whether `value` is an opaque site identifier: letters, digits and dashes.
+#[must_use]
+pub fn valid_site(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SITE_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
 
 /// A session cookie to present to the captured origin.
 #[derive(Clone, Eq, PartialEq)]
@@ -181,6 +197,7 @@ fn parse_cookie(body: &[u8]) -> Option<SessionCookie> {
 pub fn sign_in(
     state_dir: Option<&Path>,
     host: &str,
+    site: Option<&str>,
     transport: &dyn JsonPost,
 ) -> Result<SessionCookie, String> {
     let state_dir = state_dir
@@ -200,12 +217,17 @@ pub fn sign_in(
             }
         )
     })?;
+    let body = match site {
+        Some(site) if valid_site(site) => serde_json::json!({ "site_id": site }).to_string(),
+        Some(_) => return Err(String::from("--login-site is not a site identifier")),
+        None => String::from("{}"),
+    };
     let authorization = Zeroizing::new(format!("Bearer {}", config.token.as_str()));
     let reply = transport
         .post_json(
             &config.endpoint,
             &[("authorization", authorization.as_str())],
-            "{}",
+            &body,
         )
         .map_err(|failure| format!("login for {host} failed: {}", failure.reason()))?;
     if !(200..300).contains(&reply.status) {
@@ -257,7 +279,7 @@ mod tests {
     fn a_sign_in_presents_the_credential_once_and_reads_the_cookie() {
         let state = configured();
         let transport = FakePost::answering(200, REPLY);
-        let cookie = sign_in(Some(state.path()), HOST, &transport).expect("signs in");
+        let cookie = sign_in(Some(state.path()), HOST, None, &transport).expect("signs in");
         assert_eq!(cookie.name, "__Secure-authjs.session-token");
         assert_eq!(cookie.value.as_str(), "aaa.bbb.ccc");
         assert_eq!(cookie.path, "/");
@@ -275,16 +297,38 @@ mod tests {
     }
 
     #[test]
+    fn a_site_travels_as_data_and_is_refused_when_it_is_not_an_identifier() {
+        let state = configured();
+        let transport = FakePost::answering(200, REPLY);
+        let site = "019b03c2-ac41-74d3-8c53-5658f167b887";
+        sign_in(Some(state.path()), HOST, Some(site), &transport).expect("signs in");
+        sign_in(Some(state.path()), HOST, None, &transport).expect("signs in");
+        let sent = transport.sent.borrow();
+        assert_eq!(sent[0].body, format!(r#"{{"site_id":"{site}"}}"#));
+        assert_eq!(sent[1].body, "{}");
+        drop(sent);
+
+        let refused = FakePost::answering(200, REPLY);
+        for bad in ["", "a b", "x\",\"y", &"a".repeat(MAX_SITE_BYTES + 1)] {
+            assert_eq!(
+                sign_in(Some(state.path()), HOST, Some(bad), &refused).unwrap_err(),
+                "--login-site is not a site identifier"
+            );
+        }
+        assert_eq!(refused.calls(), 0);
+    }
+
+    #[test]
     fn the_configuration_is_found_by_host_only_and_must_be_private() {
         let state = configured();
         let transport = FakePost::answering(200, REPLY);
         assert_eq!(
-            sign_in(Some(state.path()), "other.example", &transport).unwrap_err(),
+            sign_in(Some(state.path()), "other.example", None, &transport).unwrap_err(),
             "login is not configured for other.example"
         );
-        assert!(sign_in(Some(state.path()), "MANAGE.example", &transport).is_ok());
+        assert!(sign_in(Some(state.path()), "MANAGE.example", None, &transport).is_ok());
         assert_eq!(
-            sign_in(None, HOST, &transport).unwrap_err(),
+            sign_in(None, HOST, None, &transport).unwrap_err(),
             "login needs the state directory, which is not set"
         );
 
@@ -293,7 +337,7 @@ mod tests {
         let readable = state_with(HOST, &conf(&[&endpoint, &token]), 0o640);
         let refused = FakePost::answering(200, REPLY);
         assert_eq!(
-            sign_in(Some(readable.path()), HOST, &refused).unwrap_err(),
+            sign_in(Some(readable.path()), HOST, None, &refused).unwrap_err(),
             "login configuration for manage.example is not a private owner-only regular file"
         );
         assert_eq!(refused.calls(), 0);
@@ -316,7 +360,7 @@ mod tests {
             let state = state_with(HOST, &conf(&lines), 0o600);
             let transport = FakePost::answering(200, REPLY);
             assert_eq!(
-                sign_in(Some(state.path()), HOST, &transport).unwrap_err(),
+                sign_in(Some(state.path()), HOST, None, &transport).unwrap_err(),
                 "login configuration for manage.example is malformed",
                 "{lines:?}"
             );
@@ -329,12 +373,12 @@ mod tests {
         let state = configured();
         let refused = FakePost::answering(403, r#"{"error":{"code":"forbidden"}}"#);
         assert_eq!(
-            sign_in(Some(state.path()), HOST, &refused).unwrap_err(),
+            sign_in(Some(state.path()), HOST, None, &refused).unwrap_err(),
             "login for manage.example was refused by the sign-in service (HTTP 403)"
         );
         let down = FakePost::failing(PostFailure::TimedOut);
         assert_eq!(
-            sign_in(Some(state.path()), HOST, &down).unwrap_err(),
+            sign_in(Some(state.path()), HOST, None, &down).unwrap_err(),
             "login for manage.example failed: the service did not answer in time"
         );
         for body in [
@@ -347,7 +391,7 @@ mod tests {
         ] {
             let transport = FakePost::answering(200, body);
             assert_eq!(
-                sign_in(Some(state.path()), HOST, &transport).unwrap_err(),
+                sign_in(Some(state.path()), HOST, None, &transport).unwrap_err(),
                 "login for manage.example returned no usable session cookie",
                 "{body}"
             );

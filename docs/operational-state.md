@@ -269,6 +269,8 @@ host being captured (the `--host` virtual host when one is pinned) it reads
 application's own sign-in service, and presents the short-lived session cookie
 it gets back to that host only, whatever the answer says about a domain. A host
 with no file fails with `MONIQUE_SHOT_FAIL: login is not configured for <host>`.
+`--login-site <id>` (which implies `--login`) sends `{"site_id":"<id>"}` so an
+application with several spaces opens the session on that site's.
 `endpoint` must be `https://`; the service answers
 `{"cookie":{"name","value","path","secure","http_only","same_site"}}`:
 

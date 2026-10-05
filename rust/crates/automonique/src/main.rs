@@ -647,7 +647,8 @@ fn ask_command(values: Vec<std::ffi::OsString>) -> ExitCode {
 ///
 /// `--login` captures a screen behind a sign-in: for a host configured in
 /// `shot/logins/<host>.conf` in the state directory, one short-lived session
-/// is obtained and presented to that host only.
+/// is obtained and presented to that host only. `--login-site <id>` opens it
+/// on one site's space for an application that keeps several.
 fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
     use automonique_daemon::shot::{FAIL_MARKER, OK_MARKER, capture, find_browser, parse};
     let stamp = SystemTime::now()
@@ -660,7 +661,7 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
         Err(reason) => {
             println!("{FAIL_MARKER} {reason}");
             eprintln!(
-                "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S] [--login]"
+                "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S] [--login] [--login-site ID]"
             );
             eprintln!(
                 "       interactions, applied in the order given: [--wait-for CSS] [--click CSS] [--hover CSS] [--scroll-to CSS]"
@@ -686,7 +687,12 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
             return ExitCode::from(2);
         };
         let transport = LivePost::https(REQUEST_TIMEOUT, MAX_RESPONSE_BYTES);
-        match sign_in(state_dir_from_environment().as_deref(), &host, &transport) {
+        match sign_in(
+            state_dir_from_environment().as_deref(),
+            &host,
+            request.login_site.as_deref(),
+            &transport,
+        ) {
             Ok(cookie) => request.cookie = Some(cookie),
             Err(reason) => {
                 println!("{FAIL_MARKER} {reason}");

@@ -116,6 +116,8 @@ pub struct ShotRequest {
     /// Capture signed in (`--login`): the caller resolves [`Self::cookie`]
     /// with `shot_login::sign_in` for [`Self::login_host`] before capturing.
     pub login: bool,
+    /// The site whose space the session opens on (`--login-site`).
+    pub login_site: Option<String>,
     /// The session cookie presented to the captured origin.
     pub cookie: Option<crate::shot_login::SessionCookie>,
 }
@@ -143,7 +145,7 @@ pub struct ShotOutcome {
     pub bytes: u64,
 }
 
-/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S] [--login]`
+/// Parse `shot <url> [--out PATH] [--host H] [--width N] [--height N] [--full] [--timeout S] [--login] [--login-site ID]`
 /// and the interaction options `[--wait-for CSS] [--click CSS] [--hover CSS]
 /// [--scroll-to CSS]` (repeatable, kept in the order given), `[--selector CSS]`,
 /// `[--wait-ms N]` and `[--timeout-ms N]`.
@@ -160,6 +162,7 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
     let mut action_timeout = Duration::from_millis(DEFAULT_ACTION_TIMEOUT_MS);
     let mut settle = None;
     let mut login = false;
+    let mut login_site = None;
     let mut values = values.iter();
     while let Some(value) = values.next() {
         let text = value
@@ -186,6 +189,15 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
             "--height" => height = dimension(values.next(), "--height")?,
             "--full" => full = true,
             "--login" => login = true,
+            "--login-site" => {
+                let site = values
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .filter(|site| crate::shot_login::valid_site(site))
+                    .ok_or_else(|| String::from("--login-site needs a site identifier"))?;
+                login = true;
+                login_site = Some(site.to_owned());
+            }
             "--timeout" => {
                 let seconds: u64 = values
                     .next()
@@ -265,6 +277,7 @@ pub fn parse(values: &[OsString], default_out: PathBuf) -> Result<ShotRequest, S
         action_timeout,
         settle,
         login,
+        login_site,
         cookie: None,
     })
 }
@@ -582,6 +595,26 @@ mod tests {
         assert!(signed.login && signed.interactive());
         assert!(signed.cookie.is_none());
         assert_eq!(signed.login_host(), Some("manage.example"));
+
+        let sited = parse(
+            &args(&[
+                "https://manage.example/manage",
+                "--login-site",
+                "019b03c2-ac41",
+            ]),
+            out.clone(),
+        )
+        .expect("parses");
+        assert!(sited.login);
+        assert_eq!(sited.login_site.as_deref(), Some("019b03c2-ac41"));
+        assert_eq!(
+            parse(
+                &args(&["https://manage.example/", "--login-site", "a b"]),
+                out.clone()
+            )
+            .unwrap_err(),
+            "--login-site needs a site identifier"
+        );
 
         let pinned = parse(
             &args(&[
