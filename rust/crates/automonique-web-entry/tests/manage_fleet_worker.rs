@@ -41,6 +41,7 @@ mode=${mode#MODE:}
 dir=${FAKE_PROVIDER_DIR:?}
 printf '%s\n' "$$" >"$dir/$mode.pid"
 printf '%s\n' "$*" >"$dir/$mode.args"
+printf '%s\n' "${JCODE_OPENAI_REASONING_EFFORT:-}" >"$dir/$mode.effort"
 printf '%s\n' "{\"type\":\"start\",\"model\":\"fake-model-1\",\"provider\":\"FakeAI\",\"session_id\":\"session_fake_$mode\"}"
 printf '%s\n' '{"type":"tokens","input":100,"output":7,"cache_read_input":60,"cache_creation_input":null}'
 printf '%s\n' '{"type":"tool_start","name":"bash","id":"call_1"}'
@@ -92,6 +93,7 @@ if [[ "$*" == *"--tools"* ]]; then
     printf '%s\n' "$*" >>"$dir/claude-triage.args"
     case "$prompt" in
         *ROUTE:claude*) answer='Here it is: {\"engine\":\"claude\",\"reason\":\"new tool to build\"}' ;;
+        *ROUTE:hard*) answer='{\"engine\":\"jcode\",\"effort\":\"high\",\"reason\":\"bug with unknown cause\"}' ;;
         *ROUTE:jcode*) answer='{\"engine\":\"jcode\",\"reason\":\"scoped fix\"}' ;;
         *ROUTE:other*) answer='{\"engine\":\"codex\",\"reason\":\"not an engine of this worker\"}' ;;
         *) answer='I cannot tell.' ;;
@@ -104,6 +106,57 @@ printf '%s\n' "$CLAUDE_CONFIG_DIR" >"$dir/claude-run.home"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude_session_1","model":"fake-claude-1"}'
 printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude_session_1","result":"Finished. https://github.com/example/repo/issues/1#issuecomment-5","total_cost_usd":0.25,"num_turns":4,"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}'
 "#;
+
+/// Stand-in for Codex, the third engine a job can ask for by name. It is signed
+/// in while `codex-signed-in` exists.
+const FAKE_CODEX: &str = r#"#!/usr/bin/env bash
+dir=${FAKE_PROVIDER_DIR:?}
+if [[ "$*" == "login status" ]]; then
+    if [[ -e "$dir/codex-signed-in" ]]; then
+        printf '%s\n' 'Logged in using ChatGPT'
+        exit 0
+    fi
+    printf '%s\n' 'Not logged in'
+    exit 1
+fi
+cat >/dev/null
+printf '%s\n' "$*" >>"$dir/codex-run.args"
+printf '%s\n' "$CODEX_HOME" >"$dir/codex-run.home"
+printf '%s\n' '{"type":"thread.started","thread_id":"codex_thread_1"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Finished. https://github.com/example/repo/issues/1#issuecomment-5"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":50,"cached_input_tokens":20,"output_tokens":9}}'
+"#;
+const CODEX_ACCOUNT: &str = "acct-89abcdef0123456789abcdef";
+
+/// A Claude account and a Codex account, both selected.
+fn install_both_accounts(root: &Path, codex_signed_in: bool) {
+    install_claude_account(root, true);
+    fs::create_dir_all(root.join("agent-auth/profiles").join(CODEX_ACCOUNT)).expect("profile");
+    fs::write(
+        root.join("agent-auth/accounts.json"),
+        json!({
+            "schema": "automonique.agent-accounts/v1",
+            "worker_provider": "codex",
+            "selected": {"claude": CLAUDE_ACCOUNT, "codex": CODEX_ACCOUNT},
+            "accounts": [
+                {"id": CLAUDE_ACCOUNT, "provider": "claude", "label": "Test Claude"},
+                {"id": CODEX_ACCOUNT, "provider": "codex", "label": "Test Codex"},
+            ],
+        })
+        .to_string(),
+    )
+    .expect("account registry");
+    executable(&root.join("bin/codex"), FAKE_CODEX);
+    if codex_signed_in {
+        fs::write(root.join("pids/codex-signed-in"), "").expect("signed-in marker");
+    }
+}
+const THIRD_ENGINE: &[(&str, &str)] = &[
+    ("AUTOMONIQUE_AGENT_AUTH_DIR", "{root}/agent-auth"),
+    ("AUTOMONIQUE_FLEET_CLAUDE_BINARY", "{root}/bin/claude"),
+    ("AUTOMONIQUE_FLEET_CODEX_BINARY", "{root}/bin/codex"),
+    ("AUTOMONIQUE_FLEET_CONCURRENCY", "1"),
+];
 
 /// The account directory the dashboard writes: one Claude account, selected.
 const CLAUDE_ACCOUNT: &str = "acct-0123456789abcdef01234567";
@@ -204,6 +257,18 @@ impl Platform {
         });
         if let Some(engine) = engine {
             job["engine"] = json!(engine);
+        }
+        self.state.lock().unwrap().queue.push_back(job);
+    }
+
+    /// A job with the routing fields Manage resolved for it, as given.
+    fn queue_job_with(&self, id: &str, mode: &str, route: &str, fields: Value) {
+        let mut job = json!({
+            "id": id,
+            "prompt": format!("Handle the ticket. MODE:{mode} ROUTE:{route}"),
+        });
+        for (key, value) in fields.as_object().expect("an object") {
+            job[key] = value.clone();
         }
         self.state.lock().unwrap().queue.push_back(job);
     }
@@ -692,6 +757,152 @@ fn an_unmarked_ticket_is_triaged_and_a_ticket_that_names_jcode_is_not() {
             .unwrap()
             .lines()
             .count()
+    );
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn a_ticket_can_name_codex_its_model_and_its_effort() {
+    let codex = job_id(30);
+    let claude = job_id(31);
+    let mut worker = Worker::start(THIRD_ENGINE, |platform, root| {
+        install_both_accounts(root, true);
+        platform.queue_job_with(
+            &codex,
+            "done",
+            "claude",
+            json!({"engine": "codex", "model": "gpt-test-9", "effort": "high", "prior_runs": 9}),
+        );
+        platform.queue_job_with(
+            &claude,
+            "done",
+            "jcode",
+            json!({"engine": "claude", "model": "opus-test[1m]", "effort": "xhigh"}),
+        );
+    });
+
+    let report = worker.terminal_report(&codex);
+    assert_eq!("done", report["status"], "{report}");
+    assert_eq!("codex", report["agent"], "{report}");
+    assert_eq!("high", report["effort"], "{report}");
+    assert_eq!("gpt-test-9", report["model"], "{report}");
+    assert_eq!("codex_thread_1", report["session_id"], "{report}");
+    assert_eq!(
+        "asked for by the ticket or its project", report["engine_reason"],
+        "{report}"
+    );
+    let pids = worker.root.path().join("pids");
+    let arguments = fs::read_to_string(pids.join("codex-run.args")).unwrap();
+    assert!(arguments.contains("-m gpt-test-9"), "{arguments}");
+    assert!(
+        arguments.contains("-c model_reasoning_effort=\"high\""),
+        "{arguments}"
+    );
+    let home = fs::read_to_string(pids.join("codex-run.home")).unwrap();
+    assert!(home.trim_end().ends_with(CODEX_ACCOUNT), "{home}");
+
+    let report = worker.terminal_report(&claude);
+    assert_eq!("claude", report["agent"], "{report}");
+    assert_eq!("xhigh", report["effort"], "{report}");
+    let arguments = fs::read_to_string(pids.join("claude-run.args")).unwrap();
+    assert!(
+        arguments.contains("--model opus-test[1m] --effort xhigh"),
+        "{arguments}"
+    );
+    // Neither request was triaged, and JCode never started.
+    assert!(!pids.join("claude-triage.args").exists());
+    assert!(!pids.join("done.pid").exists());
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn a_signed_out_codex_account_fails_the_ticket_that_asks_for_it() {
+    let asked = job_id(32);
+    let mut worker = Worker::start(THIRD_ENGINE, |platform, root| {
+        install_both_accounts(root, false);
+        platform.queue_job_with(&asked, "done", "jcode", json!({"engine": "codex"}));
+    });
+    let report = worker.terminal_report(&asked);
+    assert_eq!("failed", report["status"], "{report}");
+    assert!(
+        report["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("This ticket asks for Codex"),
+        "{report}"
+    );
+    assert!(worker.stop().success());
+}
+
+#[test]
+fn triage_names_the_effort_and_a_ticket_that_keeps_coming_back_is_escalated() {
+    let hard = job_id(33);
+    let third_run = job_id(34);
+    let fifth_run = job_id(35);
+    let pinned = job_id(36);
+    let mut worker = Worker::start(THIRD_ENGINE, |platform, root| {
+        install_both_accounts(root, true);
+        platform.queue_job_with(&hard, "done", "hard", json!({}));
+        platform.queue_job_with(&third_run, "slow", "jcode", json!({"prior_runs": 2}));
+        platform.queue_job_with(&fifth_run, "leftover", "jcode", json!({"prior_runs": 4}));
+        platform.queue_job_with(
+            &pinned,
+            "done",
+            "claude",
+            json!({"engine": "jcode", "effort": "low", "prior_runs": 9}),
+        );
+    });
+    let pids = worker.root.path().join("pids");
+
+    // The triage's effort reaches the engine it chose.
+    let report = worker.terminal_report(&hard);
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!("high", report["effort"], "{report}");
+    assert_eq!(
+        "triage: bug with unknown cause", report["engine_reason"],
+        "{report}"
+    );
+    assert_eq!(
+        "high",
+        fs::read_to_string(pids.join("done.effort")).unwrap().trim()
+    );
+
+    // A third run on the same ticket thinks harder, on the same engine.
+    let report = worker.terminal_report(&third_run);
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!("high", report["effort"], "{report}");
+    assert_eq!(
+        "triage: scoped fix; effort raised: run 3 on this ticket", report["engine_reason"],
+        "{report}"
+    );
+    assert_eq!(
+        "high",
+        fs::read_to_string(pids.join("slow.effort")).unwrap().trim()
+    );
+
+    // A fifth run moves to Claude at the highest effort.
+    let report = worker.terminal_report(&fifth_run);
+    assert_eq!("claude", report["agent"], "{report}");
+    assert_eq!("xhigh", report["effort"], "{report}");
+    assert_eq!(
+        "escalated: run 5 on this ticket", report["engine_reason"],
+        "{report}"
+    );
+    assert!(!pids.join("leftover.pid").exists());
+    let arguments = fs::read_to_string(pids.join("claude-run.args")).unwrap();
+    assert!(arguments.contains("--effort xhigh"), "{arguments}");
+
+    // What the ticket or its project named is never escalated.
+    let report = worker.terminal_report(&pinned);
+    assert_eq!("jcode", report["agent"], "{report}");
+    assert_eq!("low", report["effort"], "{report}");
+    assert_eq!(
+        "asked for by the ticket or its project", report["engine_reason"],
+        "{report}"
+    );
+    assert_eq!(
+        "low",
+        fs::read_to_string(pids.join("done.effort")).unwrap().trim()
     );
     assert!(worker.stop().success());
 }

@@ -22,6 +22,7 @@ Environment=AUTOMONIQUE_FLEET_CONCURRENCY=3
 Environment=AUTOMONIQUE_PLATFORM_ENDPOINT=http://127.0.0.1:18082
 Environment=AUTOMONIQUE_AGENT_AUTH_DIR=%S/automonique/agent-auth
 Environment=AUTOMONIQUE_FLEET_CLAUDE_BINARY=%h/.local/bin/claude
+Environment=AUTOMONIQUE_FLEET_CODEX_BINARY=%h/.local/bin/codex
 # Legacy fallback used only until the native account registry has an explicit
 # worker selection. New Codex and Claude accounts use private isolated profiles.
 # Environment=AUTOMONIQUE_FLEET_CODEX_HOME=%h/.codex
