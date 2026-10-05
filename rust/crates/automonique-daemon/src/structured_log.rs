@@ -16,6 +16,8 @@ pub(crate) const WORKER_FAULT_MESSAGE_ID: &str = "5d3f0b7a9c1e4e0b8a6f2d9c4b1e7a
 pub(crate) const WORKER_FAULT_EVENT: &str = "worker_fault";
 pub(crate) const STALE_APPROVAL_MESSAGE_ID: &str = "9a4e61c2b7d84f0e8c35d1a6f2b97e04";
 pub(crate) const STALE_APPROVAL_EVENT: &str = "stale_approval_settled";
+pub(crate) const TICKET_STATUS_READ_MESSAGE_ID: &str = "4f8a2c6d1e9b47a3b5c07d2e8f61a9c3";
+pub(crate) const TICKET_STATUS_READ_EVENT: &str = "ticket_status_read";
 pub(crate) const RENEWAL_DEFERRED_MESSAGE_ID: &str = "0b1c7d5e2a9f4b6c8d3e1f7a5c9b2d40";
 pub(crate) const RENEWAL_DEFERRED_EVENT: &str = "lease_renewal_deferred";
 pub(crate) const TEMPFS_RECONCILED_MESSAGE_ID: &str = "db1313b593ad4bbe907a22f790c6b8f6";
@@ -97,6 +99,67 @@ fn emit_stale_approval_to(socket_path: &Path, outcome: &str, category: &str) -> 
          AUTOMONIQUE_EVENT={STALE_APPROVAL_EVENT}\n\
          AUTOMONIQUE_STALE_APPROVAL_OUTCOME={outcome}\n\
          AUTOMONIQUE_FAULT_CATEGORY={category}\n"
+    );
+    emit_to(socket_path, &event)
+}
+
+/// A ticket job's status could not be read from Manage, or can be read again.
+///
+/// `outcome` is `unreadable` (warning) or `readable_again` (informational);
+/// `category` says why the read failed and `failures` how many reads in a row
+/// have. `job_id` is Manage's opaque job identifier: it is the only handle an
+/// operator has on a job whose completion reply and check mark are waiting on
+/// this read, and it names nothing a user typed.
+pub(crate) fn emit_ticket_status_read(
+    outcome: &str,
+    job_id: &str,
+    category: &str,
+    failures: u32,
+) -> io::Result<()> {
+    if std::env::var_os("JOURNAL_STREAM").is_none() {
+        return Ok(());
+    }
+    emit_ticket_status_read_to(
+        Path::new(JOURNAL_SOCKET),
+        outcome,
+        job_id,
+        category,
+        failures,
+    )
+}
+
+fn emit_ticket_status_read_to(
+    socket_path: &Path,
+    outcome: &str,
+    job_id: &str,
+    category: &str,
+    failures: u32,
+) -> io::Result<()> {
+    if !matches!(outcome, "unreadable" | "readable_again")
+        || !stable_identifier(job_id)
+        || !stable_vocabulary(category)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid ticket status read observation",
+        ));
+    }
+    let (message, priority) = if outcome == "unreadable" {
+        ("Automonique cannot read a ticket job's status", 4)
+    } else {
+        ("Automonique can read a ticket job's status again", 6)
+    };
+    let event = format!(
+        "MESSAGE={message}\n\
+         MESSAGE_ID={TICKET_STATUS_READ_MESSAGE_ID}\n\
+         PRIORITY={priority}\n\
+         SYSLOG_IDENTIFIER=automonique\n\
+         AUTOMONIQUE_SCHEMA={READY_SCHEMA}\n\
+         AUTOMONIQUE_EVENT={TICKET_STATUS_READ_EVENT}\n\
+         AUTOMONIQUE_TICKET_STATUS_READ={outcome}\n\
+         AUTOMONIQUE_JOB_ID={job_id}\n\
+         AUTOMONIQUE_FAULT_CATEGORY={category}\n\
+         AUTOMONIQUE_CONSECUTIVE_FAILURES={failures}\n"
     );
     emit_to(socket_path, &event)
 }
@@ -636,6 +699,40 @@ mod tests {
         }
         assert!(!event.contains("CONTENT="));
         assert!(!event.contains("TOKEN="));
+    }
+
+    #[test]
+    fn ticket_status_read_event_names_the_job_and_refuses_free_text() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("journal.sock");
+        let receiver = UnixDatagram::bind(&path).expect("journal receiver");
+        let job = "f95267b4-c3e3-4284-8097-5ae54ea54f62";
+
+        emit_ticket_status_read_to(&path, "unreadable", job, "field_out_of_bounds", 10)
+            .expect("structured event");
+        let mut bytes = [0_u8; MAX_EVENT_BYTES + 1];
+        let count = receiver.recv(&mut bytes).expect("event datagram");
+        let event = std::str::from_utf8(&bytes[..count]).expect("utf8 event");
+        assert!(event.starts_with("MESSAGE=Automonique cannot read a ticket job's status\n"));
+        assert!(event.contains("PRIORITY=4\n"));
+        assert!(event.contains("AUTOMONIQUE_EVENT=ticket_status_read\n"));
+        assert!(event.contains(&format!("AUTOMONIQUE_JOB_ID={job}\n")));
+        assert!(event.contains("AUTOMONIQUE_FAULT_CATEGORY=field_out_of_bounds\n"));
+        assert!(event.contains("AUTOMONIQUE_CONSECUTIVE_FAILURES=10\n"));
+
+        emit_ticket_status_read_to(&path, "readable_again", job, "recovered", 3)
+            .expect("structured event");
+        let count = receiver.recv(&mut bytes).expect("event datagram");
+        let event = std::str::from_utf8(&bytes[..count]).expect("utf8 event");
+        assert!(event.contains("PRIORITY=6\n"));
+
+        for (outcome, job_id, category) in [
+            ("unreadable", "job\nINJECTED=1", "job_missing"),
+            ("unreadable", job, "free text"),
+            ("sideways", job, "job_missing"),
+        ] {
+            assert!(emit_ticket_status_read_to(&path, outcome, job_id, category, 1).is_err());
+        }
     }
 
     #[test]
