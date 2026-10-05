@@ -717,8 +717,8 @@ publish_process_snapshot() {
         --arg provider "$selected_provider" \
         --arg auth "$(auth_health_status)" \
         --arg fleet_base "${fleet_base%/}" \
-        --argjson issue_links "$issue_links" \
-        --argjson output_map "$output_map" \
+        --slurpfile issue_links <(printf '%s' "$issue_links") \
+        --slurpfile output_map <(printf '%s' "$output_map") \
         --argjson concurrency "$max_concurrency" \
         --argjson observed "$observed_at" '
         def safe_text($limit):
@@ -773,7 +773,7 @@ publish_process_snapshot() {
                 status: (.status | safe_state),
                 source: (.source | safe_state),
                 issue_id: (.issue_id | safe_id),
-                issue_url: $issue_links[.id],
+                issue_url: $issue_links[0][.id],
                 manage_url: (if (.issue_id | type) == "string"
                     and (.issue_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
                     then ($fleet_base + "/manage/ai-operations/issues?issue=" + .issue_id)
@@ -790,15 +790,15 @@ publish_process_snapshot() {
                 decision_count: (if (.decisions | type) == "array" then (.decisions | length) else 0 end),
                 created_at: (.created_at | safe_text(64)),
                 updated_at: (.updated_at | safe_text(64)),
-                output: (($output_map[.id] // []) as $live
+                output: (($output_map[0][.id] // []) as $live
                     | (.result | output_text) as $final
-                    | if ($live | length) > 0 then $live[-12:]
-                      elif $final != null then [{
-                        at_ms: $observed,
+                    | if (.status == "done" or .status == "failed" or .status == "cancelled") and $final != null then ($live[-11:] + [{
+                        at_ms: (try (.updated_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 * 1000) catch $observed),
                         kind: "final",
                         text: $final,
                         truncated: ((.result | length) > 1000)
-                      }]
+                      }])
+                      elif ($live | length) > 0 then $live[-12:]
                       else [] end)
             } | select(.id != null)]
                 | sort_by(.updated_at // "") | reverse | .[:100]
@@ -1430,6 +1430,17 @@ run_job() {
         provider_prompt=$(printf '%s\n\n%s\n\n%s\n' "$prompt" "$local_brief" "$completion_receipt")
     else
         provider_prompt=$(printf '%s\n\n%s\n' "$prompt" "$completion_receipt")
+    fi
+    # Every provider receives the same artifact tool and provenance. Secrets stay
+    # in the private state frame; prompt text contains no credentials.
+    export MONIQUE_ARTIFACT_RUN_ID="$job_id"
+    export MONIQUE_ARTIFACT_ISSUE_URL="$expected_issue_url"
+    export MONIQUE_ARTIFACT_AGENT="$selected_provider"
+    artifact_tool="${AUTOMONIQUE_ARTIFACT_TOOL:-$(dirname -- "${BASH_SOURCE[0]}")/monique_artifact.py}"
+    if [[ -x "$artifact_tool" && -r "$state_dir/share/share.conf" ]]; then
+        export MONIQUE_ARTIFACT_TOOL="$artifact_tool"
+        artifact_brief=$'Monique deliverables: the executable at $MONIQUE_ARTIFACT_TOOL publishes report/file bundles using the private configured Share service. Use publish <directory> --title <title> for a new private bundle. Use download <id> <new-directory> to retrieve an existing bundle for revision. Use --artifact-id <id> to retain the same bundle and add a version. The run, ticket and agent are attached automatically. Include MONIQUE_ARTIFACT_ID and MONIQUE_ARTIFACT_URL from the receipt in your final answer. Do not make it public unless the user requested public sharing. Use template <path> --title <title> for a report scaffold; replace placeholders with verified results. Never put credentials in reports. Publishing a bundle does not complete the ticket or replace its completion receipt.'
+        provider_prompt=$(printf '%s\n\n%s\n' "$provider_prompt" "$artifact_brief")
     fi
     requested_cwd=$(jq -r '.cwd // ""' <<<"$job")
     cwd=$(workspace_for "$requested_cwd") || {

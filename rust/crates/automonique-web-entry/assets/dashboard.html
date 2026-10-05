@@ -7,11 +7,13 @@
     <meta name="color-scheme" content="dark light">
     <meta name="theme-color" id="theme-color" content="#0b0d10">
     <title>Monique</title>
-    <link rel="icon" href="/favicon.svg?v=5" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/dashboard.css?v=17">
+    <link rel="icon" href="/favicon.svg?v=ivory-red-1" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/dashboard.css?v=35">
     <script src="/assets/qrcode.js?v=1" defer></script>
     <script src="/assets/platform-cockpit-core.js?v=2" defer></script>
-    <script src="/assets/dashboard.js?v=19" defer></script>
+    <link rel="stylesheet" href="/assets/artifacts.css?v=6">
+    <script src="/assets/artifacts.js?v=8" defer></script>
+    <script src="/assets/dashboard.js?v=35" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -19,13 +21,14 @@
       <header class="topbar">
         <div class="topbar-inner">
           <a class="brand" href="#sessions" aria-label="Monique, open tasks">
-            <img class="brand-mark" src="/favicon.svg?v=5" width="26" height="26" alt="">
+            <img class="brand-mark" src="/favicon.svg?v=ivory-red-1" width="26" height="26" alt="">
             <span class="brand-name">Monique</span>
           </a>
           <nav class="tabs" aria-label="Main sections">
             <button class="tab is-active" type="button" data-view="sessions">Tasks<b class="tab-badge" id="tab-badge-sessions" hidden></b></button>
             <button class="tab" type="button" data-view="tickets">Tickets<b class="tab-badge" id="tab-badge-tickets" hidden></b></button>
             <button class="tab" type="button" data-view="operations">Agents<b class="tab-badge" id="tab-badge-operations" hidden></b></button>
+            <button class="tab" type="button" data-view="artifacts">Deliverables</button>
             <button class="tab" type="button" data-view="memory">Memory</button>
             <button class="tab" type="button" data-view="overview">Health<b class="tab-badge" id="tab-badge-overview" hidden></b></button>
             <button class="tab" type="button" data-view="configuration">Settings</button>
@@ -172,45 +175,64 @@
 
         <!-- ASSISTANT -->
         <section class="view" data-panel="chat" aria-labelledby="chat-title">
-          <div class="view-head">
-            <div class="view-title"><h1 id="chat-title">Assistant</h1><span class="tag">GENERAL HELP</span></div>
-            <p class="view-lede">Ask anything about Monique. For work on a task, reply inside that task instead.</p>
-            <div class="view-actions"><button class="button ghost" type="button" data-open-sessions>Back to tasks</button></div>
-          </div>
-          <div class="chat-layout">
+          <div class="chat-workspace" id="chat-workspace">
+            <aside class="chat-history" id="chat-history" aria-label="Conversation history">
+              <div class="chat-history-head"><strong>Conversations</strong><button class="chat-icon-button" id="chat-history-close" type="button" aria-label="Close conversation history" title="Close conversation history"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M9 4v16m7-12-4 4 4 4"></path></svg></button></div>
+              <button class="button chat-new-button" id="new-chat" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 5H6a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-7M16 3l5 5M9 15l1-5L18 2l5 5-8 8z"></path></svg><span>New chat</span></button>
+              <label class="chat-history-search-field"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 5 5"></path></svg><input id="chat-history-search" type="search" placeholder="Search conversations…" aria-label="Search conversations" autocomplete="off"></label>
+              <div class="chat-history-list" id="chat-history-list"><p class="inline-hint">Loading conversations…</p></div>
+              <div class="chat-history-foot"><small>Conversations retained for 90 days</small></div>
+            </aside>
+            <button class="chat-history-backdrop" id="chat-history-backdrop" type="button" aria-label="Close conversation history" hidden></button>
             <article class="chat-surface">
-              <div class="chat-model-bar">
-                <div class="model-identity"><span>M</span><div><strong>Monique</strong><small>General assistant</small></div></div>
+              <header class="chat-model-bar">
+                <button class="chat-icon-button" id="chat-history-toggle" type="button" aria-controls="chat-history" aria-expanded="true" aria-label="Toggle conversation history" title="Conversation history"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M9 4v16"></path></svg></button>
+                <div class="chat-heading"><h1 id="chat-title">Monique</h1><p id="chat-conversation-title" data-i18n-skip></p></div>
                 <div class="chat-model-actions">
-                  <div class="chat-context-summary" aria-label="Conversation context">
-                    <span><b id="chat-memory-count">-</b> memory</span>
-                    <span><b id="chat-source-count">0</b> live</span>
-                    <span><b id="chat-latency">-</b> last turn</span>
-                    <span id="chat-manage-state" hidden>Actions ready</span>
+                  <button class="chat-icon-button" id="chat-artifacts-open" type="button" aria-label="Conversation deliverables" title="Conversation deliverables">▧</button>
+                  <button class="chat-icon-button" id="chat-find-toggle" type="button" aria-label="Find in conversation" title="Find in conversation" aria-controls="chat-navigator" aria-expanded="false">⌕</button>
+                  <button class="chat-icon-button" id="chat-new-shortcut" type="button" aria-label="New chat" title="New chat">＋</button>
+                  <details class="chat-options" id="chat-options"><summary aria-label="Conversation options" title="Conversation options">···</summary><div class="chat-options-menu">
+                    <strong>Conversation context</strong>
+                    <div class="chat-context-summary"><span><b id="chat-memory-count">-</b> memory</span><span><b id="chat-source-count">0</b> live</span><span><b id="chat-latency">-</b> last turn</span><span id="chat-manage-state" hidden>Actions ready</span></div>
+                    <button class="button ghost small voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
+                    <button class="button ghost small" id="chat-export" type="button">Export visible messages</button>
+                    <button class="button ghost small" id="chat-export-all" type="button">Export full conversation</button>
+                    <small id="chat-export-status" role="status" hidden></small>
+                    <button class="button ghost small" id="chat-outline-toggle" type="button" aria-controls="chat-navigator">Conversation outline</button>
+                    <button class="button ghost small" id="chat-reload" type="button">Reload conversation</button>
+                    <small>GENERAL HELP</small><p>For work on a task, reply inside that task instead.</p>
+                    <button class="text-button" type="button" data-open-sessions>Back to tasks</button>
+                  </div></details>
+                </div>
+              </header>
+              <section class="chat-navigator" id="chat-navigator" aria-label="Navigate conversation" hidden>
+                <div class="chat-navigator-head"><div role="tablist" aria-label="Navigation mode"><button id="chat-find-tab" type="button" role="tab" aria-selected="true" aria-controls="chat-find-panel">Find</button><button id="chat-outline-tab" type="button" role="tab" aria-selected="false" aria-controls="chat-outline-panel" tabindex="-1">Outline</button></div><button class="chat-icon-button" id="chat-navigator-close" type="button" aria-label="Close conversation navigation">×</button></div>
+                <div id="chat-find-panel" role="tabpanel" aria-labelledby="chat-find-tab">
+                  <div class="chat-find-row"><input id="chat-find-input" type="search" maxlength="200" placeholder="Find in this conversation…" aria-label="Find in this conversation" autocomplete="off"><span id="chat-find-status" role="status" data-i18n-skip></span><button class="chat-icon-button" id="chat-find-prev" type="button" aria-label="Previous match">↑</button><button class="chat-icon-button" id="chat-find-next" type="button" aria-label="Next match">↓</button></div>
+                </div>
+                <div id="chat-outline-panel" role="tabpanel" aria-labelledby="chat-outline-tab" hidden><div id="chat-outline-list" class="chat-outline-list"></div></div>
+                <div class="chat-navigator-foot"><small id="chat-navigation-scope">Loaded messages</small><button class="text-button" id="chat-navigation-older" type="button" hidden>Load earlier messages</button></div>
+              </section>
+              <div class="chat-reading-area">
+                <div class="chat-thread" id="chat-thread" aria-label="Conversation messages" aria-busy="true">
+                  <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Think it through, find an answer, or get something done.</p></div>
+                </div>
+                <button class="button ghost small chat-jump" id="chat-jump" type="button" hidden>↓ Latest messages</button>
+              </div>
+              <div class="chat-compose-area">
+                <div class="chat-compose-status"><span id="chat-state" role="status">Loading conversation…</span><span class="composer-hint"><span id="chat-limit" hidden><b id="chat-count">0</b>/8192 · </span><span id="chat-keyboard-hint">Shift + Enter for a new line</span></span></div>
+                <form class="composer" id="chat-form">
+                  <div class="chat-quote" id="chat-quote" hidden><div><strong>Quoted excerpt</strong><p id="chat-quote-text" data-i18n-skip></p></div><button class="chat-icon-button" id="chat-quote-remove" type="button" aria-label="Remove quote">×</button></div>
+                  <textarea id="chat-input" maxlength="8192" rows="1" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
+                  <div class="composer-row">
+                    <label class="chat-mode"><span class="sr-only">Mode</span><select id="chat-profile" aria-label="Response mode"><option value="conversation">Fast conversation</option><option value="operational">Operational reasoning</option></select></label>
+                    <button class="voice-input-button" id="voice-input" type="button" aria-pressed="false" aria-label="Start voice input" title="Start voice input">MIC</button>
+                    <button class="send-button" id="chat-send" type="submit" aria-label="Send message" disabled>↑</button>
                   </div>
-                  <button class="button ghost small voice-output-button" id="voice-output" type="button" aria-pressed="false" aria-label="Turn on spoken replies" title="Voice replies are off">VOICE OFF</button>
-                  <button class="button ghost small new-chat-button" id="new-chat" type="button">＋ New chat</button>
-                </div>
+                </form>
+                <p class="chat-disclaimer">Monique can make mistakes. Check important information.</p>
               </div>
-              <div class="chat-thread" id="chat-thread" aria-live="polite">
-                <div class="empty-state" id="chat-empty"><span>M</span><h2>What can I help with?</h2><p>Ask naturally. I can use what I remember, read connected tools, and prepare actions for your approval.</p><div class="starter-grid"><button type="button" data-chat-prompt="Explain the current operational health and any risks."><strong>Explain system health</strong><small>Live status and risks</small></button><button type="button" data-chat-prompt="Summarize the latest relevant Slack messages."><strong>Catch me up</strong><small>Recent Slack messages</small></button><button type="button" data-chat-prompt="What do you remember that is most relevant right now? Cite memory references."><strong>Explore memory</strong><small>What Monique remembers</small></button><button type="button" data-chat-prompt="Show me the useful actions available in Manage AI Operations and help me choose the right one."><strong>Work in Manage</strong><small>Prepare an action for approval</small></button></div></div>
-              </div>
-              <form class="composer" id="chat-form">
-                <textarea id="chat-input" maxlength="8192" rows="2" placeholder="Message Monique…" aria-label="Message Monique" required></textarea>
-                <div class="composer-row">
-                  <label>Mode
-                    <select id="chat-profile">
-                      <option value="conversation">Fast conversation</option>
-                      <option value="operational">Operational reasoning</option>
-                    </select>
-                  </label>
-                  <span class="composer-hint"><b id="chat-count">0</b>/8192 · <kbd>Enter</kbd> send</span>
-                  <span id="chat-state" role="status">Ready</span>
-                  <button class="voice-input-button" id="voice-input" type="button" aria-pressed="false" aria-label="Start voice input" title="Start voice input">MIC</button>
-                  <button class="send-button" id="chat-send" type="submit" aria-label="Send message">↑</button>
-                </div>
-              </form>
-              <p class="chat-disclaimer">Monique can make mistakes. Answers show when they rely on memory or live sources. Voice uses your browser and starts only when you press a voice button.</p>
             </article>
           </div>
         </section>
@@ -330,22 +352,30 @@
               <article class="stat"><b id="memory-candidates">-</b> to approve</article>
               <article class="stat stat-warn"><b id="memory-review-due">-</b> to recheck</article>
               <article class="stat"><b id="memory-superseded">-</b> replaced</article>
-              <article class="stat"><b id="memory-deleted">-</b> deleted</article>
+              <article class="stat"><b id="memory-deleted">-</b> archived</article>
               <article class="stat"><b id="memory-messages">-</b> messages</article>
             </div>
             <form class="search-field memory-search" id="memory-search" role="search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 1 0 4.1 11.5L20 21M10.5 4a6.5 6.5 0 0 1 4.1 11.5"></path></svg><input id="memory-query" maxlength="512" aria-label="Search memory" placeholder="Search what Monique remembers"><button class="search-clear" id="memory-clear" type="button" aria-label="Clear memory search" hidden>×</button><button class="button ghost small" type="submit">Search</button></form>
           </div>
           <div class="toolbar memory-toolbar">
+            <button class="button primary" id="memory-create" type="button">Add memory</button>
+            <button class="button secondary" id="memory-refresh" type="button">Refresh</button>
+            <button class="button secondary" id="memory-retrieval-test" type="button">Test retrieval</button>
+            <button class="button secondary" id="memory-duplicates" type="button">Find duplicates</button>
+            <button class="button secondary" id="memory-export" type="button" disabled>Export results</button>
             <div class="segmented memory-modes" role="group" aria-label="Memory view"><button type="button" data-memory-mode="list">List</button><button type="button" data-memory-mode="timeline">Timeline</button><button type="button" data-memory-mode="graph">Map</button></div>
             <div class="memory-filters">
               <label class="select-field memory-filter"><span>Type</span><select id="memory-kind"><option value="all">All types</option></select></label>
               <label class="select-field memory-filter"><span>Status</span><select id="memory-status"><option value="all">All statuses</option></select></label>
               <label class="select-field memory-filter"><span>Privacy</span><select id="memory-sensitivity"><option value="all">All levels</option></select></label>
+              <label class="select-field memory-filter"><span>Review</span><select id="memory-review"><option value="all">Any review date</option><option value="due">Needs review</option><option value="scheduled">Scheduled</option><option value="none">Unscheduled</option></select></label>
               <label class="select-field memory-filter"><span>Sort</span><select id="memory-sort"><option value="updated_desc">Recently updated</option><option value="confidence_desc">Most certain</option><option value="review_asc">Recheck date</option><option value="reference">Reference</option></select></label>
               <button class="text-button" id="memory-reset" type="button">Reset</button>
             </div>
             <span class="toolbar-meta" id="memory-result-label" role="status">Loading…</span>
           </div>
+          <div class="memory-bulk-toolbar"><button class="button ghost small" id="memory-select-visible" type="button">Select filtered memories</button><span id="memory-selected-count" role="status">0 selected</span><button class="button ghost small" id="memory-clear-selection" type="button">Clear selection</button><button class="button ghost small" id="memory-archive-selected" type="button" disabled>Archive selected</button></div>
+          <section class="panel memory-inspection" id="memory-inspection" aria-live="polite" hidden></section>
           <div class="view-split">
             <div class="view-main memory-views">
               <div class="table memory-table" id="memory-list" hidden></div>
@@ -361,6 +391,32 @@
             </aside>
           </div>
         </section>
+
+        <dialog class="memory-dialog" id="memory-editor" aria-labelledby="memory-editor-title">
+          <form id="memory-editor-form">
+            <header><h2 id="memory-editor-title">Add memory</h2><button class="drawer-close" type="button" data-memory-close="memory-editor" aria-label="Close editor">×</button></header>
+            <p id="memory-editor-help">Save a stable fact or preference for future conversations.</p>
+            <label>Content<textarea id="memory-edit-content" rows="5" maxlength="8192" required placeholder="What should Monique remember?"></textarea></label>
+            <div class="memory-editor-fields">
+              <label>Type<select id="memory-edit-kind"><option value="user_profile">User preference</option><option value="workspace">Workspace</option><option value="team">Team</option><option value="task">Task</option><option value="episodic">Event</option><option value="procedure">Procedure</option></select></label>
+              <label>Certainty (%)<input id="memory-edit-confidence" type="number" min="0" max="100" step="0.1" value="100" required></label>
+              <label>Privacy<select id="memory-edit-sensitivity"><option value="personal">Personal</option><option value="restricted">Restricted</option><option value="internal">Internal</option><option value="public">Public</option></select></label>
+              <label>Visible to<select id="memory-edit-visibility"><option value="private">Only me</option><option value="team">Team</option><option value="tenant">Everyone in this tenant</option></select></label>
+              <label>Next review<input id="memory-edit-review" type="date"></label>
+            </div>
+            <p class="memory-form-error" id="memory-editor-error" role="alert" hidden></p>
+            <footer><button class="button secondary" type="button" data-memory-close="memory-editor">Cancel</button><button class="button primary" type="submit" id="memory-save">Save memory</button></footer>
+          </form>
+        </dialog>
+        <dialog class="memory-dialog" id="memory-confirm" aria-labelledby="memory-confirm-title">
+          <form id="memory-confirm-form">
+            <h2 id="memory-confirm-title">Forget memory?</h2>
+            <p id="memory-confirm-help"></p>
+            <blockquote id="memory-confirm-content" data-i18n-skip></blockquote>
+            <p class="memory-form-error" id="memory-confirm-error" role="alert" hidden></p>
+            <footer><button class="button secondary" type="button" data-memory-close="memory-confirm">Cancel</button><button class="button primary" type="submit" id="memory-confirm-submit">Confirm</button></footer>
+          </form>
+        </dialog>
 
         <!-- HEALTH -->
         <section class="view" data-panel="overview" aria-labelledby="overview-title">
@@ -439,6 +495,7 @@
         </section>
 
         <!-- SETTINGS -->
+        <section class="view" data-panel="artifacts" aria-label="Deliverables"><div id="artifact-library" data-i18n-skip></div></section>
         <section class="view" data-panel="configuration" aria-labelledby="configuration-title">
           <div class="view-head">
             <div class="view-title"><h1 id="configuration-title">Settings</h1><span class="tag success">NO SECRETS SHOWN</span></div>
@@ -481,13 +538,18 @@
 
               <article class="settings-group agent-accounts" id="agent-accounts-manager" data-config-card data-config-category="ai security">
                 <div class="config-card-heading"><div><h2>Agent accounts</h2><p>Sign agents in with your Claude or ChatGPT subscription. No API keys needed.</p></div><span class="config-scope" id="agent-account-capacity">0 accounts</span></div>
-                <div class="agent-account-actions"><button class="button ghost small" type="button" data-add-agent-provider="codex">Add Codex account</button><button class="button ghost small" type="button" data-add-agent-provider="claude">Add Claude account</button></div>
+                <div class="agent-account-overview" id="agent-account-overview" aria-label="Account overview"></div>
+                <div class="agent-account-actions"><button class="button ghost small" type="button" data-add-agent-provider="codex">Add Codex account</button><button class="button ghost small" type="button" data-add-agent-provider="claude">Add Claude account</button><button class="button ghost small" type="button" id="agent-accounts-refresh">Refresh accounts &amp; usage</button></div>
+                <div class="agent-account-filters"><label for="agent-account-search">Find an account<input type="search" id="agent-account-search" placeholder="Search account names…" autocomplete="off"></label><label for="agent-account-filter">Show accounts<select id="agent-account-filter"><option value="all">All accounts</option><option value="codex">ChatGPT</option><option value="claude">Claude</option><option value="connected">Connected</option><option value="attention">Needs attention</option></select></label></div>
                 <div class="agent-login-sessions" id="agent-login-sessions" aria-live="polite"></div>
                 <div class="agent-account-list" id="agent-account-list"><div class="agent-account-empty">Loading accounts…</div></div>
+                <p class="inline-hint">Usage is shared with other apps using the same subscription. Readings refresh at most every five minutes.</p>
                 <p class="inline-hint agent-account-boundary">Each account is kept separate. Monique only switches the worker account when you ask.</p>
               </article>
 
               <div class="config-section-heading" data-config-card data-config-category="all"><div><h2>System settings</h2><p>Read from the running server. Change them on the server.</p></div><span class="section-meta" id="configuration-last-read">Checking…</span></div>
+              <article class="settings-group integration-manager" data-config-card data-config-category="integrations" id="integration-manager" data-i18n-skip><p>Chargement des applications…</p></article>
+              <div class="config-grid" id="configuration-controls"></div>
               <div class="config-grid" id="configuration-grid"><article class="settings-group loading-panel">Loading settings…</article></div>
               <div class="config-empty" id="configuration-empty" hidden><strong>No matching settings</strong><span>Try another word or section.</span></div>
             </div>
@@ -577,5 +639,6 @@
       <p class="appearance-note">Saved only in this browser.</p>
     </section>
     <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <dialog id="artifact-dialog" class="artifact-dialog" aria-label="Deliverable preview"><button id="artifact-dialog-close" class="button ghost artifact-dialog-close" type="button" aria-label="Close preview">×</button><div id="artifact-dialog-content" data-i18n-skip></div></dialog>
   </body>
 </html>

@@ -1,0 +1,7 @@
+{
+  "name": "monique-artifact-viewer-build",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "pdfjs-dist": "6.4.299", "marked": "17.0.6", "esbuild": "0.28.2" }
+}

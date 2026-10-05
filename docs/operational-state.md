@@ -70,6 +70,17 @@ Manage terminal job must not be presented as GitHub delivery evidence.
 - snapshot `stale`: the projection is too old for a current-state conclusion.
   Retain it for context but do not present it as live evidence.
 
+The Agents drawer treats snapshots older than 90 seconds as historical. A
+nonterminal run then shows `Status unconfirmed` with its last reported status
+in Details, and its output is labelled saved. A refreshed terminal receipt
+updates an already open drawer. If refreshing fails, the previous drawer is
+closed so it cannot continue asserting a live run.
+
+The fleet publisher passes accumulated output to jq through file descriptors,
+not command arguments: a long output history must not exceed the operating
+system's per-argument limit and silently freeze the dashboard projection. A
+terminal job's final result is retained alongside its bounded tool-event tail.
+
 ## What a question sees
 
 Every conversational question, on Telegram, Slack or the dashboard lane that
@@ -252,9 +263,31 @@ token=<sent as authorization: Bearer>
 end=automonique.purge/v1
 ```
 
-Both files sit in a directory the agent's own user can read, so the agent can
-read what they hold. Give the share secret and the purge credentials only the
-reach these two verbs need.
+`automonique shot <url> --login` captures a screen behind a sign-in. For the
+host being captured (the `--host` virtual host when one is pinned) it reads
+`shot/logins/<host>.conf`, posts the service credential once to the
+application's own sign-in service, and presents the short-lived session cookie
+it gets back to that host only, whatever the answer says about a domain. A host
+with no file fails with `MONIQUE_SHOT_FAIL: login is not configured for <host>`.
+`--login-site <id>` (which implies `--login`) sends `{"site_id":"<id>"}` so an
+application with several spaces opens the session on that site's.
+`endpoint` must be `https://`; the service answers
+`{"cookie":{"name","value","path","secure","http_only","same_site"}}`:
+
+```text
+schema=automonique.shot-login/v1
+endpoint=https://manage.example.test/api/v1/agent/session
+token=<service credential, sent as authorization: Bearer>
+end=automonique.shot-login/v1
+```
+
+The session is the application's verification account, with that account's
+rights: a `--click` in a signed-in capture acts as that account. Captures of
+protected screens stay local and are never passed to `share`.
+
+These files sit in a directory the agent's own user can read, so the agent can
+read what they hold. Give the share secret, the purge credentials and each
+sign-in credential only the reach these verbs need.
 
 The worker accepts a job as done only when the provider's final message names
 the completion comment's permalink on the expected issue and, when the comment

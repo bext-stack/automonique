@@ -21,7 +21,7 @@ use std::path::Path;
 pub const OVERRIDE_FILE: &str = "work-method.md";
 /// Ceiling on the rendered method so a verbose override cannot crowd the job
 /// prompt out of the provider's budget.
-pub const MAX_METHOD_BYTES: usize = 6 * 1024;
+pub const MAX_METHOD_BYTES: usize = 7 * 1024;
 
 /// The marker line a completion report must carry, checked by the worker.
 pub const REPORT_MARKER: &str = "Demande 1";
@@ -58,7 +58,9 @@ fn default_text() -> String {
 MÉTHODE MONIQUE — à respecter pour chaque ticket (le client lit ton compte rendu).
 
 1. LIRE TOUT. Le ticket ET tous ses commentaires, jusqu'au dernier. Le dernier commentaire humain est souvent la vraie demande (relance, correction, « non ce n'est pas fait »). Si le client dit qu'un point n'est pas fait, il n'est pas fait : repars de son constat, pas de ton précédent compte rendu.
+   Images du ticket (user-attachments) : ouvre-les avant d'agir. curl -sL -H \"Authorization: token $(gh auth token)\" -o /tmp/piece-1.png <lien>
 2. DÉCOUPER. Numérote chaque demande (Demande 1, 2, …) avant d'agir et traite-les une par une. Une demande ambiguë ou risquée n'est pas devinée : elle est signalée dans le compte rendu et le reste est traité.
+   Pour chaque URL exacte, identifie le frontend et l'API réellement servis (vhost, routes, processus). Un domaine peut servir plusieurs applications : modifier un frontend parallèle ne prouve rien sur l'écran demandé.
 3. PROUVER CHAQUE DEMANDE. Rien n'est « fait » sans une vérification lue de tes yeux :
    - rendu visuel (page, composant, style, layout) → capture obligatoire, puis OUVRE le PNG et contrôle l'attendu :
      {automonique} shot <url> --out /tmp/monique-<demande>.png [--host <vhost>] [--width 390] [--full]
@@ -68,6 +70,7 @@ MÉTHODE MONIQUE — à respecter pour chaque ticket (le client lit ton compte r
      {automonique} share /tmp/monique-<demande>.png --issue <url du ticket>
      Succès = MONIQUE_SHARE_OK: <lien> ; mets ce lien dans le compte rendu en image : ![Demande 1](<lien>). Le lien expire (ligne MONIQUE_SHARE_NOTE) : l'image est un bonus, le texte doit se suffire. Échec (MONIQUE_SHARE_FAIL) ou partage non configuré → décris ce qu'on voit à l'URL publique, sans image et sans chemin local.
      Ne partage JAMAIS la capture d'une page derrière un login, d'un écran de back-office, d'une facture ou de toute donnée personnelle : uniquement des pages publiques du site.
+   - écran protégé → capture-le connecté en ajoutant --login à shot (session du compte de vérification ; pour une donnée d'un site précis, --login-site <siteId de cette donnée> ouvre son espace ; MONIQUE_SHOT_FAIL: login … = hôte non configuré, déclare alors le blocage), puis vérifie le compte, l'onglet et les champs demandés. Une capture de connexion, un HTTP 200 après redirection, un bundle ou un commit déployé ne prouvent PAS cet écran. Pour un formulaire, contrôle l'enregistrement et la relecture via son API réelle ; sans accès autorisé, déclare le blocage, jamais « Fait ».
    - comportement / données → commande ou test dont tu colles le résultat.
    - déploiement → preuve que le code SERVI contient le changement (URL publique en HTTP 200 + marqueur visible ou commit servi), pas seulement que le build a réussi.
 4. CASES À COCHER. Ne coche JAMAIS en masse ni par remplacement de motif. Une case se coche individuellement, après la preuve de cette demande précise. Doute = case laissée vide + explication. Cocher une case non vérifiée est la faute la plus grave.
@@ -128,6 +131,11 @@ mod tests {
         assert!(method.contains("n'y cite aucun chemin de fichier (ni /tmp, ni fichier source)"));
         assert!(method.contains("aucun nom de commit"));
         assert!(method.contains("signature « Monique »"));
+        assert!(method.contains("frontend et l'API réellement servis"));
+        assert!(method.contains("Une capture de connexion"));
+        assert!(method.contains("en ajoutant --login à shot"));
+        assert!(method.contains("-H \"Authorization: token $(gh auth token)\""));
+        assert!(method.contains("via son API réelle"));
         assert!(method.contains(REPORT_MARKER));
         assert!(method.contains("Ne coche JAMAIS en masse"));
         assert!(method.contains("#issuecomment-"));

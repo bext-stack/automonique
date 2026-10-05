@@ -965,6 +965,26 @@ impl Drop for TicketIntakeHost {
     }
 }
 
+/// Read a bounded support page without recording tickets or taking actions.
+pub(crate) fn test_connection(state_dir: &Path) -> crate::connection_checks::CheckResult {
+    let config = FleetConfig::load(state_dir)
+        .map_err(|_| "invalid_configuration")?
+        .ok_or("not_configured")?;
+    let client = FleetClient::with_request_timeout(
+        config.base,
+        config.instance,
+        config.token,
+        Duration::from_secs(8),
+    );
+    let request = SupportIssuesRequest::new(1).map_err(|_| "invalid_configuration")?;
+    match client.support_issues(&request) {
+        Ok(FleetOutcome::Accepted(_)) => Ok("support_read_verified"),
+        Ok(FleetOutcome::Rejected(_)) => Err("request_rejected"),
+        Err(FleetFailure::TimedOut) => Err("timed_out"),
+        Err(_) => Err("service_unavailable"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

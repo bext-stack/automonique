@@ -1183,6 +1183,22 @@ impl TelegramHostError {
     }
 }
 
+/// Verify bot identity without consuming updates or sending a message.
+pub(crate) fn test_connection(state_dir: &Path) -> crate::connection_checks::CheckResult {
+    let config = TelegramBotConfig::load(state_dir)
+        .map_err(|_| "invalid_configuration")?
+        .ok_or("not_configured")?;
+    let TelegramEnablement::Live(control) = config.enablement else {
+        return Err("not_enabled");
+    };
+    match TelegramHttpsClient::new().check_identity(&control.inbound_token, config.bot_id) {
+        Ok(true) => Ok("bot_authenticated"),
+        Ok(false) => Err("authentication_rejected"),
+        Err(automonique_transport_runtime::HttpFailure::TimedOut) => Err("timed_out"),
+        Err(_) => Err("service_unavailable"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

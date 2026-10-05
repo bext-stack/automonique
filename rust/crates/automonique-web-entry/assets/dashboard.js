@@ -19,8 +19,14 @@ let memorySort = "updated_desc";
 let memoryMode = storedPreference("monique-memory-view", ["graph", "list", "timeline"], "list");
 let selectedMemoryReference = null;
 let memoryQuery = null;
+let memoryReview = "all";
+let memoryLoadSequence = 0;
+let memoryEditorEntry = null;
+let memoryConfirmation = null;
+let memorySaving = false;
 let operationsSnapshot = null;
 let processesSnapshot = null;
+let processesLoadSequence = 0;
 let platformSnapshot = null;
 let cockpitSnapshot = null;
 let platformSelectedSession = null;
@@ -66,12 +72,15 @@ let voiceRepliesEnabled = storedPreference("monique-voice-replies", ["on", "off"
 let activeSpeechButton = null;
 let activeSpeechUtterance = null;
 let activeSpeechStatus = null;
-let newChatArmed = false;
-let newChatTimer = null;
+const chatUi = {id:null,ready:false,loading:false,items:[],drafts:new Map(),quotes:new Map(),findHits:[],findIndex:-1,historyGroups:new Map(),follow:true,hasMore:false};
 let lastStatusSnapshot = null;
 let configurationFilter = "all";
 let configurationQuery = "";
 let agentAccountsPollTimer = null;
+let agentAccountsView = null;
+const dismissedAgentLogins = new Set();
+let agentAccountsRequest = 0;
+let agentAccountMutation = false;
 let statusRefreshTimer = null;
 let lastNotifiedAttentionKey = null;
 
@@ -81,7 +90,7 @@ let lastNotifiedAttentionKey = null;
 const consoleState = { expandedLists: new Set(), taskDrawerDismissed: false, ticketId: null, opsKind: null, opsKey: null, memoryOpen: false };
 
 function consoleViewName(name) {
-  return { sessions: "Tasks", tickets: "Tickets", operations: "Agents", memory: "Memory", overview: "Health", configuration: "Settings", chat: "Assistant" }[name] || name;
+  return { sessions: "Tasks", tickets: "Tickets", operations: "Agents", memory: "Memory", artifacts: "Deliverables", overview: "Health", configuration: "Settings", chat: "Assistant" }[name] || name;
 }
 
 function consoleRow(className, onSelect) {
@@ -128,7 +137,7 @@ function consoleCapList(root, key, attribute, selectedValue, limit = 20) {
 // running agent job on that session, or its workspace reporting "working".
 function consoleSessionWorking(sessionId) {
   if (!sessionId) return false;
-  const running = (processesSnapshot?.jobs || []).some((job) => job.status === "running" && job.session_id === sessionId);
+  const running = (processesSnapshot?.jobs || []).some((job) => processDisplayStatus(job) === "running" && job.session_id === sessionId);
   const workspace = (cockpitPresentation?.workspaces || []).some((item) => item.attention === "working" && (item.session_ids || []).includes(sessionId));
   return running || workspace;
 }
@@ -291,6 +300,7 @@ function consoleOpenTool(key, reveal = true) {
   if (!reveal && !consoleDrawerIsOpen("ops-drawer")) return;
   consoleState.opsKind = "tool";
   consoleState.opsKey = key;
+  processPanel.resetShell();
   renderToolDrawer(tool);
   consoleMarkSelected(byId("operations-tool-grid"), "data-tool-key", key);
   consoleMarkSelected(byId("process-list"), "data-process-id", null);
@@ -298,6 +308,7 @@ function consoleOpenTool(key, reveal = true) {
 }
 
 function consoleCloseOps() {
+  processPanel.resetShell();
   consoleState.opsKind = null;
   consoleState.opsKey = null;
   consoleMarkSelected(byId("process-list"), "data-process-id", null);
@@ -374,6 +385,180 @@ function consoleOpenWorkspace(workspace) {
   selectCockpitWorkspace(workspace);
 }
 const frenchUi = Object.freeze({
+  "Deliverables": "Livrables",
+  "No deliverables attached to this run yet.": "Aucun livrable rattaché à cette exécution pour le moment.",
+  "Deliverables are unavailable.": "Les livrables sont indisponibles.",
+  "Open deliverable": "Ouvrir le livrable",
+  "Conversation deliverables": "Livrables de la conversation",
+  "Close preview": "Fermer l’aperçu",
+  "archived": "archivés",
+  "Model not reported": "Modèle non communiqué",
+  "active jobs": "tâches actives",
+  "Manage reports this run as active, but the assigned worker reports no active jobs.": "Manage indique une exécution en cours, mais le worker assigné ne signale aucune tâche active.",
+  "Test response": "Tester une réponse",
+  "Response test started.": "Test de réponse lancé.",
+  "Sends a small test prompt using this subscription.": "Envoie une courte demande de test avec cet abonnement.",
+  "MCP servers & tools": "Serveurs et outils MCP",
+  "No MCP servers configured.": "Aucun serveur MCP configuré.",
+  "MCP configuration is unavailable.": "La configuration MCP est indisponible.",
+  "Refresh tools": "Actualiser les outils",
+  "Tools discovered": "Outils disponibles",
+  "Discovery failed": "Échec de la découverte",
+  "Changes data": "Modifie des données",
+  "Not checked yet": "Pas encore vérifié",
+  "Automations": "Automatisations",
+  "Pause stops future runs. Work already running can finish.": "La pause arrête les prochaines exécutions. Le travail en cours peut se terminer.",
+  "Automation service is unavailable.": "Le service d’automatisation est indisponible.",
+  "No automations registered.": "Aucune automatisation enregistrée.",
+  "Last result": "Dernier résultat",
+  "Next run": "Prochaine exécution",
+  "Last run": "Dernière exécution",
+  "Never run": "Jamais exécutée",
+  "Preview": "Aperçu",
+  "Preview only · nothing will run": "Aperçu uniquement · aucune exécution",
+  "Schedule": "Planification",
+  "Scope": "Périmètre",
+  "No task registered.": "Aucune tâche enregistrée.",
+  "Pause": "Mettre en pause",
+  "Resume": "Reprendre",
+  "Paused": "En pause",
+  "Archived": "Archivé",
+  "Backups": "Sauvegardes",
+  "Next backup": "Prochaine sauvegarde",
+  "Latest backup": "Dernière sauvegarde",
+  "Automatic backups are not configured.": "Les sauvegardes automatiques ne sont pas configurées.",
+  "Automatic backups are paused.": "Les sauvegardes automatiques sont en pause.",
+  "Backup schedule is unavailable.": "La planification des sauvegardes est indisponible.",
+  "No completed backups found.": "Aucune sauvegarde terminée trouvée.",
+  "Older backups": "Sauvegardes précédentes",
+  "databases": "bases de données",
+  "Verify backup": "Vérifier la sauvegarde",
+  "Verifying backup…": "Vérification de la sauvegarde…",
+  "Backup verified": "Sauvegarde vérifiée",
+  "Backup verification failed": "Échec de la vérification de la sauvegarde",
+  "Check latest status": "Vérifier l’état actuel",
+  "Checking latest status…": "Vérification de l’état actuel…",
+  "Fresh snapshot": "Relevé récent",
+  "Last activity": "Dernière activité",
+  "GitHub is closed while Manage still reports pending or running work. These sources disagree.": "Le ticket GitHub est fermé, mais Manage indique encore un travail en attente ou en cours. Les sources sont en désaccord.",
+  "Issue state and agent execution are separate. An open issue can contain completed work.": "L’état du ticket et l’exécution de l’agent sont distincts. Un ticket ouvert peut contenir un travail terminé.",
+  "The source status differs from the ticket list. Refresh the list to reconcile the display.": "L’état de la source diffère de la liste. Actualisez la liste pour mettre l’affichage à jour.",
+  "Testing response…": "Test de réponse en cours…",
+  "Response verified": "Réponse vérifiée",
+  "Response test failed": "Échec du test de réponse",
+  "Subscription quota reached.": "Quota de l’abonnement atteint.",
+  "Sign in before testing a response.": "Connectez le compte avant de tester une réponse.",
+  "The provider could not complete the response test.": "Le fournisseur n’a pas pu terminer le test de réponse.",
+  "Test retrieval": "Tester le rappel",
+  "Find duplicates": "Chercher les doublons",
+  "Select filtered memories": "Sélectionner les souvenirs filtrés",
+  "Clear selection": "Effacer la sélection",
+  "Archive selected": "Archiver la sélection",
+  "selected": "sélectionnés",
+  "Select": "Sélectionner",
+  "Select up to 100 memories.": "Sélectionnez jusqu’à 100 souvenirs.",
+  "Retrieval preview": "Aperçu du rappel",
+  "These are the memories supplied to dashboard chat for this question. No message was sent.": "Voici les souvenirs fournis à l’assistant pour cette question. Aucun message n’a été envoyé.",
+  "No active memories match this question.": "Aucun souvenir actif ne correspond à cette question.",
+  "Duplicate memories": "Souvenirs en double",
+  "Matches ignore letter case and extra spaces. Review each group before archiving.": "La recherche ignore les majuscules et les espaces supplémentaires. Vérifiez chaque groupe avant d’archiver.",
+  "No duplicate memories found.": "Aucun doublon trouvé.",
+  "Results are limited. Search to narrow the inventory.": "Les résultats sont limités. Affinez votre recherche.",
+  "Enter a question in the memory search field.": "Saisissez une question dans le champ de recherche des souvenirs.",
+  "Archive selected memories": "Archiver les souvenirs sélectionnés",
+  "Selected memories": "Souvenirs sélectionnés",
+  "They will stop appearing in retrieval. Their content and audit history will be retained.": "Ils ne seront plus utilisés par l’assistant. Leur contenu et leur historique seront conservés.",
+  "Archive": "Archiver",
+  "Selected memories archived.": "Souvenirs sélectionnés archivés.",
+  "This automation changed. Refresh before trying again.": "Cette automatisation a changé. Actualisez avant de réessayer.",
+  "A selected memory changed. Refresh and select it again.": "Un souvenir sélectionné a changé. Actualisez et sélectionnez-le à nouveau.",
+  "A backup verification is already running.": "Une vérification de sauvegarde est déjà en cours.",
+  "An agent response test is already running.": "Un test de réponse d’agent est déjà en cours.",
+  "Check the selected item and try again.": "Vérifiez l’élément sélectionné et réessayez.",
+
+  "Test": "Tester",
+  "Test again": "Retester",
+  "Testing…": "Test en cours…",
+  "Checking connection…": "Vérification de la connexion…",
+  "Checked": "Vérifié à",
+  "servers verified": "serveurs vérifiés",
+  "Bot authentication verified.": "Authentification du bot vérifiée.",
+  "Account authentication verified.": "Authentification du compte vérifiée.",
+  "Support access verified.": "Accès à l’assistance vérifié.",
+  "Tool discovery verified.": "Accès aux outils vérifié.",
+  "Connection is not configured.": "Connexion non configurée.",
+  "Configure an authorized user before testing.": "Configurez un utilisateur autorisé avant de tester.",
+  "Review the connection configuration on the server.": "Vérifiez la configuration de la connexion sur le serveur.",
+  "Reconnect GitHub on the server, then retry.": "Reconnectez GitHub sur le serveur, puis réessayez.",
+  "Authentication rejected. Reconnect and retry.": "Authentification refusée. Reconnectez le compte et réessayez.",
+  "Access refused. Check the connection permissions.": "Accès refusé. Vérifiez les permissions de la connexion.",
+  "Service unavailable. Check access and retry.": "Service indisponible. Vérifiez l’accès et réessayez.",
+  "The connection timed out. Try again.": "Le délai de connexion est dépassé. Réessayez.",
+  "Some MCP servers could not list their tools.": "Certains serveurs MCP n’ont pas pu lister leurs outils.",
+  "MCP discovery timed out before all servers were checked.": "Le délai est dépassé. Certains serveurs MCP n’ont pas été vérifiés.",
+  "The check could not finish. Try again.": "Le test n’a pas pu aboutir. Réessayez.",
+  "Another connection test is running. Try again shortly.": "Un autre test est en cours. Réessayez dans un instant.",
+  "Read-only tests · no messages sent": "Tests en lecture seule · aucun message envoyé",
+
+  "Dismiss": "Masquer",
+  "The connection was lost. These readings may be out of date.": "La connexion a été perdue. Ces relevés peuvent être périmés.",
+  "Sign-in required": "Connexion nécessaire",
+  "Account overview": "Vue d’ensemble des comptes",
+  "Refresh accounts & usage": "Actualiser les comptes et l’utilisation",
+  "Find an account": "Rechercher un compte",
+  "Search account names…": "Rechercher un nom de compte…",
+  "Show accounts": "Afficher les comptes",
+  "All accounts": "Tous les comptes",
+  "Connected": "Connectés",
+  "Needs attention": "À vérifier",
+  "Usage is shared with other apps using the same subscription. Readings refresh at most every five minutes.": "L’utilisation est partagée avec les autres applications du même abonnement. Les relevés sont actualisés au maximum toutes les cinq minutes.",
+  "Account name": "Nom du compte",
+  "Enter an account name.": "Saisissez un nom de compte.",
+  "Use a name between 1 and 48 characters.": "Utilisez un nom de 1 à 48 caractères.",
+  "Reconnect account": "Reconnecter le compte",
+  "Connect a subscription": "Connecter un abonnement",
+  "Choose a name, then sign in securely on the provider’s website.": "Choisissez un nom, puis connectez-vous sur le site sécurisé du fournisseur.",
+  "Continue to sign-in": "Continuer la connexion",
+  "Subscription usage": "Utilisation de l’abonnement",
+  "Checking usage…": "Vérification de l’utilisation…",
+  "Usage unavailable": "Utilisation indisponible",
+  "Latest reading": "Dernier relevé",
+  "5-hour window": "Fenêtre de 5 heures",
+  "Weekly limit": "Limite hebdomadaire",
+  "Usage window": "Période d’utilisation",
+  "used": "utilisés",
+  "Resets": "Réinitialisation",
+  "Reset time passed; refresh pending": "Échéance passée ; actualisation en attente",
+  "Reset time not provided": "Date de réinitialisation non fournie",
+  "Sign in to view subscription usage.": "Connectez-vous pour voir l’utilisation de cet abonnement.",
+  "The provider has limited usage checks. We’ll retry after the cooldown.": "Le fournisseur limite les vérifications. Une nouvelle tentative aura lieu après le délai d’attente.",
+  "The provider took too long to respond. Try again later.": "Le fournisseur met trop de temps à répondre. Réessayez plus tard.",
+  "The provider has not returned usage limits for this account.": "Le fournisseur n’a pas renvoyé de limites d’utilisation pour ce compte.",
+  "Usage could not be retrieved. Try again later.": "L’utilisation n’a pas pu être récupérée. Réessayez plus tard.",
+  "Previous reading — usage may have changed.": "Relevé précédent — l’utilisation a pu évoluer.",
+  "Usage has not been checked yet.": "L’utilisation n’a pas encore été vérifiée.",
+  "Checked": "Vérifié",
+  "Worker account": "Compte sélectionné pour l’agent",
+  "Available account": "Compte disponible",
+  "Last verified": "Dernière vérification",
+  "Not verified yet": "Pas encore vérifié",
+  "Selected for worker": "Sélectionné pour l’agent",
+  "Verify connection": "Vérifier la connexion",
+  "Manage account": "Gérer le compte",
+  "Rename": "Renommer",
+  "Rename account": "Renommer le compte",
+  "This name is only used in Monique.": "Ce nom est utilisé uniquement dans Monique.",
+  "Account renamed.": "Compte renommé.",
+  "Sign out account": "Déconnecter le compte",
+  "This account is selected for the worker. New work may require signing in again.": "Ce compte est sélectionné pour l’agent. Les prochaines tâches pourront nécessiter une nouvelle connexion.",
+  "Remove account": "Supprimer le compte",
+  "No accounts match these filters.": "Aucun compte ne correspond à ces filtres.",
+  "accounts": "comptes",
+  "Connected accounts": "Comptes connectés",
+  "Need sign-in": "À connecter",
+  "Approaching a limit": "Proches d’une limite",
+  "Connect your first subscription to see its usage and choose an account for the worker.": "Connectez votre premier abonnement pour suivre son utilisation et choisir le compte de l’agent.",
+
   "Skip to workspace": "Aller à l’espace de travail",
   "Primary navigation": "Navigation principale",
   "Open retained sessions": "Ouvrir les sessions conservées",
@@ -687,6 +872,48 @@ const frenchUi = Object.freeze({
   "Next review": "Prochain réexamen",
   "No review scheduled": "Aucun réexamen planifié",
   "Review due": "Réexamen requis",
+  "Add memory": "Ajouter un souvenir",
+  "Edit memory": "Modifier le souvenir",
+  "Save memory": "Enregistrer le souvenir",
+  "Export results": "Exporter les résultats",
+  "Any review date": "Toutes les dates de réexamen",
+  "Needs review": "À réexaminer",
+  "Unscheduled": "Non planifié",
+  "Close editor": "Fermer l’éditeur",
+  "Content": "Contenu",
+  "Certainty (%)": "Certitude (%)",
+  "User preference": "Préférence utilisateur",
+  "Event": "Événement",
+  "Personal": "Personnel",
+  "Restricted": "Restreint",
+  "Only me": "Moi uniquement",
+  "Everyone in this tenant": "Tout le monde dans cet espace",
+  "Forget": "Oublier",
+  "Expires": "Expiration",
+  "Never": "Jamais",
+  "Replaced by": "Remplacé par",
+  "What should Monique remember?": "Que doit retenir Monique ?",
+  "Save a stable fact or preference for future conversations.": "Enregistrez un fait stable ou une préférence pour les prochaines conversations.",
+  "Save a stable fact or preference for future conversations. It will be active immediately.": "Enregistrez un fait stable ou une préférence pour les prochaines conversations. Il sera actif immédiatement.",
+  "Saving keeps the previous version as a replaced record. Approval status is preserved. Choose a future review date or leave it empty.": "L’enregistrement conserve la version précédente et l’état d’approbation. Choisissez une date de réexamen future ou laissez ce champ vide.",
+  "This proposal will become active and available in future conversations.": "Cette proposition deviendra active et disponible dans les prochaines conversations.",
+  "This memory will be excluded from future recall. Its content and audit history remain available as an archived record.": "Ce souvenir ne sera plus utilisé. Son contenu et son historique restent disponibles dans les éléments supprimés.",
+  "This memory changed elsewhere. Your draft is still here. Cancel and refresh before trying again.": "Ce souvenir a été modifié ailleurs. Votre brouillon est conservé. Annulez et actualisez avant de réessayer.",
+  "This memory is unavailable or belongs to another author. Refresh the list.": "Ce souvenir est indisponible ou appartient à un autre auteur. Actualisez la liste.",
+  "Check the content, certainty, and future review date. Content must fit within 8 KB.": "Vérifiez le contenu, la certitude et la date de réexamen future. Le contenu est limité à 8 Ko.",
+  "The change could not be confirmed. Your draft is still here. Refresh the list before retrying.": "La modification n’a pas pu être confirmée. Votre brouillon est conservé. Actualisez la liste avant de réessayer.",
+  "Memory unavailable. Refresh to try again.": "Mémoire indisponible. Actualisez pour réessayer.",
+  "Status unconfirmed": "État non confirmé",
+  "Out-of-date snapshot": "Données périmées",
+  "Saved agent output": "Sortie de l’agent conservée",
+  "Last reported status": "Dernier état signalé",
+  "Snapshot": "Relevé",
+  "This snapshot is out of date. The last reported status is shown in Details; current execution is unconfirmed.": "Ce relevé est périmé. Le dernier état signalé figure dans les détails ; l’exécution actuelle n’est pas confirmée.",
+  "Memory added.": "Souvenir ajouté.",
+  "Memory updated. Previous version retained.": "Souvenir modifié. Version précédente conservée.",
+  "Memory approved.": "Souvenir approuvé.",
+  "Proposal rejected.": "Proposition rejetée.",
+  "Memory removed from recall.": "Souvenir retiré du rappel.",
   "Copy content": "Copier le contenu",
   "Ask Monique": "Demander à Monique",
   "Memory content copied.": "Contenu de la mémoire copié.",
@@ -1113,12 +1340,12 @@ const frenchUi = Object.freeze({
   "Continue with Claude.ai ↗": "Continuer avec Claude.ai ↗",
   "Cancel": "Annuler",
   "ACTIVE WORKER": "WORKER ACTIF",
-  "Use for worker": "Utiliser pour le worker",
+  "Use for worker": "Utiliser pour l’agent",
   "Verify": "Vérifier",
   "Sign in again": "Se reconnecter",
   "Sign out": "Se déconnecter",
   "Remove": "Supprimer",
-  "Worker account selected.": "Compte du worker sélectionné.",
+  "Worker account selected.": "Compte de l’agent sélectionné.",
   "Account status refreshed.": "État du compte actualisé.",
   "Account signed out.": "Compte déconnecté.",
   "Account removed.": "Compte supprimé.",
@@ -1181,6 +1408,128 @@ const frenchUi = Object.freeze({
   "Create unavailable": "Création indisponible",
   "Resume unavailable": "Reprise indisponible",
   "Task create and resume remain unavailable. Local host setup and checkout support typed preview and receipt operations.": "La création et la reprise de tâche restent indisponibles. La configuration d’hôte local et le checkout prennent en charge des opérations typées d’aperçu et de reçu.",
+  // Conversation workspace.
+  "New chat": "Nouvelle discussion",
+  "Conversations retained for 90 days": "Conversations conservées 90 jours",
+  "Find in conversation": "Rechercher dans la conversation",
+  "Find in this conversation…": "Rechercher dans cette conversation…",
+  "Find in this conversation": "Rechercher dans cette conversation",
+  "Navigate conversation": "Parcourir la conversation",
+  "Navigation mode": "Mode de navigation",
+  "Close conversation navigation": "Fermer la navigation",
+  "Conversation outline": "Sommaire de la conversation",
+  "Find": "Rechercher",
+  "Outline": "Sommaire",
+  "Previous match": "Résultat précédent",
+  "Next match": "Résultat suivant",
+  "No matches": "Aucun résultat",
+  "First 1000 matches": "1 000 premiers résultats",
+  "Loaded messages": "Messages chargés",
+  "All retained messages loaded": "Tous les messages conservés sont chargés",
+  "Questions and reply headings will appear here.": "Les questions et les titres des réponses apparaîtront ici.",
+  "Quote": "Citer",
+  "Quoted excerpt": "Extrait cité",
+  "Remove quote": "Retirer la citation",
+  "Download reply": "Télécharger la réponse",
+  "Export full conversation": "Exporter toute la conversation",
+  "Cancel export": "Annuler l’export",
+  "Preparing retained messages…": "Préparation des messages conservés…",
+  "Conversation exported.": "Conversation exportée.",
+  "Export cancelled.": "Export annulé.",
+  "Export could not finish. No partial file was downloaded.": "L’export n’a pas abouti. Aucun fichier partiel n’a été téléchargé.",
+  "This conversation is too large to export here.": "Cette conversation est trop volumineuse pour être exportée ici.",
+  "Retained messages at the time of export.": "Messages conservés au moment de l’export.",
+  "Today": "Aujourd’hui",
+  "Close conversation history": "Fermer l’historique",
+  "Toggle conversation history": "Afficher ou masquer l’historique",
+  "Search conversations…": "Rechercher une conversation…",
+  "Search conversations": "Rechercher une conversation",
+  "Recent conversations · retained for 90 days": "Conversations récentes · conservées 90 jours",
+  "Conversation options": "Options de la conversation",
+  "Export visible messages": "Exporter les messages affichés",
+  "Reload conversation": "Recharger la conversation",
+  "Conversation messages": "Messages de la conversation",
+  "Think it through, find an answer, or get something done.": "Réfléchir ensemble, trouver une réponse ou avancer sur un projet.",
+  "↓ Latest messages": "↓ Derniers messages",
+  "Loading conversation…": "Chargement de la conversation…",
+  "Shift + Enter for a new line": "Maj + Entrée pour une nouvelle ligne",
+  "Response mode": "Mode de réponse",
+  "Monique can make mistakes. Check important information.": "Monique peut se tromper. Vérifiez les informations importantes.",
+  "Your message is too long. Shorten it before sending.": "Votre message est trop long. Raccourcissez-le avant de l’envoyer.",
+  "Previous 7 days": "7 derniers jours",
+  "Earlier": "Plus anciennes",
+  "No conversations match your search.": "Aucune conversation ne correspond à votre recherche.",
+  "Your conversations will appear here.": "Vos conversations apparaîtront ici.",
+  "Conversation history is unavailable.": "L’historique des conversations est indisponible.",
+  "Load earlier messages": "Charger les messages précédents",
+  "Thinking…": "Réflexion en cours…",
+  "Reply unavailable · your draft is kept": "Réponse indisponible · votre brouillon est conservé",
+  "Visible messages from this conversation.": "Messages affichés dans cette conversation.",
+  "Make a plan": "Préparer un plan",
+  "Turn an idea into clear next steps": "Passer d’une idée à des étapes concrètes",
+  "Help me turn an idea into a clear plan.": "Aide-moi à transformer une idée en un plan clair.",
+  "Write something": "Trouver les mots",
+  "Draft, rewrite, or find the right words": "Rédiger, reformuler ou améliorer un texte",
+  "Help me improve a piece of writing.": "Aide-moi à améliorer un texte.",
+  "The active conversation changed. Reload it before sending.": "La conversation active a changé. Rechargez-la avant d’envoyer un message.",
+  "This conversation is no longer available.": "Cette conversation n’est plus disponible.",
+  "Copy code": "Copier le code",
+  "Code copied.": "Code copié.",
+  "Code": "Code",
+  "Use again": "Réutiliser",
+  // Agent run inspector.
+  "Saved output": "Sortie conservée",
+  "Live output": "Sortie en direct",
+  "Runtime not reported": "Environnement non renseigné",
+  "Runtime": "Environnement",
+  "Previous run": "Exécution précédente",
+  "Expand panel": "Agrandir le panneau",
+  "Collapse panel": "Réduire le panneau",
+  "Run sections": "Sections de l’exécution",
+  "This snapshot is out of date. Current execution is unconfirmed.": "Ce relevé est ancien. L’exécution actuelle n’est pas confirmée.",
+  "Manage reports a running job, but matching worker activity is not confirmed.": "Manage signale une exécution en cours, mais l’activité correspondante du worker n’est pas confirmée.",
+  "Tool started": "Outil démarré",
+  "Tool request": "Demande à l’outil",
+  "Tool result": "Résultat de l’outil",
+  "Tool finished": "Outil terminé",
+  "Agent response": "Réponse de l’agent",
+  "Run finished": "Exécution terminée",
+  "Run failed": "Exécution en échec",
+  "Run event": "Événement d’exécution",
+  "This event was shortened at the source.": "Cet événement a été raccourci à la source.",
+  "Status sources": "Sources de l’état",
+  "Compare the latest Manage report with GitHub and the worker.": "Comparer le dernier relevé Manage avec GitHub et le worker.",
+  "Failure details": "Détails de l’échec",
+  "Latest activity": "Dernière activité",
+  "Copy response": "Copier la réponse",
+  "Response copied.": "Réponse copiée.",
+  "No final response is included in this snapshot. Open GitHub or Manage for the completion report.": "Ce relevé ne contient pas de réponse finale. Consultez GitHub ou Manage pour le compte rendu.",
+  "No failure details are included in this snapshot. Open Manage to investigate.": "Ce relevé ne précise pas la cause de l’échec. Consultez Manage pour l’examiner.",
+  "Most recent recorded action": "Dernière action enregistrée",
+  "Execution context": "Contexte d’exécution",
+  "Related runs": "Exécutions liées",
+  "Parent run": "Exécution parente",
+  "Child run": "Sous-exécution",
+  "Recent events retained by the worker; this may not be the full history.": "Événements récents conservés par le worker ; l’historique peut être incomplet.",
+  "Copy output": "Copier la sortie",
+  "Output copied.": "Sortie copiée.",
+  "Show new activity": "Afficher les nouveaux événements",
+  "Search activity…": "Rechercher dans l’activité…",
+  "Search activity": "Rechercher dans l’activité",
+  "Filter activity": "Filtrer l’activité",
+  "All events": "Tous les événements",
+  "Messages": "Messages",
+  "Errors": "Erreurs",
+  "Run events": "Événements d’exécution",
+  "Newest first": "Plus récents d’abord",
+  "Reverse activity order": "Inverser l’ordre de l’activité",
+  "No events match your search.": "Aucun événement ne correspond à votre recherche.",
+  "Run details": "Détails de l’exécution",
+  "References": "Références",
+  "Current worker": "Worker actuel",
+  "Current worker configuration, not a record of this run’s model or usage.": "Configuration actuelle du worker. Le modèle et l’utilisation propres à cette exécution ne sont pas renseignés ici.",
+  "Copied.": "Copié.",
+  "events": "événements",
   // Ops console layout.
   "READY": "PRÊT",
   "Session": "Session",
@@ -1661,7 +2010,7 @@ const frenchUi = Object.freeze({
   "Agent accounts": "Comptes des agents",
   "Sign agents in with your Claude or ChatGPT subscription. No API keys needed.": "Connectez les agents avec votre abonnement Claude ou ChatGPT. Aucune clé d’API nécessaire.",
   "Loading accounts…": "Chargement des comptes…",
-  "Each account is kept separate. Monique only switches the worker account when you ask.": "Chaque compte reste séparé. Monique ne change de compte de worker que si vous le demandez.",
+  "Each account is kept separate. Monique only switches the worker account when you ask.": "Chaque compte reste séparé. Monique ne change le compte de l’agent qu’à votre demande.",
   "System settings": "Réglages du système",
   "Read from the running server. Change them on the server.": "Lus sur le serveur en marche. Modifiez-les sur le serveur.",
   "Loading settings…": "Chargement des réglages…",
@@ -1736,6 +2085,11 @@ function translatePhraseForFrench(value) {
   const source = String(value);
   if (frenchUi[source]) return frenchUi[source];
   const replacements = [
+    [/^Saved output · (.+) events$/, (match) => `Sortie conservée · ${match[1]} événements`],
+    [/^Edit (M-\d+)$/, (match) => `Modifier ${match[1]}`],
+    [/^(Approve|Reject|Forget) (M-\d+)\?$/, (match) => `${{ Approve: "Approuver", Reject: "Rejeter", Forget: "Oublier" }[match[1]]} ${match[2]} ?`],
+    [/^(\d+) memories exported\. This is a filtered export, not a database backup\.$/, (match) => `${match[1]} souvenirs exportés. Cet export filtré n’est pas une sauvegarde de la base de données.`],
+
     [/^Appearance\. Current theme: (.+)$/, (match) => `Apparence. Thème actuel : ${translatePhraseForFrench(match[1])}`],
     [/^Appearance · (.+)$/, (match) => `Apparence · ${translatePhraseForFrench(match[1])}`],
     [/^Text size: (.+)\. Increase text size$/, (match) => `Taille du texte : ${translatePhraseForFrench(match[1])}. Augmenter la taille du texte`],
@@ -2132,7 +2486,7 @@ async function api(path, options = {}) {
     response = await request();
   }
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(payload.error?.code || payload.error || `HTTP ${response.status}`);
   return payload;
 }
 
@@ -2155,8 +2509,8 @@ function attention(status) {
   if ((status.outbox_ambiguous || 0) > 0) add("ambiguous", "Some messages may not have been sent", `${count(status.outbox_ambiguous)} message(s) have an unclear delivery result.`);
   if (status.provider_available === false) add("provider", "AI provider unavailable", "Monique cannot reach its AI provider.");
   if (status.accepting_intake === false) add("intake", "Not accepting new work", "Monique is not taking new requests right now.");
-  if (processesSnapshot?.health === "stale") add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
-  const manageJobs = Array.isArray(processesSnapshot?.jobs) && ["ready", "degraded"].includes(processesSnapshot.health) ? processesSnapshot.jobs : [];
+  if (processesSnapshot && processesSnapshot.health !== "unavailable" && !processSnapshotIsFresh()) add("manage-stale", "Agent list is out of date", "The list of agent runs has not refreshed recently.");
+  const manageJobs = Array.isArray(processesSnapshot?.jobs) && processSnapshotIsFresh() ? processesSnapshot.jobs : [];
   const awaitingApproval = manageJobs.filter((job) => job.status === "pending_approval");
   if (awaitingApproval.length > 0) {
     add(
@@ -2389,14 +2743,48 @@ async function refreshStatus({ announce = false } = {}) {
   }
 }
 
+let artifactLibrary = null, artifactModal = null, artifactPublicBase = "";
+async function artifactApi(body) {
+  const result = await api("/api/artifacts", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(result.public_base)artifactPublicBase=result.public_base;
+  return result;
+}
+function artifactOptions(context={}) {
+  const options={context,compact:true,previewUrl:"/artifact-preview",publicBase:artifactPublicBase,
+    api:async body=>{const result=await artifactApi(body);options.publicBase=artifactPublicBase;if(body.action==="list" && (context.run_id || context.conversation_id))result.items=(result.items||[]).filter(a=>context.run_id?a.run_id===context.run_id:a.conversation_id===context.conversation_id);return result;},
+    onRevise:reviseArtifact,
+    getJob:async id=>(await integrationApi({section:"jobs",action:"get",id})).job,
+    renderAnswer:renderMarkdown,
+    revisionError:error=>humanChatError(error.message),
+    onConversation:async id=>{if(chatBusy||chatUi.loading)throw Error("chat_lane_busy");byId("artifact-dialog").close();showView("chat");await selectChatConversation(id);}};
+  return options;
+}
+async function reviseArtifact(artifact,version,request) {
+  const key=request.idempotencyKey || crypto.randomUUID();
+  const result=await integrationApi({section:"jobs",action:"submit",idempotency_key:key,prompt:request.message,project:artifact.project||"General",title:artifact.title,artifact_id:artifact.id,version:version.number,path:request.file});
+  return {answer:"Demande enregistrée. Monique préparera une nouvelle version ; vous pouvez fermer cette page.",job:result.job};
+}
+function mountArtifactLibrary(id,revise=false){artifactLibrary?.destroy();artifactLibrary=window.ArtifactWorkspace.mount(byId("artifact-library"),{...artifactOptions(),onOpen:a=>history.replaceState(null,"",`#artifacts?artifact=${encodeURIComponent(a.id)}`),onLibrary:()=>history.replaceState(null,"","#artifacts"),...(id?{id,revise}:{})});}
+function openArtifact(id,context={}){artifactModal?.destroy();const dialog=byId("artifact-dialog");if(!dialog.open)dialog.showModal();artifactModal=window.ArtifactWorkspace.mount(byId("artifact-dialog-content"),{...artifactOptions(context),...(id?{id}:{})});}
+function artifactCard(a){const root=controlNode("div",undefined,"aw aw-inline");root.dataset.i18nSkip="";const button=controlButton("",()=>openArtifact(a.id));button.append(controlData("strong",a.title),controlData("small",` · v${a.version_count} · ${a.visibility==="public"?"Public":"Privé"}`));root.append(button);return root;}
+function artifactRunPane(job){const root=controlNode("section",undefined,"run-section");root.append(controlNode("h3","Deliverables"));const list=controlNode("div");root.append(list,controlButton("Deliverables",()=>openArtifact(null,{run_id:job.id,issue_url:processIssueReference(job).href||"",agent:job.provider||""})));
+  artifactApi({action:"list"}).then(data=>{if(!root.isConnected)return;const items=(data.items||[]).filter(a=>a.run_id===job.id);list.replaceChildren(...items.map(artifactCard));if(!items.length)list.append(controlNode("p","No deliverables attached to this run yet.","inline-hint"));}).catch(()=>{if(root.isConnected)list.append(controlNode("p","Deliverables are unavailable.","inline-hint"));});return root;
+}
+function appendArtifactReferences(root,content){const ids=new Set([...String(content).matchAll(/(?:MONIQUE_ARTIFACT_ID:\s*|\/artifacts\?id=)([A-Za-z0-9_-]{24})(?![A-Za-z0-9_-])/g)].map(m=>m[1]));for(const id of ids){const card=controlNode("div",undefined,"aw aw-inline");card.append(controlButton("Open deliverable",()=>openArtifact(id)));root.append(card);}}
+async function loadConversationArtifacts(){const id=chatUi.id;if(!id)return;try{const data=await artifactApi({action:"list"});if(id!==chatUi.id)return;byId("chat-linked-artifacts")?.remove();const items=(data.items||[]).filter(a=>a.conversation_id===id);if(items.length){const root=controlNode("div",undefined,"chat-linked-artifacts");root.id="chat-linked-artifacts";root.append(...items.map(artifactCard));byId("chat-thread").append(root);}}catch(_error){/* A separate service outage must not interrupt a conversation. */}}
+byId("artifact-dialog-close").addEventListener("click",()=>byId("artifact-dialog").close());
+byId("artifact-dialog").addEventListener("close",()=>artifactModal?.destroy());
+byId("chat-artifacts-open").addEventListener("click",()=>openArtifact(null,{conversation_id:chatUi.id||""}));
+
 function showView(name) {
-  const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration"];
+  const allowed = ["overview", "sessions", "chat", "operations", "tickets", "memory", "configuration", "artifacts"];
   const link = globalThis.AutomoniquePlatformCockpit.parseDeepLink(typeof name === "string" && name.startsWith("#") ? name : `#${name || ""}`);
   name = allowed.includes(link.view) ? link.view : "sessions";
   if (link.workspace || link.session || link.pane) {
     cockpitState = globalThis.AutomoniquePlatformCockpit.initialState(link);
     if (link.session) platformSelectedSession = link.session;
   }
+  document.body.classList.toggle("chat-page", name === "chat");
   document.querySelectorAll("[data-panel]").forEach((node) => node.classList.toggle("is-visible", node.dataset.panel === name));
   document.querySelectorAll("[data-view]").forEach((node) => {
     const active = node.dataset.view === name;
@@ -2406,8 +2794,11 @@ function showView(name) {
   byId("current-view").textContent = consoleViewName(name);
   document.title = `${translatePhrase(consoleViewName(name))} · Monique`;
   const linkedSessions = name === "sessions" && (link.workspace || link.session || link.pane || link.file);
-  const targetHash = linkedSessions ? globalThis.AutomoniquePlatformCockpit.buildDeepLink(link) : `#${name}`;
+  const artifactParams=name==="artifacts"?new URLSearchParams(String(window.location.hash).split("?")[1]||""):null;
+  const artifactId=artifactParams?.get("artifact");
+  const targetHash = artifactId ? `#artifacts?artifact=${encodeURIComponent(artifactId)}${artifactParams.get("revise")==="1"?"&revise=1":""}` : linkedSessions ? globalThis.AutomoniquePlatformCockpit.buildDeepLink(link) : `#${name}`;
   if (window.location.hash !== targetHash) history.replaceState(null, "", targetHash);
+  if (name === "artifacts") mountArtifactLibrary(artifactId,artifactParams?.get("revise")==="1");
   if (name === "memory") loadMemory(memoryQuery);
   if (name === "operations" || name === "tickets") loadOperations();
   if (name === "sessions") loadPlatform();
@@ -2428,6 +2819,13 @@ function selectedMemoryEntries() {
     .filter((entry) => memoryKind === "all" || entry.kind === memoryKind)
     .filter((entry) => memoryStatus === "all" || entry.status === memoryStatus)
     .filter((entry) => memorySensitivity === "all" || entry.sensitivity === memorySensitivity)
+    .filter((entry) => {
+      if (memoryReview === "all") return true;
+      const review = entry.review_at_ms;
+      if (memoryReview === "none") return review == null;
+      if (!["active", "candidate"].includes(entry.status)) return false;
+      return Number.isSafeInteger(review) && (memoryReview === "due" ? review <= Date.now() : review > Date.now());
+    })
     .sort((left, right) => {
       if (memorySort === "confidence_desc") return right.confidence - left.confidence || right.updated_at_ms - left.updated_at_ms;
       if (memorySort === "review_asc") return (left.review_at_ms ?? Number.MAX_SAFE_INTEGER) - (right.review_at_ms ?? Number.MAX_SAFE_INTEGER) || right.updated_at_ms - left.updated_at_ms;
@@ -2447,7 +2845,7 @@ function updateMemoryFacet(id, entries, field, allLabel, previous) {
   values.forEach((value) => {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = label(value);
+    option.textContent = field === "status" && value === "deleted" ? translatePhrase("Archived") : label(value);
     select.append(option);
   });
   const selected = values.includes(previous) ? previous : "all";
@@ -2481,11 +2879,13 @@ function setMemoryMode(mode) {
 function renderMemory(view) {
   memorySnapshot = view;
   const entries = view.entries || [];
+  for (const [reference, selected] of memorySelection) if (!entries.some((entry)=>entry.reference===reference && entry.revision===selected.revision && entry.status==="active")) memorySelection.delete(reference);
+  updateMemorySelection();
   byId("memory-active").textContent = count(view.counts?.active);
   byId("memory-candidates").textContent = count(view.counts?.candidates);
   byId("memory-superseded").textContent = count(view.counts?.superseded);
   byId("memory-deleted").textContent = count(view.counts?.deleted);
-  byId("memory-review-due").textContent = count(entries.filter((entry) => Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
+  byId("memory-review-due").textContent = count(entries.filter((entry) => ["active", "candidate"].includes(entry.status) && Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now()).length);
   byId("memory-messages").textContent = count(view.counts?.messages);
   memoryKind = updateMemoryFacet("memory-kind", entries, "kind", "All types", memoryKind);
   memoryStatus = updateMemoryFacet("memory-status", entries, "status", "All statuses", memoryStatus);
@@ -2499,12 +2899,13 @@ function renderSelectedMemory() {
   const entries = selectedMemoryEntries();
   if (!entries.some((entry) => entry.reference === selectedMemoryReference)) selectedMemoryReference = entries[0]?.reference || null;
   const query = memoryQuery ? ` for “${memoryQuery}”` : "";
-  byId("memory-result-label").textContent = `${count(entries.length)} ${entries.length === 1 ? "memory" : "memories"}${query}`;
+  byId("memory-result-label").textContent = `${count(entries.length)} ${entries.length === 1 ? "memory" : "memories"}${query}${memorySnapshot?.truncated ? " · Limited to 4,096 records. Search to narrow results." : ""}`;
+  byId("memory-export").disabled = entries.length === 0;
   renderMemoryList(entries);
   renderMemoryGraph(entries);
   renderMemoryTimeline(entries);
   renderMemoryInspector(entries.find((entry) => entry.reference === selectedMemoryReference) || null);
-  byId("memory-reset").disabled = memoryKind === "all" && memoryStatus === "all" && memorySensitivity === "all" && memorySort === "updated_desc";
+  byId("memory-reset").disabled = memoryKind === "all" && memoryStatus === "all" && memorySensitivity === "all" && memorySort === "updated_desc" && memoryReview === "all" && !memoryQuery;
 }
 
 function memoryEmpty(message) {
@@ -2537,11 +2938,12 @@ function renderMemoryList(entries) {
     row.dataset.memoryReference = entry.reference;
     const ref = consoleCell(entry.reference, "cell cell-mono");
     ref.setAttribute("data-i18n-skip", "");
+    ref.prepend(memorySelectionCheckbox(entry));
     const text = consoleCell(entry.content, "cell memory-row-content");
     text.setAttribute("data-i18n-skip", "");
     const kind = consoleCell(consoleSentence(entry.kind), "cell");
     const due = Number.isSafeInteger(entry.review_at_ms) && entry.review_at_ms <= Date.now();
-    const status = consoleBadge(due ? "Recheck" : consoleSentence(entry.status), due ? "warn" : { active: "ok", candidate: "info", superseded: "quiet", deleted: "danger" }[entry.status] || "quiet");
+    const status = consoleBadge(due ? "Recheck" : entry.status === "deleted" ? "Archived" : consoleSentence(entry.status), due ? "warn" : { active: "ok", candidate: "info", superseded: "quiet", deleted: "danger" }[entry.status] || "quiet");
     const confidence = document.createElement("span");
     confidence.className = "confidence";
     const bar = document.createElement("i");
@@ -2617,7 +3019,7 @@ function renderMemoryTimeline(entries) {
     content.setAttribute("data-i18n-skip", "");
     content.textContent = entry.content;
     const meta = document.createElement("small");
-    meta.textContent = `${words(entry.kind)} · ${words(entry.status)}`;
+    meta.textContent = `${words(entry.kind)} · ${entry.status === "deleted" ? translatePhrase("Archived") : words(entry.status)}`;
     body.append(heading, content, meta);
     item.append(marker, date, body);
     item.dataset.row = "";
@@ -2663,7 +3065,7 @@ function renderMemoryInspector(entry) {
   title.textContent = entry.reference;
   headingCopy.append(eyebrow, title);
   const status = document.createElement("i");
-  status.textContent = words(entry.status).toUpperCase();
+  status.textContent = (entry.status === "deleted" ? translatePhrase("Archived") : words(entry.status)).toUpperCase();
   status.dataset.state = entry.status;
   head.append(headingCopy, status);
   const content = document.createElement("p");
@@ -2688,13 +3090,15 @@ function renderMemoryInspector(entry) {
   facts.className = "memory-inspector-facts";
   [
     ["Type", consoleSentence(entry.kind)],
-    ["Status", consoleSentence(entry.status)],
+    ["Status", entry.status === "deleted" ? "Archived" : consoleSentence(entry.status)],
     ["Learned from", entry.provenance],
     ["Updated", memoryDateLabel(entry.updated_at_ms)],
     ["Recheck", memoryReviewLabel(entry.review_at_ms)],
     ["Privacy", consoleSentence(entry.sensitivity)],
     ["Visible to", consoleSentence(entry.visibility)],
     ["Version", String(entry.revision)],
+    ["Expires", entry.expires_at_ms ? memoryDateLabel(entry.expires_at_ms) : "Never"],
+    ["Replaced by", entry.superseded_by || "—"],
   ].forEach(([labelText, value]) => facts.append(memoryInspectorFact(labelText, value)));
   const actions = document.createElement("div");
   actions.className = "memory-inspector-actions";
@@ -2716,23 +3120,148 @@ function renderMemoryInspector(entry) {
   ask.textContent = "Ask assistant";
   ask.dataset.openChat = `Review memory evidence ${entry.reference}. Explain what it establishes, its provenance and confidence, whether it needs review, and how it should influence current work.`;
   actions.append(copy, ask);
+  if (entry.editable) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "button primary";
+    edit.textContent = "Edit memory";
+    edit.addEventListener("click", () => openMemoryEditor(entry));
+    actions.prepend(edit);
+    for (const action of entry.status === "candidate" ? ["approve", "deny"] : ["forget"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button secondary";
+      button.textContent = { approve: "Approve", deny: "Reject", forget: "Forget" }[action];
+      button.addEventListener("click", () => confirmMemoryAction(entry, action));
+      actions.append(button);
+    }
+  }
   root.append(head, content, confidence, facts, actions);
 }
 
 async function loadMemory(query = null) {
+  const sequence = ++memoryLoadSequence;
   memoryQuery = query?.trim() || null;
   byId("memory-clear").hidden = memoryQuery === null;
   byId("memory-result-label").textContent = memoryQuery ? "Searching…" : "Loading…";
+  byId("memory-export").disabled = true;
   try {
     const view = memoryQuery === null
       ? await api("/api/memory")
       : await api("/api/memory/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: memoryQuery }) });
+    if (sequence !== memoryLoadSequence) return;
     renderMemory(view);
   } catch (error) {
-    byId("memory-result-label").textContent = `Memory unavailable · ${error.message}`;
+    if (sequence !== memoryLoadSequence) return;
+    renderMemory({ entries: [], counts: {} });
+    byId("memory-result-label").textContent = "Memory unavailable. Refresh to try again.";
     toast("Memory retrieval is unavailable.", "error");
   }
 }
+
+function openMemoryEditor(entry = null) {
+  memoryEditorEntry = entry;
+  byId("memory-editor-form").reset();
+  byId("memory-editor-title").textContent = entry ? `Edit ${entry.reference}` : "Add memory";
+  byId("memory-editor-help").textContent = entry
+    ? "Saving keeps the previous version as a replaced record. Approval status is preserved. Choose a future review date or leave it empty."
+    : "Save a stable fact or preference for future conversations. It will be active immediately.";
+  byId("memory-edit-content").value = entry?.content || "";
+  byId("memory-edit-kind").value = entry?.kind || "user_profile";
+  byId("memory-edit-confidence").value = (entry?.confidence ?? 1000) / 10;
+  byId("memory-edit-sensitivity").value = entry?.sensitivity || "personal";
+  byId("memory-edit-visibility").value = entry?.visibility || "private";
+  const tomorrow = new Date(Date.now() + 86400000).toLocaleDateString("en-CA");
+  byId("memory-edit-review").min = tomorrow;
+  if (entry?.review_at_ms > Date.now()) {
+    byId("memory-edit-review").value = new Date(entry.review_at_ms).toLocaleDateString("en-CA");
+  }
+  byId("memory-editor-error").hidden = true;
+  byId("memory-editor").showModal();
+  byId("memory-edit-content").focus();
+}
+
+function confirmMemoryAction(entry, action) {
+  memoryConfirmation = { entry, action };
+  const verb = { approve: "Approve", deny: "Reject", forget: "Forget" }[action];
+  byId("memory-confirm-title").textContent = `${verb} ${entry.reference}?`;
+  byId("memory-confirm-submit").textContent = verb;
+  byId("memory-confirm-help").textContent = action === "approve"
+    ? "This proposal will become active and available in future conversations."
+    : "This memory will be excluded from future recall. Its content and audit history remain available as an archived record.";
+  byId("memory-confirm-content").textContent = entry.content;
+  byId("memory-confirm-error").hidden = true;
+  byId("memory-confirm").showModal();
+}
+
+function memoryActionError(error) {
+  if (error.message === "memory_revision_stale" || error.message === "memory_conflict") return "This memory changed elsewhere. Your draft is still here. Cancel and refresh before trying again.";
+  if (error.message === "memory_not_found") return "This memory is unavailable or belongs to another author. Refresh the list.";
+  if (error.message === "memory_field_invalid") return "Check the content, certainty, and future review date. Content must fit within 8 KB.";
+  return "The change could not be confirmed. Your draft is still here. Refresh the list before retrying.";
+}
+
+async function saveMemoryAction(payload, dialogId, errorId) {
+  if (memorySaving) return;
+  memorySaving = true;
+  const dialog = byId(dialogId);
+  dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+  byId(errorId).hidden = true;
+  try {
+    const entry = await api("/api/memory/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    dialog.close();
+    selectedMemoryReference = entry.reference;
+    memoryKind = memoryStatus = memorySensitivity = memoryReview = "all";
+    byId("memory-review").value = "all";
+    byId("memory-query").value = "";
+    await loadMemory(null);
+    if (memorySnapshot?.entries.some((item) => item.reference === entry.reference)) consoleOpenMemory(entry.reference);
+    toast({ create: "Memory added.", edit: "Memory updated. Previous version retained.", approve: "Memory approved.", deny: "Proposal rejected.", forget: "Memory removed from recall." }[payload.action]);
+  } catch (error) {
+    byId(errorId).textContent = memoryActionError(error);
+    byId(errorId).hidden = false;
+  } finally {
+    memorySaving = false;
+    dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+byId("memory-editor-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const review = byId("memory-edit-review").value;
+  saveMemoryAction({
+    action: memoryEditorEntry ? "edit" : "create",
+    ...(memoryEditorEntry ? { reference: memoryEditorEntry.reference, revision: memoryEditorEntry.revision } : {}),
+    content: byId("memory-edit-content").value,
+    kind: byId("memory-edit-kind").value,
+    confidence: Math.round(Number(byId("memory-edit-confidence").value) * 10),
+    sensitivity: byId("memory-edit-sensitivity").value,
+    visibility: byId("memory-edit-visibility").value,
+    review_at_ms: review ? new Date(`${review}T00:00:00`).getTime() : null,
+  }, "memory-editor", "memory-editor-error");
+});
+byId("memory-confirm-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!memoryConfirmation) return;
+  const { entry, action } = memoryConfirmation;
+  saveMemoryAction({ action, reference: entry.reference, revision: entry.revision }, "memory-confirm", "memory-confirm-error");
+});
+document.querySelectorAll("[data-memory-close]").forEach((button) => button.addEventListener("click", () => byId(button.dataset.memoryClose).close()));
+["memory-editor", "memory-confirm"].forEach((id) => byId(id).addEventListener("cancel", (event) => { if (memorySaving) event.preventDefault(); }));
+byId("memory-create").addEventListener("click", () => openMemoryEditor());
+byId("memory-refresh").addEventListener("click", () => loadMemory(memoryQuery));
+byId("memory-review").addEventListener("change", (event) => { memoryReview = event.target.value; renderSelectedMemory(); });
+byId("memory-export").addEventListener("click", () => {
+  const entries = selectedMemoryEntries();
+  const blob = new Blob([JSON.stringify({ schema: "automonique.memory-export/v1", exported_at: new Date().toISOString(), query: memoryQuery, truncated: Boolean(memorySnapshot?.truncated), filters: { kind: memoryKind, status: memoryStatus, sensitivity: memorySensitivity, review: memoryReview }, entries }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `monique-memory-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`${entries.length} memories exported. This is a filtered export, not a database backup.`);
+});
 
 byId("memory-search").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -2767,11 +3296,14 @@ byId("memory-reset").addEventListener("click", () => {
   memoryStatus = "all";
   memorySensitivity = "all";
   memorySort = "updated_desc";
+  memoryReview = "all";
+  byId("memory-review").value = "all";
+  byId("memory-query").value = "";
   byId("memory-kind").value = memoryKind;
   byId("memory-status").value = memoryStatus;
   byId("memory-sensitivity").value = memorySensitivity;
   byId("memory-sort").value = memorySort;
-  renderSelectedMemory();
+  loadMemory(null);
 });
 document.querySelectorAll("[data-memory-mode]").forEach((button) => button.addEventListener("click", () => {
   setMemoryMode(button.dataset.memoryMode);
@@ -2793,13 +3325,33 @@ function operationsMessage(health) {
 }
 
 function processStatusLabel(status) {
-  const labels = { pending: "Queued in Manage", pending_approval: "Waiting for approval", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", authenticated: "Signed in" };
+  const labels = { pending: "Queued in Manage", pending_approval: "Waiting for approval", running: "Running", done: "Finished", failed: "Failed", cancelled: "Cancelled", unknown: "Unknown", unconfirmed: "Status unconfirmed", authenticated: "Signed in" };
   return labels[status] || operationLabel(status);
+}
+
+function processSnapshotIsFresh(view = processesSnapshot) {
+  return ["ready", "degraded"].includes(view?.health)
+    && Number.isSafeInteger(view?.observed_at_ms)
+    && view.observed_at_ms <= Date.now() + 5000
+    && Date.now() - view.observed_at_ms <= 90000;
+}
+
+function processDisplayStatus(job) {
+  if (["done", "failed", "cancelled"].includes(job.status)) return job.status;
+  if (!processSnapshotIsFresh()) return "unconfirmed";
+  if (job.status === "running") {
+    const worker = processesSnapshot?.worker;
+    const matching = job.assigned_to_worker && worker?.active_jobs > 0
+      && worker.provider === job.provider && worker.runtime === job.runtime
+      && ["online", "ready", "busy", "running"].includes(worker.status);
+    if (!matching) return "unconfirmed";
+  }
+  return job.status;
 }
 
 function processMatches(job, filter) {
   if (filter === "all") return true;
-  if (filter === "active") return job.status === "running";
+  if (filter === "active") return processDisplayStatus(job) === "running";
   if (filter === "queued") return job.status === "pending";
   if (filter === "approval") return job.status === "pending_approval";
   if (filter === "completed") return job.status === "done";
@@ -2866,12 +3418,12 @@ function renderProcessWorker(worker, health) {
   identity.append(orb, copy);
   const status = document.createElement("span");
   status.className = `process-worker-status status-${worker.status}`;
-  status.textContent = worker.status.toUpperCase();
+  status.textContent = health === "stale" ? "OUT OF DATE" : worker.status.toUpperCase();
   const facts = document.createElement("div");
   facts.className = "process-worker-facts";
   [
     ["Model", worker.model],
-    ["Busy", `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
+    ["Busy", health === "stale" ? translatePhrase("Status unconfirmed") : `${count(worker.active_jobs)} of ${count(worker.concurrency)} slots active`],
     ["Seen", processTimeLabel(worker.last_seen_at), worker.last_seen_at],
   ].forEach(([labelText, value, exact]) => facts.append(processDetail(labelText, value, exact)));
   root.append(identity, status, facts);
@@ -2911,7 +3463,8 @@ function renderProcesses(view) {
   processesSnapshot = view;
   const jobs = Array.isArray(view.jobs) ? view.jobs : [];
   if (lastStatusSnapshot) renderAttention(lastStatusSnapshot);
-  const health = String(view.health || "unavailable");
+  const fresh = processSnapshotIsFresh(view);
+  const health = fresh ? String(view.health) : view.health === "unavailable" ? "unavailable" : "stale";
   // No worker report yet is a waiting state, not an outage.
   const waiting = health === "unavailable" && !view.worker && jobs.length === 0;
   byId("processes-health").textContent = waiting ? "NO REPORT YET" : health.toUpperCase();
@@ -2919,8 +3472,8 @@ function renderProcesses(view) {
   const observed = Number.isSafeInteger(view.observed_at_ms) ? new Date(view.observed_at_ms).toISOString() : null;
   byId("process-observed").textContent = observed ? `Updated ${processTimeLabel(observed)}` : "Waiting for the worker";
   byId("process-observed").title = observed ? ticketDateLabel(observed) : "";
-  byId("process-running").textContent = count(view.stats?.running);
-  byId("process-queued").textContent = count(view.stats?.queued);
+  byId("process-running").textContent = count(fresh ? view.stats?.running : null);
+  byId("process-queued").textContent = count(fresh ? view.stats?.queued : null);
   byId("process-approval").textContent = count(jobs.filter((job) => job.status === "pending_approval").length);
   byId("process-completed").textContent = count(view.stats?.completed);
   byId("process-failed").textContent = count(view.stats?.failed);
@@ -2943,6 +3496,7 @@ function renderProcesses(view) {
     empty.className = "integration-empty process-empty";
     empty.textContent = health === "unavailable" ? "No agent runs to show yet." : "No agent runs match this filter.";
     root.append(empty);
+    if (consoleState.opsKind === "process") consoleOpenProcess(consoleState.opsKey, false);
     return;
   }
   visible.forEach(({ job, depth }) => {
@@ -2965,7 +3519,7 @@ function renderProcesses(view) {
     const execution = consoleCell(executionName || "-", "cell");
     const updated = consoleCell(processTimeLabel(job.updated_at), "cell cell-time");
     if (job.updated_at) updated.title = ticketDateLabel(job.updated_at);
-    const status = consoleBadge(processStatusLabel(job.status), processStatusTone(job.status));
+    const status = consoleBadge(processStatusLabel(processDisplayStatus(job)), processStatusTone(processDisplayStatus(job)));
     status.classList.add("process-status", `status-${job.status}`);
     row.append(main, execution, updated, consoleCellWrap(status));
     root.append(row);
@@ -2978,130 +3532,272 @@ function processStatusTone(status) {
   return { pending: "quiet", pending_approval: "warn", running: "info", done: "ok", failed: "danger", cancelled: "quiet" }[status] || "quiet";
 }
 
-function renderProcessDrawer(job) {
-  const issueReference = processIssueReference(job);
-  byId("ops-drawer-kicker").textContent = `Agent run · ${processStatusLabel(job.status)}`;
-  const title = byId("ops-drawer-title");
-  title.setAttribute("data-i18n-skip", "");
-  title.textContent = issueReference.label;
-  const body = byId("ops-drawer-body");
-  body.replaceChildren();
-  const summary = document.createElement("section");
-  summary.className = "drawer-section";
-  const badges = document.createElement("div");
-  badges.className = "drawer-badges";
-  badges.append(consoleBadge(processStatusLabel(job.status), processStatusTone(job.status)));
-  if (job.approved) badges.append(consoleBadge("Approved", "ok"));
-  if (job.parent_id) badges.append(consoleBadge("Part of a larger run", "quiet"));
-  const lede = document.createElement("p");
-  lede.className = "inline-hint";
-  lede.textContent = {
-    pending: "Waiting for a free agent to pick it up.",
-    pending_approval: "Waiting for your approval in Manage. Nothing runs until it is approved.",
-    running: "An agent is working on this right now.",
-    done: "The agent finished this run.",
-    failed: "This run failed. Check the output below, then retry from Manage.",
-    cancelled: "This run was cancelled.",
-  }[job.status] || "Agent run.";
-  const actions = document.createElement("div");
-  actions.className = "drawer-actions";
-  if (issueReference.href) {
-    const issueLink = document.createElement("a");
-    issueLink.className = "button ghost small";
-    issueLink.href = issueReference.href;
-    issueLink.target = "_blank";
-    issueLink.rel = "noreferrer";
-    issueLink.textContent = "GitHub ↗";
-    actions.append(issueLink);
+// Agent details retain the selected tab, search and reading position during polling.
+const processPanel = (() => {
+  const states = new Map();
+  let currentId = null;
+  let signature = null;
+  const text = (tag, value, className) => controlNode(tag, value, className);
+  const raw = (tag, value, className) => {
+    const node = controlData(tag, value);
+    if (className) node.className = className;
+    return node;
+  };
+  const action = (label, fn, key, className = "button ghost small") => {
+    const button = controlButton(label, fn); button.className = className;
+    if (key) button.dataset.runFocus = key;
+    return button;
+  };
+  const currentJob = () => (processesSnapshot?.jobs || []).find((job) => job.id === currentId);
+  const eventKey = (line) => JSON.stringify([line.at_ms, line.kind, line.text, line.truncated]);
+  const timestamp = (value) => {
+    const ms = typeof value === "number" ? value : ticketTimestamp(value);
+    return Number.isFinite(ms) && ms > 0 && ms < 8640000000000000 ? new Date(ms).toISOString() : null;
+  };
+  function time(value) {
+    const iso = timestamp(value), node = text("time", iso ? processTimeLabel(iso) : "Not available");
+    if (iso) { node.dateTime = iso; node.title = ticketDateLabel(iso); }
+    return node;
   }
-  const manageHref = safeTicketLink(job.manage_url);
-  if (manageHref) {
-    const manageLink = document.createElement("a");
-    const awaitingApproval = job.status === "pending_approval";
-    manageLink.className = awaitingApproval ? "button primary small" : "button ghost small";
-    manageLink.href = manageHref;
-    manageLink.target = "_blank";
-    manageLink.rel = "noreferrer";
-    manageLink.textContent = awaitingApproval ? "Approve in Manage ↗" : "Manage ↗";
-    actions.append(manageLink);
+  function stateFor(job) {
+    if (!states.has(job.id)) states.set(job.id, {tab:"overview",query:"",filter:"all",newest:true,open:new Set(),output:job.output || [],pending:null});
+    if (states.size > 100) states.delete(states.keys().next().value);
+    return states.get(job.id);
   }
-  summary.append(badges, lede);
-  if (actions.childNodes.length) summary.append(actions);
-  const output = document.createElement("section");
-  output.className = "drawer-section process-output";
-  output.setAttribute("aria-label", "Live agent output");
-  const outputTitle = document.createElement("h3");
-  const outputLines = Array.isArray(job.output) ? job.output : [];
-  outputTitle.textContent = `Live output · ${outputLines.length.toLocaleString(localeTag())} events`;
-  const outputLog = document.createElement("div");
-  outputLog.className = "process-output-log";
-  outputLog.setAttribute("role", "log");
-  if (outputLines.length === 0) {
-    const emptyOutput = document.createElement("p");
-    emptyOutput.textContent = "No output from the agent yet.";
-    outputLog.append(emptyOutput);
-  } else {
-    outputLines.forEach((line) => {
-      const entry = document.createElement("article");
-      const meta = document.createElement("div");
-      const kind = document.createElement("span");
-      kind.textContent = operationLabel(line.kind);
-      const at = document.createElement("time");
-      const timestamp = Number.isSafeInteger(line.at_ms) ? new Date(line.at_ms).toISOString() : null;
-      at.textContent = timestamp ? processTimeLabel(timestamp) : "-";
-      if (timestamp) {
-        at.dateTime = timestamp;
-        at.title = ticketDateLabel(timestamp);
-      }
-      meta.append(kind, at);
-      if (line.truncated) {
-        const truncated = document.createElement("i");
-        truncated.textContent = "CUT SHORT";
-        meta.append(truncated);
-      }
-      const text = document.createElement("pre");
-      text.setAttribute("data-i18n-skip", "");
-      text.textContent = line.text;
-      entry.append(meta, text);
-      outputLog.append(entry);
+  function copy(value, message = "Copied.") {
+    return navigator.clipboard.writeText(value).then(() => toast(translatePhrase(message))).catch(() => toast(translatePhrase("The browser did not allow clipboard access."), "error"));
+  }
+  function category(line) {
+    const kind = String(line.kind || "").toLowerCase();
+    if (/error|fail/.test(kind)) return "errors";
+    if (/^tool/.test(kind)) return "tools";
+    if (["final","assistant","message","answer","result"].includes(kind)) return "messages";
+    return "events";
+  }
+  function eventLabel(line) {
+    return ({tool_start:"Tool started",tool_input:"Tool request",tool_result:"Tool result",tool_end:"Tool finished",final:"Agent response",done:"Run finished",error:"Error",failed:"Run failed",lifecycle:"Run event",assistant:"Agent response"})[line.kind] || operationLabel(line.kind);
+  }
+  function groups(lines) {
+    const result = [];
+    lines.forEach((line) => {
+      const previous = result[result.length - 1];
+      if (line.kind === "tool_input" && previous?.lines.length === 1 && previous.lines[0].kind === "tool_start") {
+        previous.lines.push(line); previous.content = line.text; previous.key += eventKey(line);
+      } else result.push({key:eventKey(line),lines:[line],content:line.text,category:category(line)});
     });
+    return result;
   }
-  output.append(outputTitle, outputLog);
-  const detailsSection = document.createElement("section");
-  detailsSection.className = "drawer-section";
-  const detailsTitle = document.createElement("h3");
-  detailsTitle.textContent = "Details";
-  const details = document.createElement("div");
-  details.className = "process-details";
-  [
-    ["Agent", [operationLabel(job.provider), operationLabel(job.runtime)].filter((value) => value !== "Unknown").join(" · ")],
-    ["Type", job.kind ? translatePhrase(operationLabel(job.kind)) : null],
-    ["Came from", job.source && job.source !== "unknown" ? operationLabel(job.source) : null],
-    ["On this worker", translatePhrase(job.assigned_to_worker ? "Yes" : "No")],
-    ["Decisions", String(job.decision_count)],
-    ["Site", job.site_id],
-    ["Created", job.created_at ? ticketDateLabel(job.created_at) : null, job.created_at],
-    ["Updated", job.updated_at ? ticketDateLabel(job.updated_at) : null, job.updated_at],
-    ["Run ID", job.id],
-    ["Part of", job.parent_id],
-    ["Ticket ID", job.issue_id],
-    ["Conversation", job.session_id],
-  ].filter(([, value]) => value).forEach(([labelText, value, exact]) => details.append(processDetail(labelText, value, exact)));
-  detailsSection.append(detailsTitle, details);
-  body.append(summary, output, detailsSection);
-}
+  function eventRow(group, state, compact = false) {
+    const row = text("article", undefined, `run-event run-event-${group.category}`);
+    const meta = text("div", undefined, "run-event-meta");
+    meta.append(text("span", group.lines.length > 1 ? "Tool request" : eventLabel(group.lines[0])), time(group.lines[group.lines.length-1].at_ms));
+    const content = String(group.content || "");
+    row.append(meta);
+    if (content.length > (compact ? 220 : 700) || content.split("\n").length > (compact ? 3 : 8)) {
+      const disclosure = text("details", undefined, "run-event-disclosure");
+      disclosure.dataset.runDisclosure = group.key; disclosure.open = state.open.has(group.key);
+      disclosure.append(raw("summary", content.replace(/\s+/g," ").slice(0,compact ? 160 : 200) + "…"),raw("pre",content,"run-event-text"));
+      disclosure.firstChild.dataset.runFocus = `event-${group.key}`;
+      disclosure.addEventListener("toggle",()=>disclosure.open ? state.open.add(group.key) : state.open.delete(group.key)); row.append(disclosure);
+    } else row.append(raw("pre", content, "run-event-text"));
+    if (group.lines.length > 1 && !compact) row.append(raw("small",group.lines[0].text,"run-tool-context"));
+    if (group.lines.some((line)=>line.truncated)) row.append(text("small","This event was shortened at the source.","run-truncated"));
+    return row;
+  }
+  function section(title, className = "") {
+    const root = text("section",undefined,`run-section ${className}`); root.append(text("h3",title)); return root;
+  }
+  function fact(root, label, value) {
+    const row = text("div",undefined,"run-fact");row.append(text("dt",label),raw("dd",value || translatePhrase("Not reported")));root.append(row);
+  }
+  function switchTab(tab, focus = false) {
+    const job = currentJob(); if (!job) return;
+    stateFor(job).tab = tab; render(job,true); byId("ops-drawer-body").scrollTop = 0;
+    if (focus) byId(`run-tab-${tab}`)?.focus({preventScroll:true});
+  }
+  function sourceCheck(job) {
+    const root = section("Status sources","run-sources");
+    const output = text("div",undefined,"run-source-result");output.dataset.runCheck = job.id;
+    const result = controlState.runs.get(job.id);
+    const check = action("Check latest status",async()=>{
+      controlState.runs.set(job.id,{pending:true});render(currentJob(),true);
+      try {controlState.runs.set(job.id,await controlAction({action:"check_run",id:job.id}));}
+      catch(error) {controlState.runs.set(job.id,{error});}
+      if(currentId===job.id && consoleState.opsKind === "process")render(currentJob(),true);
+    },"check-status");check.disabled=result?.pending===true;
+    const heading=text("div",undefined,"run-section-head");heading.append(root.firstChild,check);root.append(heading,output);
+    if(result?.pending) output.append(text("p","Checking latest status…","inline-hint"));
+    else if(result?.error) output.append(text("p",controlError(result.error),"run-warning"));
+    else if(result?.manage) {
+      output.append(text("small",`${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`,"inline-hint"));
+      const rows=text("dl",undefined,"run-facts");
+      fact(rows,"Manage",`${translatePhrase(processStatusLabel(result.manage.status))} · ${translatePhrase(result.manage.fresh ? "Fresh snapshot" : "Out-of-date snapshot")}`);
+      fact(rows,"GitHub",result.github?.status==="verified"?translatePhrase(ticketStatusLabel(result.github.state)):translatePhrase("Not available"));
+      if(result.worker?.status)fact(rows,"Worker",`${translatePhrase(operationLabel(result.worker.status))} · ${result.worker.active_jobs ?? "—"} ${translatePhrase("active jobs")}`);
+      output.append(rows);
+      if(result.issue_conflict)output.append(text("p","GitHub is closed while Manage still reports pending or running work. These sources disagree.","run-warning"));
+      else output.append(text("p","Issue state and agent execution are separate. An open issue can contain completed work.","inline-hint"));
+      if(result.worker_conflict)output.append(text("p","Manage reports this run as active, but the assigned worker reports no active jobs.","run-warning"));
+      output.dataset.state=result.disagreement?"failed":"verified";
+    } else output.append(text("p","Compare the latest Manage report with GitHub and the worker.","inline-hint"));
+    return root;
+  }
+  function overview(job,state) {
+    const root = text("div");
+    const lines=job.output || [];
+    const final=[...lines].reverse().find((line)=>line.kind==="final" && String(line.text || "").trim());
+    const error=[...lines].reverse().find((line)=>category(line)==="errors" && String(line.text || "").trim());
+    const result=job.status==="failed" ? error || final : final;
+    const outcome=section(result ? (job.status==="failed" ? "Failure details" : "Agent response") : "Latest activity","run-outcome");
+    if(result) {
+      outcome.dataset.outcome=job.status;
+      outcome.append(eventRow({key:eventKey(result),lines:[result],content:result.text,category:category(result)},state));
+      outcome.append(action("Copy response",()=>copy(String(result.text),"Response copied."),"copy-response"));
+    } else {
+      outcome.append(text("p",job.status==="done" ? "No final response is included in this snapshot. Open GitHub or Manage for the completion report." : job.status==="failed" ? "No failure details are included in this snapshot. Open Manage to investigate." : lines.length ? "Most recent recorded action" : "No output from the agent yet.","inline-hint"));
+      const latest=groups(lines).slice(-1)[0];if(latest)outcome.append(eventRow(latest,state,true));
+    }
+    root.append(outcome);
+    const context=section("Execution context");const facts=text("dl",undefined,"run-facts");
+    fact(facts,"Agent",operationLabel(job.provider));fact(facts,"Runtime",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):null);
+    fact(facts,"Last activity",job.updated_at?ticketDateLabel(job.updated_at):null);
+    context.append(facts);root.append(context);
+    root.append(sourceCheck(job));
+    const related=(processesSnapshot?.jobs || []).filter((item)=>item.id===job.parent_id || item.parent_id===job.id);
+    if(related.length){const sectionRoot=section("Related runs");for(const item of related){const label=`${translatePhrase(item.id===job.parent_id?"Parent run":"Child run")} · ${processIssueReference(item).label}`;sectionRoot.append(action(label,()=>consoleOpenProcess(item.id),`related-${item.id}`));}root.append(sectionRoot);}
+    return root;
+  }
+  function outputText(job,lines) {
+    return [`${processIssueReference(job).label} · ${job.id}`,`${translatePhrase("Last reported status")}: ${translatePhrase(processStatusLabel(job.status))}`,translatePhrase("Recent events retained by the worker; this may not be the full history."),"",...lines.map(line=>`[${timestamp(line.at_ms)||"—"}] ${line.kind}${line.truncated?" [truncated]":""}\n${line.text}`)].join("\n\n");
+  }
+  function activity(job,state) {
+    const root=text("div",undefined,"run-activity");
+    const live=processDisplayStatus(job)==="running";
+    const head=text("div",undefined,"run-section-head");
+    head.append(text("h3",`${translatePhrase(live?"Live output":"Saved output")} · ${state.output.length} ${translatePhrase("events")}`));
+    head.append(action("Copy output",()=>copy(outputText(job,state.output),"Output copied."),"copy-output"));root.append(head);
+    root.append(text("p","Recent events retained by the worker; this may not be the full history.","inline-hint"));
+    if(state.pending){root.append(action("Show new activity",()=>{state.output=state.pending;state.pending=null;render(job,true);byId("ops-drawer-body").scrollTop=0;},"new-activity","button primary small"));}
+    const toolbar=text("div",undefined,"run-activity-toolbar");
+    const search=text("input");search.type="search";search.placeholder=translatePhrase("Search activity…");search.setAttribute("aria-label",translatePhrase("Search activity"));search.value=state.query;search.dataset.runFocus="search";
+    const select=text("select");select.setAttribute("aria-label",translatePhrase("Filter activity"));select.dataset.runFocus="filter";
+    for(const [value,label] of [["all","All events"],["messages","Messages"],["tools","Tools"],["errors","Errors"],["events","Run events"]]) {const option=text("option",label);option.value=value;select.append(option);}select.value=state.filter;
+    const order=action(state.newest?"Newest first":"Oldest first",()=>{state.newest=!state.newest;render(job,true);},"order");order.setAttribute("aria-label",translatePhrase("Reverse activity order"));
+    toolbar.append(search,select,order);root.append(toolbar);
+    const count=text("p",undefined,"run-match-count");count.setAttribute("role","status");
+    const log=text("div",undefined,"run-event-list");log.setAttribute("aria-label",translatePhrase(live?"Live agent output":"Saved agent output"));
+    const paint=()=>{
+      const query=state.query.trim().toLocaleLowerCase();
+      let visible=groups(state.output).filter(group=>(state.filter==="all" || group.category===state.filter) && (!query || group.lines.some(line=>`${line.kind} ${line.text}`.toLocaleLowerCase().includes(query))));
+      if(state.newest)visible.reverse();
+      const events=visible.reduce((n,group)=>n+group.lines.length,0);count.textContent=`${events} / ${state.output.length} ${translatePhrase("events")}`;
+      log.replaceChildren(...visible.map(group=>eventRow(group,state)));
+      if(!visible.length)log.append(text("p",state.output.length?"No events match your search.":"No output from the agent yet.","run-empty"));
+    };
+    search.addEventListener("input",()=>{state.query=search.value;paint();});select.addEventListener("change",()=>{state.filter=select.value;paint();});
+    root.append(count,log);paint();return root;
+  }
+  function details(job) {
+    const root=text("div");const facts=section("Run details");const list=text("dl",undefined,"run-facts");
+    for(const [label,value] of [
+      ["Last reported status",translatePhrase(processStatusLabel(job.status))],
+      ["Created",job.created_at?ticketDateLabel(job.created_at):null],
+      ["Updated",job.updated_at?ticketDateLabel(job.updated_at):null],
+      ["On this worker",translatePhrase(job.assigned_to_worker?"Yes":"No")],
+      ["Approval",translatePhrase(job.approved?"Approved":"Not reported")],
+      ["Decisions",String(job.decision_count ?? 0)],
+      ["Type",job.kind?translatePhrase(operationLabel(job.kind)):null],
+      ["Came from",job.source && job.source!=="unknown"?translatePhrase(operationLabel(job.source)):null],
+    ])if(value)fact(list,label,value);
+    const observed=text("div",undefined,"run-fact");observed.append(text("dt","Snapshot"));const date=raw("dd",controlTime(processesSnapshot?.observed_at_ms));date.dataset.runSnapshot="";observed.append(date);list.append(observed);
+    facts.append(list);root.append(facts);
+    const references=section("References");
+    for(const [label,value] of [["Run ID",job.id],["Ticket ID",job.issue_id],["Conversation",job.session_id],["Part of",job.parent_id],["Site",job.site_id]])if(value){
+      const row=text("div",undefined,"run-reference");const content=text("div");content.append(text("small",label),raw("code",value));
+      const button=action("Copy",()=>copy(value),`copy-${label}`);button.setAttribute("aria-label",`${translatePhrase("Copy")} ${translatePhrase(label)}`);row.append(content,button);references.append(row);
+    }
+    root.append(references);
+    if(job.assigned_to_worker && processesSnapshot?.worker){const worker=processesSnapshot.worker;const sectionRoot=section("Current worker");sectionRoot.append(text("p","Current worker configuration, not a record of this run’s model or usage.","inline-hint"));const workerFacts=text("dl",undefined,"run-facts");
+      for(const [label,value] of [["Status",translatePhrase(operationLabel(worker.status))],["Agent",operationLabel(worker.provider)],["Model",worker.model],["Runtime",worker.runtime],["Version",worker.cli_version],["Active jobs",`${worker.active_jobs ?? 0} / ${worker.concurrency ?? "—"}`]])if(value)fact(workerFacts,label,value);
+      sectionRoot.append(workerFacts);root.append(sectionRoot);}
+    return root;
+  }
+  function header(job,state) {
+    const drawer=byId("ops-drawer");drawer.classList.add("is-run-panel");
+    let tools=drawer.querySelector(".run-header-tools");if(!tools){tools=text("div",undefined,"run-header-tools");drawer.querySelector(".drawer-head").insertBefore(tools,drawer.querySelector(".drawer-close"));}
+    const visible=processHierarchy(processesSnapshot?.jobs || []).filter(({job})=>processMatches(job,processFilter)).map(({job})=>job);
+    const index=visible.findIndex(item=>item.id===job.id);
+    const previous=action("‹",()=>{consoleOpenProcess(visible[index-1].id);byId("ops-drawer").querySelector('[data-run-focus="previous"]')?.focus();},"previous","run-icon-button");
+    const next=action("›",()=>{consoleOpenProcess(visible[index+1].id);byId("ops-drawer").querySelector('[data-run-focus="next"]')?.focus();},"next","run-icon-button");
+    previous.setAttribute("aria-label",translatePhrase("Previous run"));next.setAttribute("aria-label",translatePhrase("Next run"));previous.title=previous.getAttribute("aria-label");next.title=next.getAttribute("aria-label");previous.disabled=index<=0;next.disabled=index<0 || index>=visible.length-1;
+    const position=raw("small",index>=0?`${index+1} / ${visible.length}`:"—","run-position");
+    const expand=action(drawer.classList.contains("is-expanded")?"↙":"↗",()=>{drawer.classList.toggle("is-expanded");drawer.closest(".view-split").classList.toggle("has-expanded-run",drawer.classList.contains("is-expanded"));render(job,true);byId("ops-drawer").querySelector('[data-run-focus="expand"]')?.focus();},"expand","run-icon-button run-expand");
+    expand.setAttribute("aria-label",translatePhrase(drawer.classList.contains("is-expanded")?"Collapse panel":"Expand panel"));expand.title=expand.getAttribute("aria-label");expand.setAttribute("aria-pressed",String(drawer.classList.contains("is-expanded")));
+    tools.replaceChildren(previous,position,next,expand);
+  }
+  function render(job,force=false) {
+    if(!job)return;
+    const body=byId("ops-drawer-body"),drawer=byId("ops-drawer");
+    const changed=currentId!==job.id || !drawer.classList.contains("is-run-panel");
+    const state=stateFor(job);const fresh=processSnapshotIsFresh();const displayStatus=processDisplayStatus(job);
+    const nextSignature=JSON.stringify([job,processesSnapshot?.worker,fresh,currentLanguage,processFilter,(processesSnapshot?.jobs || []).map(j=>[j.id,j.parent_id,j.status]),controlState.runs.get(job.id)]);
+    if(!changed && !force && nextSignature===signature){body.querySelectorAll("[data-run-snapshot]").forEach(node=>node.textContent=controlTime(processesSnapshot?.observed_at_ms));return;}
+    const focused=drawer.contains(document.activeElement)?document.activeElement:null;
+    const focusKey=focused?.dataset.runFocus;const selection=focused?.tagName==="INPUT"?[focused.selectionStart,focused.selectionEnd]:null;
+    const scroll=changed?0:body.scrollTop;
+    const incoming=job.output || [];
+    if(JSON.stringify(incoming)!==JSON.stringify(state.output)) {
+      if(!changed && state.tab==="activity" && scroll>100)state.pending=incoming;
+      else {state.output=incoming;state.pending=null;}
+    }
+    currentId=job.id;signature=nextSignature;
+    byId("ops-drawer-kicker").textContent=`${translatePhrase("Agent run")} · ${translatePhrase(processStatusLabel(displayStatus))}`;
+    const title=byId("ops-drawer-title");title.dataset.i18nSkip="";title.textContent=processIssueReference(job).label;
+    header(job,state);
+    const summary=text("section",undefined,"run-summary");
+    const identity=text("div",undefined,"run-identity");const mark=raw("span",String(operationLabel(job.provider)).slice(0,1).toUpperCase(),"run-agent-mark");mark.setAttribute("aria-hidden","true");
+    const provider=text("div",undefined,"run-agent-name");provider.append(raw("strong",operationLabel(job.provider)),text("small",job.runtime && job.runtime!=="unknown"?operationLabel(job.runtime):"Runtime not reported"));
+    const badge=consoleBadge(translatePhrase(processStatusLabel(displayStatus)),processStatusTone(displayStatus));identity.append(mark,provider,badge);summary.append(identity);
+    const lede={pending:"Waiting for a free agent to pick it up.",pending_approval:"Waiting for your approval in Manage. Nothing runs until it is approved.",running:"An agent is working on this right now.",done:"The agent finished this run.",failed:"This run failed. Check the output below, then retry from Manage.",cancelled:"This run was cancelled.",unconfirmed:!fresh?"This snapshot is out of date. Current execution is unconfirmed.":"Manage reports a running job, but matching worker activity is not confirmed."}[displayStatus] || "Agent run.";
+    summary.append(text("p",lede,displayStatus==="unconfirmed"||displayStatus==="failed"?"run-warning":"run-lede"));
+    if(!fresh)summary.append(text("small","Out-of-date snapshot","run-warning"));
+    const actions=text("div",undefined,"run-actions");
+    for(const [label,url] of [["GitHub ↗",processIssueReference(job).href],[job.status==="pending_approval"?"Approve in Manage ↗":"Manage ↗",safeTicketLink(job.manage_url)]])if(url){const link=text("a",label,"button ghost small");link.href=url;link.target="_blank";link.rel="noreferrer";actions.append(link);}
+    actions.append(action("Refresh",()=>loadProcesses({announce:true}),"refresh"));
+    const updated=text("span",undefined,"run-updated");updated.append(time(job.updated_at));actions.append(updated);summary.append(actions);
+    const tabs=text("div",undefined,"drawer-tabs run-tabs");tabs.setAttribute("role","tablist");tabs.setAttribute("aria-label",translatePhrase("Run sections"));
+    for(const [key,label] of [["overview","Overview"],["activity","Activity"],["artifacts","Deliverables"],["details","Details"]]){
+      const button=action(label,()=>switchTab(key,true),`tab-${key}`,state.tab===key?"is-active":"");button.id=`run-tab-${key}`;button.setAttribute("role","tab");button.setAttribute("aria-controls",`run-pane-${key}`);button.setAttribute("aria-selected",String(state.tab===key));button.tabIndex=state.tab===key?0:-1;
+      button.addEventListener("keydown",event=>{const keys=["overview","activity","artifacts","details"],i=keys.indexOf(key);const target=event.key==="ArrowRight"?keys[(i+1)%keys.length]:event.key==="ArrowLeft"?keys[(i+keys.length-1)%keys.length]:event.key==="Home"?keys[0]:event.key==="End"?keys[keys.length-1]:null;if(target){event.preventDefault();switchTab(target,true);}});tabs.append(button);
+    }
+    body.replaceChildren(summary,tabs);
+    for(const [key,build] of [["overview",()=>overview(job,state)],["activity",()=>activity(job,state)],["artifacts",()=>artifactRunPane(job)],["details",()=>details(job)]]){const pane=build();pane.id=`run-pane-${key}`;pane.classList.add("run-pane");pane.setAttribute("role","tabpanel");pane.setAttribute("aria-labelledby",`run-tab-${key}`);pane.hidden=state.tab!==key;body.append(pane);}
+    body.scrollTop=scroll;
+    if(focusKey){const replacement=[...drawer.querySelectorAll("[data-run-focus]")].find(node=>node.dataset.runFocus===focusKey && !node.closest("[hidden]"));if(replacement){replacement.focus({preventScroll:true});if(selection && replacement.tagName==="INPUT")replacement.setSelectionRange(...selection);}}
+  }
+  function resetShell() {
+    const drawer=byId("ops-drawer");drawer.classList.remove("is-run-panel","is-expanded");drawer.closest(".view-split")?.classList.remove("has-expanded-run");drawer.querySelector(".run-header-tools")?.remove();currentId=null;signature=null;
+  }
+  return {render,resetShell};
+})();
+
+function renderProcessDrawer(job) { processPanel.render(job); }
 
 async function loadProcesses({ announce = false } = {}) {
+  const sequence = ++processesLoadSequence;
   const button = byId("processes-refresh");
   button.disabled = true;
   try {
-    renderProcesses(await api("/api/processes"));
+    const view = await api("/api/processes");
+    if (sequence !== processesLoadSequence) return;
+    renderProcesses(view);
     if (announce) toast("Process visibility refreshed.");
   } catch (_error) {
+    if (sequence !== processesLoadSequence) return;
     renderProcesses({ health: "unavailable", observed_at_ms: Date.now(), stats: {}, worker: null, jobs: [] });
     if (announce) toast("Process visibility is unavailable.", "error");
   } finally {
-    button.disabled = false;
+    if (sequence === processesLoadSequence) button.disabled = false;
   }
 }
 
@@ -4329,6 +5025,7 @@ function renderTicketDrawer(ticket) {
   const summary = document.createElement("section");
   summary.className = "drawer-section";
   summary.append(badges, actions);
+  appendTicketCheck(actions, summary, ticket);
   const detailsSection = document.createElement("section");
   detailsSection.className = "drawer-section";
   const detailsTitle = document.createElement("h3");
@@ -5144,6 +5841,100 @@ function configurationValue(key, value) {
   return String(value);
 }
 
+const connectionTestResults = new Map();
+let connectionTestActive = false;
+const connectionTestReasons = {
+  bot_authenticated: "Bot authentication verified.",
+  account_authenticated: "Account authentication verified.",
+  support_read_verified: "Support access verified.",
+  tools_discovered: "Tool discovery verified.",
+  not_configured: "Connection is not configured.",
+  not_enabled: "Configure an authorized user before testing.",
+  invalid_configuration: "Review the connection configuration on the server.",
+  credentials_unavailable: "Reconnect GitHub on the server, then retry.",
+  authentication_rejected: "Authentication rejected. Reconnect and retry.",
+  request_rejected: "Access refused. Check the connection permissions.",
+  service_unavailable: "Service unavailable. Check access and retry.",
+  timed_out: "The connection timed out. Try again.",
+  discovery_failed: "Some MCP servers could not list their tools.",
+  discovery_timed_out: "MCP discovery timed out before all servers were checked.",
+};
+
+function renderConnectionResult(key, output) {
+  const result = connectionTestResults.get(key);
+  output.replaceChildren();
+  output.hidden = !result;
+  if (!result) return;
+  output.dataset.state = result.ok ? "success" : "error";
+  const message = document.createElement("span");
+  message.textContent = translatePhrase(connectionTestReasons[result.reason] || "The check could not finish. Try again.");
+  output.append(message);
+  if (Number.isSafeInteger(result.servers_passed) && Number.isSafeInteger(result.servers_total)) {
+    const count = document.createElement("span");
+    count.textContent = `${result.servers_passed}/${result.servers_total} ${translatePhrase("servers verified")}`;
+    output.append(count);
+  }
+  if (Number.isSafeInteger(result.checked_at_ms) && result.checked_at_ms > 0) {
+    const time = document.createElement("time");
+    time.dateTime = new Date(result.checked_at_ms).toISOString();
+    time.textContent = `${translatePhrase("Checked")} ${new Intl.DateTimeFormat(localeTag(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(result.checked_at_ms)}`;
+    time.title = new Date(result.checked_at_ms).toLocaleString(localeTag());
+    output.append(time);
+  }
+}
+
+function addConnectionTest(row, detail, key) {
+  if (!["slack", "telegram", "github", "support", "mcp"].includes(key)) return;
+  row.dataset.connection = key;
+  row.classList.add("connection-row");
+  detail.classList.add("connection-state");
+  const controls = document.createElement("dd");
+  controls.className = "connection-controls";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "connection-test-button";
+  button.dataset.connectionTest = key;
+  button.disabled = connectionTestActive;
+  button.textContent = translatePhrase("Test");
+  const name = { slack: "Slack", telegram: "Telegram", github: "GitHub", support: translatePhrase("Support"), mcp: "MCP" }[key];
+  button.setAttribute("aria-label", `${translatePhrase("Test")} ${name}`);
+  const output = document.createElement("dd");
+  output.className = "connection-test-result";
+  output.setAttribute("role", "status");
+  output.setAttribute("aria-live", "polite");
+  renderConnectionResult(key, output);
+  button.addEventListener("click", async () => {
+    if (connectionTestActive) return;
+    connectionTestActive = true;
+    document.querySelectorAll("[data-connection-test]").forEach((item) => { item.disabled = true; });
+    button.textContent = translatePhrase("Testing…");
+    button.setAttribute("aria-busy", "true");
+    output.hidden = false;
+    output.dataset.state = "pending";
+    output.textContent = translatePhrase("Checking connection…");
+    try {
+      const result = await api("/api/connections/test", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connector: key }), signal: AbortSignal.timeout(25000),
+      });
+      if (result.connector !== key || typeof result.ok !== "boolean") throw new Error("invalid_response");
+      connectionTestResults.set(key, result);
+      renderConnectionResult(key, output);
+    } catch (error) {
+      connectionTestResults.delete(key);
+      output.dataset.state = "error";
+      output.textContent = translatePhrase(error.message === "connection_test_busy" ? "Another connection test is running. Try again shortly." : "The check could not finish. Try again.");
+    } finally {
+      connectionTestActive = false;
+      document.querySelectorAll("[data-connection-test]").forEach((item) => { item.disabled = false; });
+      button.textContent = translatePhrase("Test again");
+      button.removeAttribute("aria-busy");
+    }
+  });
+  controls.append(button);
+  row.append(controls, output);
+}
+
 function renderConfigSection(title, values) {
   const metadata = configurationSectionMeta[title] || { category: "security", description: "Effective runtime configuration." };
   const card = document.createElement("article");
@@ -5177,7 +5968,7 @@ function renderConfigSection(title, values) {
     const row = document.createElement("div");
     if (/(seconds|bytes|count|depth|limit)/.test(key)) row.dataset.configTechnical = "true";
     const term = document.createElement("dt");
-    term.textContent = label(key);
+    term.textContent = key === "github" ? "GitHub" : label(key);
     const detail = document.createElement("dd");
     detail.textContent = configurationValue(key, value);
     if (typeof value === "boolean") detail.className = value ? "boolean-true" : "boolean-false";
@@ -5185,12 +5976,13 @@ function renderConfigSection(title, values) {
       detail.className = value === "authenticated" ? "auth-good" : value === "configured_unverified" ? "auth-warning" : "auth-danger";
     }
     row.append(term, detail);
+    if (title === "Connectors") addConnectionTest(row, detail, key);
     list.append(row);
   });
   const footer = document.createElement("div");
   footer.className = "config-card-footer";
   const scope = document.createElement("small");
-  scope.textContent = "From the server · no secrets";
+  scope.textContent = title === "Connectors" ? "Read-only tests · no messages sent" : "From the server · no secrets";
   const action = document.createElement("button");
   action.className = "config-inline-action";
   action.type = "button";
@@ -5271,11 +6063,18 @@ function agentAccountButton(text, action, disabled = false) {
   button.type = "button";
   button.textContent = translatePhrase(text);
   button.disabled = disabled;
-  button.addEventListener("click", action);
+  button.addEventListener("click", async () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    try { await action(); } finally { if (button.isConnected) button.disabled = disabled; }
+  });
   return button;
 }
 
 async function mutateAgentAccounts(payload, successMessage) {
+  if (agentAccountMutation) return null;
+  agentAccountMutation = true;
+  ++agentAccountsRequest;
   try {
     const view = await api("/api/agent-accounts/action", {
       method: "POST",
@@ -5288,6 +6087,7 @@ async function mutateAgentAccounts(payload, successMessage) {
     return view;
   } catch (error) {
     const messages = {
+      account_label_invalid: "Use a name between 1 and 48 characters.",
       account_not_authenticated: "Complete native sign-in before selecting this account.",
       selected_account_cannot_be_removed: "Select another worker account before removing this one.",
       confirmation_required: "Confirmation is required for this account change.",
@@ -5296,18 +6096,68 @@ async function mutateAgentAccounts(payload, successMessage) {
     };
     toast(messages[error.message] || `Agent account action failed (${error.message}).`, "error");
     return null;
-  }
+  } finally { agentAccountMutation = false; }
+}
+
+function agentAccountDialog(titleText, description, { value = null, submit = "Save" } = {}) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "agent-dialog";
+    const form = document.createElement("form");
+    const title = document.createElement("h2");
+    title.id = "agent-dialog-title";
+    title.textContent = translatePhrase(titleText);
+    dialog.setAttribute("aria-labelledby", title.id);
+    const hint = document.createElement("p");
+    hint.textContent = translatePhrase(description);
+    form.append(title, hint);
+    let input;
+    if (value !== null) {
+      const field = document.createElement("label");
+      field.textContent = translatePhrase("Account name");
+      input = document.createElement("input");
+      input.value = value;
+      input.required = true;
+      input.maxLength = 48;
+      input.autocomplete = "off";
+      input.addEventListener("input", () => input.setCustomValidity(""));
+      field.append(input);
+      form.append(field);
+    }
+    const buttons = document.createElement("div");
+    buttons.className = "agent-dialog-actions";
+    buttons.append(agentAccountButton("Cancel", () => dialog.close()));
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.className = "button primary";
+    save.textContent = translatePhrase(submit);
+    buttons.append(save);
+    form.append(buttons);
+    let result = null;
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (input && !input.value.trim()) { input.setCustomValidity(translatePhrase("Enter an account name.")); input.reportValidity(); return; }
+      result = input ? input.value.trim() : true;
+      dialog.close();
+    });
+    dialog.addEventListener("close", () => { dialog.remove(); resolve(result); }, { once: true });
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+    if (input) { input.focus(); input.select(); }
+  });
 }
 
 async function startAgentLogin(provider, account = null) {
-  const proposed = account?.label || `${agentProviderName(provider)} ${new Date().toLocaleDateString(localeTag(), { month: "short", day: "numeric" })}`;
-  const alias = window.prompt(translatePhrase("Choose a local alias for this subscription account."), proposed);
-  if (alias === null || !alias.trim()) return;
-  await mutateAgentAccounts({ action: "start_login", provider, label: alias.trim(), account_id: account?.id || null }, "Native sign-in started.");
+  const proposed = account?.label || agentProviderName(provider);
+  const alias = await agentAccountDialog(account ? "Reconnect account" : "Connect a subscription", "Choose a name, then sign in securely on the provider’s website.", { value: proposed, submit: "Continue to sign-in" });
+  if (!alias) return;
+  await mutateAgentAccounts({ action: "start_login", provider, label: alias, account_id: account?.id || null }, "Native sign-in started.");
   scheduleAgentAccountsPoll(true);
 }
 
 function renderAgentLoginSession(session) {
+  const terminal = ["authenticated", "failed", "cancelled"].includes(session.status);
   const card = document.createElement("div");
   card.className = "agent-login-card";
   const head = document.createElement("div");
@@ -5326,7 +6176,7 @@ function renderAgentLoginSession(session) {
   head.append(identity, status);
   const instructions = document.createElement("div");
   instructions.className = "agent-login-instructions";
-  const authorizationUrl = safeAgentAuthorizationUrl(session);
+  const authorizationUrl = terminal ? null : safeAgentAuthorizationUrl(session);
   if (authorizationUrl) {
     const link = document.createElement("a");
     link.className = "agent-login-link";
@@ -5336,14 +6186,14 @@ function renderAgentLoginSession(session) {
     link.textContent = translatePhrase(session.provider === "claude" ? "Continue with Claude.ai ↗" : "Continue with ChatGPT ↗");
     instructions.append(link);
   }
-  if (typeof session.user_code === "string") {
+  if (!terminal && typeof session.user_code === "string") {
     const code = document.createElement("code");
     code.className = "agent-login-code";
     code.dataset.i18nSkip = "";
     code.textContent = session.user_code;
     instructions.append(code);
   }
-  if (session.accepts_authorization_code === true) {
+  if (!terminal && session.accepts_authorization_code === true) {
     const codeInput = document.createElement("input");
     codeInput.className = "agent-authorization-input";
     codeInput.type = "text";
@@ -5361,98 +6211,430 @@ function renderAgentLoginSession(session) {
     });
     instructions.append(codeInput, submit);
   }
-  if (!["authenticated", "failed", "cancelled"].includes(session.status)) {
+  if (!terminal) {
     instructions.append(agentAccountButton("Cancel", () => mutateAgentAccounts({ action: "cancel_login", session_id: session.id }, "Native sign-in cancelled.")));
+  } else {
+    instructions.append(agentAccountButton("Dismiss", () => {
+      dismissedAgentLogins.add(session.id);
+      renderAgentAccounts(agentAccountsView);
+    }));
   }
   card.append(head);
   if (instructions.childNodes.length) card.append(instructions);
   return card;
 }
 
+function agentUsageDate(value) {
+  const date = new Date(value);
+  return value && Number.isFinite(date.getTime()) ? new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(date) : null;
+}
+
+function renderAgentUsage(usage = {}) {
+  const root = document.createElement("div");
+  root.className = "agent-usage";
+  const header = document.createElement("div");
+  header.className = "agent-usage-heading";
+  const title = document.createElement("strong");
+  title.textContent = translatePhrase("Subscription usage");
+  const state = document.createElement("span");
+  const stale = usage.status !== "available" || !usage.checked_at_ms || Date.now() - usage.checked_at_ms > 360000;
+  state.textContent = translatePhrase(usage.status === "loading" ? "Checking usage…" : stale ? "Usage unavailable" : "Latest reading");
+  header.append(title, state);
+  root.append(header);
+  const windows = Array.isArray(usage.windows) ? usage.windows : [];
+  for (const window of windows) {
+    if (typeof window.used_percent !== "number" || !Number.isFinite(window.used_percent) || window.used_percent < 0 || window.used_percent > 100) continue;
+    const row = document.createElement("div");
+    row.className = "agent-usage-window";
+    const used = Math.round(window.used_percent * 10) / 10;
+    row.dataset.level = stale ? "stale" : used >= 95 ? "critical" : used >= 80 ? "warning" : "normal";
+    const line = document.createElement("div");
+    line.className = "agent-usage-line";
+    const labelNode = document.createElement("span");
+    const minutes = window.duration_minutes;
+    const duration = minutes === 300 ? "5-hour window" : minutes === 10080 ? "Weekly limit" : minutes ? `${minutes} min` : "Usage window";
+    labelNode.textContent = `${window.name === "codex" ? "Codex" : window.name || ""} · ${translatePhrase(duration)}`;
+    const amount = document.createElement("strong");
+    amount.textContent = `${new Intl.NumberFormat(localeTag(), { maximumFractionDigits: 1 }).format(used)}% ${translatePhrase("used")}`;
+    line.append(labelNode, amount);
+    const bar = document.createElement("progress");
+    bar.max = 100;
+    bar.value = used;
+    bar.setAttribute("aria-label", labelNode.textContent);
+    const detail = document.createElement("small");
+    const resetValue = window.resets_at_ms || window.resets_at;
+    const reset = agentUsageDate(resetValue);
+    detail.textContent = reset ? `${translatePhrase(new Date(resetValue).getTime() <= Date.now() ? "Reset time passed; refresh pending" : "Resets")} · ${reset}` : translatePhrase("Reset time not provided");
+    row.append(line, bar, detail);
+    root.append(row);
+  }
+  const note = document.createElement("p");
+  note.className = "agent-usage-note";
+  const reasons = {
+    sign_in_required: "Sign in to view subscription usage.",
+    provider_rate_limited: "The provider has limited usage checks. We’ll retry after the cooldown.",
+    provider_timeout: "The provider took too long to respond. Try again later.",
+    not_reported: "The provider has not returned usage limits for this account.",
+    provider_unavailable: "Usage could not be retrieved. Try again later.",
+    dashboard_unavailable: "The connection was lost. These readings may be out of date.",
+  };
+  const messages = [];
+  if (stale && windows.length) messages.push(translatePhrase("Previous reading — usage may have changed."));
+  if (usage.status === "unavailable") messages.push(translatePhrase(reasons[usage.reason] || "Usage has not been checked yet."));
+  if (usage.checked_at_ms) messages.push(`${translatePhrase("Checked")} · ${agentUsageDate(usage.checked_at_ms)}`);
+  note.textContent = messages.join(" ");
+  if (note.textContent) root.append(note);
+  return root;
+}
+
+function agentAccountConnected(account) {
+  return ["authenticated", "configured_unverified"].includes(account.status) && account.usage?.reason !== "sign_in_required";
+}
+
 function renderAgentAccount(account) {
   const card = document.createElement("div");
   card.className = "agent-account-card";
+  card.dataset.accountId = account.id;
+  card.dataset.worker = String(account.worker_selected === true);
   const head = document.createElement("div");
   head.className = "agent-account-head";
   const identity = document.createElement("div");
   identity.className = "agent-account-identity";
+  const provider = document.createElement("small");
+  provider.textContent = account.provider === "claude" ? "Claude · Claude Code" : "ChatGPT · Codex";
   const labelNode = document.createElement("strong");
   labelNode.dataset.i18nSkip = "";
   labelNode.textContent = account.label;
-  const provider = document.createElement("small");
-  provider.textContent = `${account.provider_name} · ${account.method === "claude_ai" ? "Claude.ai" : "ChatGPT"}${account.worker_selected ? ` · ${translatePhrase("ACTIVE WORKER")}` : ""}`;
-  identity.append(labelNode, provider);
+  identity.append(provider, labelNode);
   const status = document.createElement("span");
   status.className = "agent-account-status";
-  status.dataset.state = account.status;
-  status.textContent = authenticationLabel(account.status);
+  const needsLogin = account.usage?.reason === "sign_in_required";
+  status.dataset.state = needsLogin ? "expired" : account.status;
+  status.textContent = needsLogin ? translatePhrase("Sign-in required") : authenticationLabel(account.status);
   head.append(identity, status);
-  const meta = document.createElement("div");
+  const role = document.createElement("div");
+  role.className = "agent-account-role";
+  role.textContent = translatePhrase("Worker account");
+  if (account.worker_selected) identity.append(role);
+  const meta = document.createElement("p");
   meta.className = "agent-account-meta";
-  meta.textContent = `${translatePhrase("Evidence")}: ${label(account.evidence)}${account.last_verified_at_ms ? ` · ${new Intl.DateTimeFormat(localeTag(), { dateStyle: "medium", timeStyle: "short" }).format(account.last_verified_at_ms)}` : ""}`;
+  meta.textContent = account.last_verified_at_ms ? `${translatePhrase("Last verified")} · ${agentUsageDate(account.last_verified_at_ms)}` : translatePhrase("Not verified yet");
   const actions = document.createElement("div");
   actions.className = "agent-account-buttons";
-  actions.append(
-    agentAccountButton("Use for worker", () => mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected."), account.worker_selected || !["authenticated", "configured_unverified"].includes(account.status)),
-    agentAccountButton("Verify", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")),
-    agentAccountButton("Sign in again", () => startAgentLogin(account.provider, account)),
-    agentAccountButton("Sign out", () => {
-      if (window.confirm(translatePhrase("Sign out this native subscription account?"))) mutateAgentAccounts({ action: "logout", account_id: account.id, confirm: true }, "Account signed out.");
+  const connected = agentAccountConnected(account);
+  actions.append(agentAccountButton(connected ? (account.worker_selected ? "Selected for worker" : "Use for worker") : "Sign in", () => connected ? mutateAgentAccounts({ action: "select", account_id: account.id }, "Worker account selected.") : startAgentLogin(account.provider, account), connected && account.worker_selected));
+  actions.append(agentAccountButton("Verify connection", () => mutateAgentAccounts({ action: "refresh", account_id: account.id }, "Account status refreshed.")));
+  const responseTest = agentAccountButton("Test response", () => mutateAgentAccounts({action:"test_response",account_id:account.id}, "Response test started."), !connected || (agentAccountsView?.accounts || []).some((a)=>a.response_test?.status==="checking"));
+  responseTest.dataset.agentResponseTest = account.id;
+  responseTest.title = translatePhrase("Sends a small test prompt using this subscription.");
+  actions.append(responseTest);
+  const more = document.createElement("details");
+  more.className = "agent-account-manage";
+  const summary = document.createElement("summary");
+  summary.textContent = translatePhrase("Manage account");
+  const management = document.createElement("div");
+  management.append(
+    agentAccountButton("Rename", async () => {
+      const name = await agentAccountDialog("Rename account", "This name is only used in Monique.", { value: account.label });
+      if (name) await mutateAgentAccounts({ action: "rename", account_id: account.id, label: name }, "Account renamed.");
     }),
-    agentAccountButton("Remove", () => {
-      if (window.confirm(translatePhrase("Remove this local account profile and its native credentials?"))) mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
+    agentAccountButton("Sign in again", () => startAgentLogin(account.provider, account)),
+    agentAccountButton("Sign out", async () => {
+      if (await agentAccountDialog("Sign out account", account.worker_selected ? "This account is selected for the worker. New work may require signing in again." : "Sign out this native subscription account?", { submit: "Sign out" })) await mutateAgentAccounts({ action: "logout", account_id: account.id, confirm: true }, "Account signed out.");
+    }, account.status === "signed_out"),
+    agentAccountButton("Remove", async () => {
+      if (await agentAccountDialog("Remove account", "Remove this local account profile and its native credentials?", { submit: "Remove" })) await mutateAgentAccounts({ action: "remove", account_id: account.id, confirm: true }, "Account removed.");
     }, account.worker_selected),
   );
-  card.append(head, meta, actions);
+  more.append(summary, meta, management);
+  const controls = document.createElement("div");
+  controls.className = "agent-account-controls";
+  controls.append(actions, more);
+  card.append(head, renderAgentUsage(account.usage), controls, renderAgentResponseTest(account));
   return card;
 }
 
+function filterAgentAccounts() {
+  const query = byId("agent-account-search").value.trim().toLocaleLowerCase();
+  const filter = byId("agent-account-filter").value;
+  const accounts = agentAccountsView?.accounts || [];
+  let visible = 0;
+  for (const card of byId("agent-account-list").querySelectorAll("[data-account-id]")) {
+    const account = accounts.find((entry) => entry.id === card.dataset.accountId);
+    if (!account) continue;
+    const connected = agentAccountConnected(account);
+    const attention = !connected || account.usage?.status === "unavailable" || account.usage?.windows?.some((window) => window.used_percent >= 80);
+    card.hidden = !`${account.label} ${account.provider} ${account.provider_name}`.toLocaleLowerCase().includes(query) || !(filter === "all" || filter === account.provider || (filter === "connected" && connected) || (filter === "attention" && attention));
+    if (!card.hidden) visible++;
+  }
+  const empty = byId("agent-account-no-matches");
+  if (empty) empty.hidden = visible > 0 || accounts.length === 0;
+}
+
 function renderAgentAccounts(view) {
+  agentAccountsView = view;
   const sessionsRoot = byId("agent-login-sessions");
   const accountsRoot = byId("agent-account-list");
-  sessionsRoot.replaceChildren(...(view.login_sessions || []).map(renderAgentLoginSession));
+  // Keep unchanged login nodes in place: polling must not erase a pasted code,
+  // collapse account controls, or steal keyboard focus.
+  const reconcile = (root, items, key, render) => {
+    const existing = new Map([...root.children].map((node) => [node.dataset.itemKey, node]));
+    const nodes = items.map((item) => {
+      const signature = `${currentLanguage}:${Math.floor(Date.now() / 60000)}:${JSON.stringify(item)}`;
+      let node = existing.get(item[key]);
+      if (!node || node._accountSignature !== signature) {
+        const previousInput = node?.querySelector(".agent-authorization-input");
+        const wasFocused = previousInput && document.activeElement === previousInput;
+        const draft = previousInput?.value;
+        const replacement = render(item);
+        replacement.dataset.itemKey = item[key];
+        replacement._accountSignature = signature;
+        if (draft && replacement.querySelector(".agent-authorization-input")) replacement.querySelector(".agent-authorization-input").value = draft;
+        if (node?.querySelector(".agent-account-manage[open]") && replacement.querySelector(".agent-account-manage")) replacement.querySelector(".agent-account-manage").open = true;
+        if (node) node.replaceWith(replacement);
+        node = replacement;
+        if (wasFocused) requestAnimationFrame(() => node.querySelector(".agent-authorization-input")?.focus());
+      }
+      return node;
+    });
+    for (const node of [...root.children]) if (!nodes.includes(node)) node.remove();
+    nodes.forEach((node, index) => { if (root.children[index] !== node) root.insertBefore(node, root.children[index] || null); });
+  };
+  const sessions = view.login_sessions || [];
+  const sessionIds = new Set(sessions.map((session) => session.id));
+  for (const id of dismissedAgentLogins) if (!sessionIds.has(id)) dismissedAgentLogins.delete(id);
+  reconcile(sessionsRoot, sessions.filter((session) => !["authenticated", "cancelled"].includes(session.status) && !dismissedAgentLogins.has(session.id)), "id", renderAgentLoginSession);
   const accounts = Array.isArray(view.accounts) ? view.accounts : [];
   const providers = Array.isArray(view.providers) ? view.providers : [];
   const maximum = Number.isSafeInteger(view.max_accounts) && view.max_accounts > 0 ? view.max_accounts : null;
   const atCapacity = maximum !== null && accounts.length >= maximum;
-  const capacity = byId("agent-account-capacity");
-  if (capacity) capacity.textContent = maximum === null ? `${accounts.length} accounts` : `${accounts.length} / ${maximum} accounts`;
+  byId("agent-account-capacity").textContent = `${accounts.length}${maximum ? ` / ${maximum}` : ""} ${translatePhrase("accounts")}`;
   document.querySelectorAll("[data-add-agent-provider]").forEach((button) => {
     const provider = providers.find((item) => item?.id === button.dataset.addAgentProvider);
     button.disabled = atCapacity || provider?.available !== true;
   });
-  if (accounts.length) {
-    accountsRoot.replaceChildren(...accounts.map(renderAgentAccount));
-  } else {
-    const empty = document.createElement("div");
-    empty.className = "agent-account-empty";
-    empty.textContent = translatePhrase("No native subscription account is configured yet.");
-    accountsRoot.replaceChildren(empty);
+  const connected = accounts.filter(agentAccountConnected).length;
+  const limited = accounts.filter((a) => a.usage?.status === "available" && a.usage.windows?.some((w) => w.used_percent >= 80)).length;
+  const overview = byId("agent-account-overview");
+  overview.replaceChildren(...[[connected, "Connected accounts"], [accounts.length - connected, "Need sign-in"], [limited, "Approaching a limit"]].map(([value, caption]) => {
+    const tile = document.createElement("div");
+    const number = document.createElement("strong");
+    number.textContent = value;
+    const text = document.createElement("span");
+    text.textContent = translatePhrase(caption);
+    tile.append(number, text);
+    return tile;
+  }));
+  reconcile(accountsRoot, accounts, "id", renderAgentAccount);
+  const responseTestBusy = accounts.some((account) => account.response_test?.status === "checking");
+  for (const button of accountsRoot.querySelectorAll("[data-agent-response-test]")) {
+    const account = accounts.find((item) => item.id === button.dataset.agentResponseTest);
+    button.disabled = responseTestBusy || !account || !agentAccountConnected(account);
   }
+  const empty = document.createElement("div");
+  empty.className = "agent-account-empty";
+  empty.id = "agent-account-no-matches";
+  empty.textContent = translatePhrase(accounts.length ? "No accounts match these filters." : "Connect your first subscription to see its usage and choose an account for the worker.");
+  accountsRoot.append(empty);
+  filterAgentAccounts();
   const activeLogin = (view.login_sessions || []).some((session) => !["authenticated", "failed", "cancelled"].includes(session.status));
-  if (activeLogin) scheduleAgentAccountsPoll();
+  scheduleAgentAccountsPoll(false, activeLogin || accounts.some((a) => a.usage?.status === "loading" || a.response_test?.status === "checking") ? 2000 : 30000);
 }
 
-function scheduleAgentAccountsPoll(immediate = false) {
+function scheduleAgentAccountsPoll(immediate = false, delay = 2000) {
   if (agentAccountsPollTimer !== null) window.clearTimeout(agentAccountsPollTimer);
-  agentAccountsPollTimer = window.setTimeout(() => loadAgentAccounts(true), immediate ? 100 : 2000);
+  agentAccountsPollTimer = window.setTimeout(() => {
+    if (location.hash === "#configuration" && !document.hidden) loadAgentAccounts(true);
+    else scheduleAgentAccountsPoll(false, 30000);
+  }, immediate ? 100 : delay);
 }
 
 async function loadAgentAccounts(polling = false) {
+  if (agentAccountMutation) { scheduleAgentAccountsPoll(); return; }
+  const request = ++agentAccountsRequest;
+  const refresh = byId("agent-accounts-refresh");
+  if (!polling) refresh.disabled = true;
   try {
     const view = await api("/api/agent-accounts");
-    renderAgentAccounts(view);
+    if (request === agentAccountsRequest) renderAgentAccounts(view);
   } catch (error) {
-    if (!polling) {
-      const empty = document.createElement("div");
-      empty.className = "agent-account-empty";
-      empty.textContent = translatePhrase("Native account management is unavailable.");
-      byId("agent-account-list").replaceChildren(empty);
-    }
-  }
+    if (request !== agentAccountsRequest) return;
+    if (!polling) toast("Native account management is unavailable.", "error");
+    if (!agentAccountsView) byId("agent-account-list").textContent = translatePhrase("Native account management is unavailable.");
+    else renderAgentAccounts({ ...agentAccountsView, accounts: (agentAccountsView.accounts || []).map((account) => ({ ...account, usage: { ...account.usage, status: "unavailable", reason: account.usage?.reason === "sign_in_required" ? "sign_in_required" : "dashboard_unavailable" } })) });
+    scheduleAgentAccountsPoll(false, 30000);
+  } finally { if (!polling) refresh.disabled = false; }
 }
 
+byId("agent-account-search").addEventListener("input", filterAgentAccounts);
+byId("agent-account-filter").addEventListener("change", filterAgentAccounts);
+byId("agent-accounts-refresh").addEventListener("click", () => loadAgentAccounts());
+
+// Direct controls share one small result area; no provider text is rendered as HTML.
+const controlState = { view: null, mcp: new Map(), runs: new Map(), tickets: new Map(), timer: null, loading: false };
+const memorySelection = new Map();
+function controlNode(tag, text, className = "") { const node = document.createElement(tag); if (text !== undefined) node.textContent = translatePhrase(String(text)); if (className) node.className = className; return node; }
+function controlData(tag, text) { const node=document.createElement(tag); node.dataset.i18nSkip=""; node.textContent=String(text); return node; }
+function controlTime(ms) { return Number.isFinite(ms) && ms > 0 ? new Date(ms).toLocaleString(localeTag(), { dateStyle: "short", timeStyle: "short" }) : translatePhrase("Not available"); }
+function controlError(error) {
+  return translatePhrase({ automation_revision_stale: "This automation changed. Refresh before trying again.", memory_revision_stale: "A selected memory changed. Refresh and select it again.", backup_busy: "A backup verification is already running.", connection_test_busy: "Another connection test is running. Try again shortly.", agent_test_busy: "An agent response test is already running.", agent_sign_in_required: "Sign in before testing a response.", invalid_request: "Check the selected item and try again." }[error?.message] || "The check could not finish. Try again.");
+}
+function controlAction(action) { return api("/api/controls/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(action), signal: AbortSignal.timeout(25000) }); }
+function controlButton(text, run) {
+  const button = controlNode("button", text, "button ghost small"); button.type = "button";
+  button.addEventListener("click", async () => { if (button.disabled) return; button.disabled = true; button.setAttribute("aria-busy", "true"); try { await run(button); } catch (error) { toast(controlError(error), "error"); } finally { button.disabled = false; button.removeAttribute("aria-busy"); } });
+  return button;
+}
+function controlResult(text = "") { const result = controlNode("div", text, "control-result"); result.setAttribute("role", "status"); result.setAttribute("aria-live", "polite"); return result; }
+function controlCard(title, category, key) {
+  const card = controlNode("article", undefined, "panel config-card control-card"); card.dataset.configCard = ""; card.dataset.configCategory = category; card.dataset.controlCard = key;
+  const head = controlNode("div", undefined, "config-card-heading"); head.append(controlNode("h2", title));
+  head.append(controlButton("Refresh", () => loadControls())); card.append(head); return card;
+}
+async function loadControls() {
+  if (controlState.loading) return;
+  controlState.loading = true;
+  try { controlState.view = await api("/api/controls"); renderControls(); }
+  catch (error) { const root = byId("configuration-controls"); root.replaceChildren(controlResult(controlError(error))); }
+  finally { controlState.loading = false; }
+}
+function renderControls() {
+  const root = byId("configuration-controls"); if (!root) return;
+  // Preserve expanded server/tool lists across backup polling.
+  const expanded = new Set([...root.querySelectorAll("details[open][data-control-details]")].map((node) => node.dataset.controlDetails));
+  root.replaceChildren(); const view = controlState.view || {};
+  const mcp = controlCard("MCP servers & tools", "integrations", "mcp");
+  if (!view.mcp?.servers?.length) mcp.append(controlNode("p", view.mcp?.status === "unavailable" ? "MCP configuration is unavailable." : "No MCP servers configured.", "inline-hint"));
+  for (const server of view.mcp?.servers || []) {
+    const item = controlNode("details", undefined, "control-disclosure"); item.dataset.controlDetails = `mcp:${server}`;
+    const summary = controlNode("summary", ({business:"Manage",support:"Support","support-workflows":"Support · suivi",designer:"Designer · site source","designer-app":"Designer · projets",seo:"SEO",ads:"Ads",mail:"MailDesigner",sms:"SMSDesigner",onboarding:"Onboarding",share:"Share"})[server] || server); summary.dataset.i18nSkip = ""; item.append(summary);
+    const result = controlResult(); const check = controlState.mcp.get(server);
+    result.textContent = check?.status === "verified" ? `${translatePhrase("Tools discovered")}: ${check.tools.length} · ${controlTime(check.checked_at_ms)}` : check?.status === "failed" ? `${translatePhrase("Discovery failed")}: ${translatePhrase(connectionTestReasons[check.reason] || "The check could not finish. Try again.")}${check.checked_at_ms ? ` · ${controlTime(check.checked_at_ms)}` : ""}` : translatePhrase("Not checked yet");
+    result.dataset.state = check?.status || "idle";
+    const compact=controlNode("small",check?.status==="verified"?`✓ ${check.tools.length}`:check?.status==="failed"?"!":check?.status==="checking"?"…":"—","app-connection-summary");compact.dataset.state=check?.status||"idle";summary.append(compact);
+    const discover = controlButton("Refresh tools", async () => {
+      controlState.mcp.set(server, {status:"checking",tools:[]}); item.open = true; renderControls();
+      try { controlState.mcp.set(server, await controlAction({action:"discover_mcp",server})); }
+      catch (error) { controlState.mcp.set(server,{status:"failed",reason:"service_unavailable",tools:[]}); }
+      renderControls();
+    });
+    discover.disabled = [...controlState.mcp.values()].some((check)=>check.status==="checking");
+    if (check?.status==="checking") result.textContent=translatePhrase("Checking connection…");
+    item.append(discover, result);
+    if (check?.status === "verified" && check.connection) {
+      const info=check.connection;
+      const usage=controlNode("p", `${info.calls ?? "—"} appels · ${info.errors ?? "—"} erreurs · ${check.duration_ms} ms`, "inline-hint");usage.dataset.appUsage=server;item.append(usage);
+      item.append(controlNode("p", info.scopes.join(" · "), "inline-hint"));
+      const access=controlNode("details",undefined,"app-access-details");access.append(controlNode("summary","Accès autorisés"),controlNode("p",`Espaces : ${info.tenants.join(", ")}`),controlNode("p",`Ressources : ${info.resources.join(", ")}`));
+      if(info.expires_at)access.append(controlNode("p",`Expire le ${new Date(info.expires_at).toLocaleDateString()}`));item.append(access);
+    }
+    if (check?.status === "verified") {
+      const ask=controlButton("Demander à Monique",()=>{});ask.dataset.chatPrompt=`Utilise la connexion ${server} pour présenter les données disponibles et les actions possibles. Commence par une lecture, sans modifier de données.`;item.append(ask);
+    }
+    for (const tool of check?.tools || []) { const line = controlNode("div", undefined, "control-tool"); const name = controlNode("strong", tool.name); name.dataset.i18nSkip = ""; line.append(name, controlNode("span", tool.read_only ? "Read only" : "Changes data", "source-pill"), controlNode("small", tool.description)); item.append(line); }
+    item.open = expanded.has(item.dataset.controlDetails); mcp.append(item);
+  }
+  const automations = controlCard("Automations", "ai integrations", "automations");
+  automations.append(controlNode("p", "Pause stops future runs. Work already running can finish.", "inline-hint"));
+  const schedule = view.automations || {};
+  if (schedule.status !== "ready") automations.append(controlResult("Automation service is unavailable."));
+  else if (!schedule.items?.length) automations.append(controlNode("p", "No automations registered.", "inline-hint"));
+  for (const item of schedule.items || []) {
+    const row = controlNode("div", undefined, "control-row"); row.dataset.automationId = item.id;
+    const title = controlNode("strong", item.id); title.dataset.i18nSkip = "";
+    const meta = controlNode("div", undefined, "control-meta");
+    meta.append(controlNode("span", {enabled:"Enabled",paused:"Paused",archived:"Archived"}[item.state] || "Unknown"), controlNode("span", `${translatePhrase("Next run")}: ${item.state === "paused" ? translatePhrase("Paused") : controlTime(item.next_run_at_ms)}`), controlNode("span", `${translatePhrase("Last result")}: ${translatePhrase({completed:"Completed",failed:"Failed",pending:"Queued",claimed:"Running",never_run:"Never run",unavailable:"Not available"}[item.last_result] || "Not available")}`), controlNode("span", `${translatePhrase("Last run")}: ${controlTime(item.last_run_at_ms)}`));
+    const actions = controlNode("div", undefined, "control-actions"); const output = controlResult();
+    actions.append(controlButton("Preview", async () => { const preview = await controlAction({ action:"preview_automation", id:item.id }); output.replaceChildren(controlNode("p", "Preview only · nothing will run"), controlNode("span", `${translatePhrase("Schedule")}: ${preview.schedule || "—"} · ${translatePhrase("Scope")}: ${preview.scope || "—"}`), controlData("pre", preview.prompt || translatePhrase("No task registered."))); }));
+    if (item.state !== "archived") actions.append(controlButton(item.state === "paused" ? "Resume" : "Pause", async () => { await controlAction({action:"set_automation",id:item.id,revision:item.revision,paused:item.state !== "paused"}); await loadControls(); }));
+    row.append(title, meta, actions, output); automations.append(row);
+  }
+  if (Number.isSafeInteger(schedule.next_cursor)) automations.append(controlButton("Load more", async () => { const page = await controlAction({action:"list_automations",cursor:schedule.next_cursor}); controlState.view.automations = {...page,items:[...schedule.items,...(page.items || [])]}; renderControls(); }));
+  const backups = controlCard("Backups", "security", "backups");
+  const inventory = view.backups || {}; const timer = inventory.timer || {};
+  backups.append(controlNode("p", timer.status === "active" ? `${translatePhrase("Next backup")}: ${timer.next_run_at_ms ? controlTime(timer.next_run_at_ms) : timer.next_run || translatePhrase("Not available")}` : translatePhrase(timer.status === "not_configured" ? "Automatic backups are not configured." : timer.status === "inactive" ? "Automatic backups are paused." : "Backup schedule is unavailable."), "inline-hint"));
+  if (!inventory.items?.length) backups.append(controlNode("p", "No completed backups found.", "inline-hint"));
+  else backups.append(controlNode("p", `${translatePhrase("Latest backup")}: ${controlTime(inventory.items[0].created_at_ms)}`, "inline-hint"));
+  const history = controlNode("details", undefined, "control-disclosure"); history.dataset.controlDetails = "backup-history"; history.open = expanded.has("backup-history"); history.append(controlNode("summary", "Older backups"));
+  (inventory.items || []).forEach((item, index) => {
+    const row = controlNode("div", undefined, "control-row"); row.dataset.backupId = item.id;
+    row.append(controlNode("strong", controlTime(item.created_at_ms)), controlNode("small", `${item.databases} ${translatePhrase("databases")} · ${(item.bytes / 1048576).toFixed(1)} MB`));
+    const verification = item.verification || {};
+    const result = controlResult(`${translatePhrase({checking:"Verifying backup…",verified:"Backup verified",failed:"Backup verification failed",not_checked:"Not checked yet"}[verification.status] || "Not checked yet")}${verification.checked_at_ms ? ` · ${controlTime(verification.checked_at_ms)}` : ""}`); result.dataset.state = verification.status;
+    const verify = controlButton("Verify backup", async () => { await controlAction({action:"verify_backup",id:item.id}); await loadControls(); }); verify.disabled = (inventory.items || []).some((item)=>item.verification?.status === "checking");
+    row.append(verify, result); (index === 0 ? backups : history).append(row);
+  });
+  if ((inventory.items?.length || 0) > 1) backups.append(history);
+  root.append(mcp, automations, backups); applyConfigurationFilter();
+  if (controlState.timer !== null) clearTimeout(controlState.timer);
+  if ((inventory.items || []).some((item) => item.verification?.status === "checking")) controlState.timer = setTimeout(() => { if (location.hash === "#configuration") loadControls(); }, 2000);
+}
+
+function appendTicketCheck(actions, summary, ticket) {
+  const key=ticketConversationKey(ticket);const output=controlResult();const paint=(result)=>{
+    if(!result)return;
+    if(result.pending){output.textContent=translatePhrase("Checking latest status…");return;}
+    if(result.error){output.textContent=controlError(result.error);return;}
+    output.replaceChildren(controlNode("span", `${translatePhrase("Checked")} ${controlTime(result.checked_at_ms)}`),controlNode("p", `${translatePhrase("Source")}: ${ticket.integration_server} · ${ticketStatusLabel(result.status || "unknown")}`),controlNode("p", `${translatePhrase("Last activity")}: ${result.updated_at ? ticketDateLabel(result.updated_at) : translatePhrase("Not available")}`));
+    if(result.status && result.status!==ticket.status)output.append(controlNode("p","The source status differs from the ticket list. Refresh the list to reconcile the display."));
+  };
+  const existing=controlState.tickets.get(key);paint(existing);
+  const button=controlButton("Check latest status",async()=>{controlState.tickets.set(key,{pending:true});paint({pending:true});try {const result=await api("/api/tickets/detail",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({integration_server:ticket.integration_server,id:ticket.id})});result.checked_at_ms=Date.now();controlState.tickets.set(key,result);paint(result);}catch(error){controlState.tickets.set(key,{error});paint({error});}});button.disabled=!ticket.integration_server || existing?.pending===true;actions.append(button);summary.append(output);
+}
+function renderAgentResponseTest(account) {
+  const test=account.response_test;const output=controlResult();output.classList.add("agent-response-test");
+  if(!test){output.hidden=true;return output;}
+  const labels={checking:"Testing response…",verified:"Response verified",failed:"Response test failed"};
+  output.append(controlNode("strong",labels[test.status] || "Not checked yet"));
+  if(test.reason && test.reason!=="response_verified")output.append(controlNode("span",{quota_limited:"Subscription quota reached.",sign_in_required:"Sign in before testing a response.",timed_out:"The connection timed out. Try again.",response_failed:"The provider could not complete the response test."}[test.reason] || "The check could not finish. Try again."));
+  if(test.status!=="checking")output.append(controlNode("span",test.model || "Model not reported"));
+  if(test.duration_ms!==undefined)output.append(controlNode("span",`${(test.duration_ms/1000).toFixed(1)} s`));
+  if(test.checked_at_ms)output.append(controlNode("time",controlTime(test.checked_at_ms)));
+  output.dataset.state=test.status;return output;
+}
+function updateMemorySelection() {
+  document.querySelectorAll("[data-memory-select]").forEach((checkbox)=>{checkbox.checked=memorySelection.has(checkbox.dataset.memorySelect);});
+  byId("memory-archive-selected").disabled=memorySelection.size===0;
+  byId("memory-selected-count").textContent=`${memorySelection.size} ${translatePhrase("selected")}`;
+}
+function memorySelectionCheckbox(entry) {
+  const checkbox=document.createElement("input");checkbox.type="checkbox";checkbox.className="memory-select";checkbox.dataset.memorySelect=entry.reference;
+  checkbox.setAttribute("aria-label",`${translatePhrase("Select")} ${entry.reference}`);checkbox.checked=memorySelection.has(entry.reference);checkbox.disabled=entry.status!=="active" || !entry.editable;
+  checkbox.addEventListener("click",event=>event.stopPropagation());
+  checkbox.addEventListener("keydown",event=>event.stopPropagation());
+  checkbox.addEventListener("change",()=>{if(checkbox.checked){if(memorySelection.size>=100){checkbox.checked=false;toast(translatePhrase("Select up to 100 memories."),"error");return;}memorySelection.set(entry.reference,{reference:entry.reference,revision:entry.revision});}else memorySelection.delete(entry.reference);updateMemorySelection();});return checkbox;
+}
+async function inspectMemory(action) {
+  const output=byId("memory-inspection");output.hidden=false;output.replaceChildren(controlResult("Checking…"));
+  try {
+    const result=await controlAction(action);output.replaceChildren();
+    const close=controlButton("Dismiss",()=>{output.hidden=true;});output.append(close);
+    if(action.action==="retrieve_memory"){
+      output.append(controlNode("h3","Retrieval preview"),controlNode("p","These are the memories supplied to dashboard chat for this question. No message was sent."));
+      if(!result.entries.length)output.append(controlNode("p","No active memories match this question."));
+      for(const entry of result.entries)output.append(controlData("p",`${entry.reference} · ${entry.content}`));
+    }else{
+      output.append(controlNode("h3","Duplicate memories"),controlNode("p","Matches ignore letter case and extra spaces. Review each group before archiving."));
+      if(!result.groups.length)output.append(controlNode("p","No duplicate memories found."));
+      for(const group of result.groups){const row=controlNode("div",undefined,"control-row");for(const entry of group){const line=controlNode("label",undefined,"memory-duplicate-choice");line.append(memorySelectionCheckbox(entry),controlData("span",`${entry.reference} · ${entry.content}`));row.append(line);}output.append(row);}
+      if(result.truncated)output.append(controlNode("p","Results are limited. Search to narrow the inventory."));
+    }
+  }catch(error){output.replaceChildren(controlResult(controlError(error)));}
+}
+byId("memory-retrieval-test").addEventListener("click",()=>{const query=byId("memory-query").value.trim();if(!query){toast(translatePhrase("Enter a question in the memory search field."));byId("memory-query").focus();return;}inspectMemory({action:"retrieve_memory",query});});
+byId("memory-duplicates").addEventListener("click",()=>inspectMemory({action:"find_duplicates"}));
+byId("memory-select-visible").addEventListener("click",()=>{memorySelection.clear();for(const entry of selectedMemoryEntries().filter(e=>e.editable && e.status==="active").slice(0,100))memorySelection.set(entry.reference,{reference:entry.reference,revision:entry.revision});renderSelectedMemory();updateMemorySelection();});
+byId("memory-clear-selection").addEventListener("click",()=>{memorySelection.clear();renderSelectedMemory();updateMemorySelection();byId("memory-inspection").hidden=true;});
+byId("memory-archive-selected").addEventListener("click",async()=>{
+  const selected=[...memorySelection.values()];if(!selected.length)return;
+  if(!await agentAccountDialog("Archive selected memories", `${translatePhrase("Selected memories")}: ${selected.length}. ${translatePhrase("They will stop appearing in retrieval. Their content and audit history will be retained.")}`, {submit:"Archive"}))return;
+  const button=byId("memory-archive-selected");button.disabled=true;
+  try {await controlAction({action:"archive_memories",entries:selected});memorySelection.clear();byId("memory-inspection").hidden=true;await loadMemory(memoryQuery);toast(translatePhrase("Selected memories archived."));}
+  catch(error){toast(controlError(error),"error");}finally{updateMemorySelection();}
+});
+
 async function loadConfiguration(force = false) {
+  loadIntegrations();
   const root = byId("configuration-grid");
   if (!force && root.dataset.loaded === "true") return;
   root.dataset.loaded = "false";
@@ -5484,6 +6666,7 @@ async function loadConfiguration(force = false) {
     );
     updateConfigurationSummary(config);
     await loadAgentAccounts();
+    loadControls();
     applyConfigurationFilter();
     root.dataset.loaded = "true";
     if (force) toast("Runtime configuration refreshed.");
@@ -5854,6 +7037,8 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   byId("chat-empty")?.remove();
   const item = document.createElement("article");
   item.className = `message ${role === "user" ? "user" : "assistant"}${details.error ? " error" : ""}`;
+  item._chatContent = String(content);
+  if (Number.isSafeInteger(details.id)) item.dataset.chatMessageId = String(details.id);
   const avatar = document.createElement("span");
   avatar.className = "message-avatar";
   avatar.textContent = role === "user" ? "YOU" : "M";
@@ -5863,8 +7048,17 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
   markdown.className = "message-markdown";
   if (!details.error && !details.localized) markdown.setAttribute("data-i18n-skip", "");
   markdown.append(renderMarkdown(content));
+  for (const pre of markdown.querySelectorAll("pre")) {
+    const code=pre.querySelector("code");if(!code)continue;
+    const wrapper=controlNode("div",undefined,"chat-code-block"),head=controlNode("div",undefined,"chat-code-head");
+    const label=controlData("span",code.dataset.language || translatePhrase("Code"));
+    const copy=controlButton("Copy code",async()=>{await navigator.clipboard.writeText(code.textContent);toast(translatePhrase("Code copied."));});
+    head.append(label,copy);pre.replaceWith(wrapper);wrapper.append(head,pre);
+  }
   body.append(markdown);
+  appendArtifactReferences(body,content);
   if (role !== "user" && details.action) body.append(createActionCard(details.action));
+  if (details.error) body.append(controlButton("Reload conversation",()=>loadChatHistory(true)));
   const meta = document.createElement("div");
   meta.className = "message-meta";
   meta.dataset.createdAt = String(createdAt);
@@ -5929,12 +7123,23 @@ function appendMessage(role, content, createdAt = Date.now(), details = {}) {
       }
     });
     actions.append(copy);
+    if (!details.error && !details.localized) {
+      const quote=controlButton("Quote",()=>quoteChatMessage(markdown,content));quote.dataset.quoteMessage="";
+      quote.addEventListener("mousedown",event=>event.preventDefault());
+      const download=controlButton("Download reply",()=>downloadChatMarkdown(String(content),"monique-reply.md"));
+      actions.append(quote,download);
+    }
     tools.append(actions);
     body.append(tools);
   }
-  if (role === "user") item.append(body, avatar); else item.append(avatar, body);
+  if (role === "user") {
+    const tools=controlNode("div",undefined,"message-tools"),actions=controlNode("div",undefined,"message-actions");
+    const reuse=controlButton("Use again",()=>{byId("chat-input").value=String(content);updateChatComposer();byId("chat-input").focus();});reuse.dataset.reusePrompt="";
+    actions.append(reuse);tools.append(actions);body.append(tools);item.append(body,avatar);
+  } else item.append(avatar,body);
   byId("chat-thread").append(item);
-  item.scrollIntoView({ block: "end" });
+  refreshChatNavigation();
+  revealChatMessage(role === "user");
   if (role !== "user" && details.speak && voiceRepliesEnabled) {
     window.setTimeout(() => speakText(markdown.innerText || markdown.textContent), 0);
   }
@@ -5978,6 +7183,7 @@ function createActionCard(action) {
 async function resolveChatAction(card, decision) {
   if (chatBusy || card.dataset.state) return;
   chatBusy = true;
+  updateChatComposer();
   card.dataset.state = "working";
   card.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   const pending = appendPendingMessage();
@@ -5989,7 +7195,7 @@ async function resolveChatAction(card, decision) {
     const answer = await api("/api/chat/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action_id: card.dataset.actionId, decision }),
+      body: JSON.stringify({ action_id: card.dataset.actionId, decision, expected_conversation: chatUi.id || "" }),
     });
     pending.remove();
     card.dataset.state = decision === "approve" ? "approved" : "denied";
@@ -6012,6 +7218,7 @@ async function resolveChatAction(card, decision) {
     toast("The action was not completed.", "error");
   } finally {
     chatBusy = false;
+    updateChatComposer();
   }
 }
 
@@ -6028,14 +7235,14 @@ function appendPendingMessage() {
   dots.className = "thinking-dots";
   dots.setAttribute("aria-label", "Monique is working");
   dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
-  body.append(dots);
+  body.append(dots, controlNode("span", "Thinking…", "chat-pending-label"));
   item.append(avatar, body);
   byId("chat-thread").append(item);
-  item.scrollIntoView({ block: "end" });
+  revealChatMessage();
   return item;
 }
 
-function createWelcome(title = "How can I help?", text = "Ask naturally. I can use reviewed memory, live sources, and prepare actions for your approval.") {
+function createWelcome(title = "What can I help with?", text = "Think it through, find an answer, or get something done.") {
   const empty = document.createElement("div");
   empty.className = "empty-state";
   empty.id = "chat-empty";
@@ -6048,10 +7255,10 @@ function createWelcome(title = "How can I help?", text = "Ask naturally. I can u
   const starters = document.createElement("div");
   starters.className = "starter-grid";
   [
-    ["Explain system health", "Review live status and surface risks", "Explain the current operational health and any risks."],
-    ["Catch me up", "Read recent configured Slack context", "Summarize the latest relevant Slack messages."],
-    ["Explore memory", "Use reviewed durable evidence", "What do you remember that is most relevant right now? Cite memory references."],
-    ["Work in Manage", "Prepare a reviewable AI Operations action", "Show me the useful actions available in Manage AI Operations and help me choose the right one."],
+    ["Make a plan", "Turn an idea into clear next steps", "Help me turn an idea into a clear plan."],
+    ["Catch me up", "Recent Slack messages", "Summarize the latest relevant Slack messages."],
+    ["Explore memory", "What Monique remembers", "What do you remember that is most relevant right now? Cite memory references."],
+    ["Write something", "Draft, rewrite, or find the right words", "Help me improve a piece of writing."],
   ].forEach(([caption, description, prompt]) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -6067,27 +7274,256 @@ function createWelcome(title = "How can I help?", text = "Ask naturally. I can u
   return empty;
 }
 
-async function loadChatHistory() {
-  const thread = byId("chat-thread");
-  if (thread.dataset.loaded === "true") return;
+function chatOutgoingMessage() {
+  const draft=byId("chat-input").value.trim(),quote=chatUi.quotes.get(chatUi.id || "");
+  return quote?`${quote.split("\n").map(line=>`> ${line}`).join("\n")}\n\n${draft}`:draft;
+}
+function renderChatQuote() {
+  const quote=chatUi.quotes.get(chatUi.id || "");byId("chat-quote").hidden=!quote;
+  byId("chat-quote-text").textContent=quote || "";
+}
+function quoteChatMessage(markdown,content) {
+  if(chatUi.loading)return;
+  const selection=window.getSelection();
+  const selected=selection && !selection.isCollapsed && markdown.contains(selection.anchorNode) && markdown.contains(selection.focusNode)?selection.toString().trim():"";
+  const text=Array.from(selected || String(content));
+  chatUi.quotes.set(chatUi.id || "",text.slice(0,1200).join("")+(text.length>1200?"…":""));
+  updateChatComposer();byId("chat-input").focus();
+}
+function downloadChatMarkdown(content,filename) {
+  const url=URL.createObjectURL(new Blob([content],{type:"text/markdown;charset=utf-8"}));
+  const link=document.createElement("a");link.href=url;link.download=filename;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+async function exportChatConversation() {
+  if(chatUi.exportController){chatUi.exportController.abort();return;}
+  if(chatBusy || chatUi.loading || !chatUi.id)return;
+  const id=chatUi.id,title=chatUi.items.find(item=>item.id===id)?.title || "Monique",controller=new AbortController();
+  chatUi.exportController=controller;byId("chat-export-all").textContent=translatePhrase("Cancel export");
+  const status=byId("chat-export-status");status.hidden=false;status.textContent=translatePhrase("Preparing retained messages…");
+  let timedOut=false;const timer=setTimeout(()=>{timedOut=true;controller.abort();},120000);
   try {
-    const history = await api("/api/chat/history");
-    if ((history.messages || []).length > 0) {
-      thread.replaceChildren();
-      history.messages.forEach((message) => appendMessage(message.role, message.content, message.created_at_ms));
+    const history=await api("/api/chat/history",{signal:controller.signal});
+    if(history.conversation_id!==id)throw new Error("chat_conversation_changed");
+    let messages=history.messages || [],more=history.has_more,pages=0,size=JSON.stringify(messages).length;
+    const seen=new Set(messages.map(message=>message.id));
+    while(more){
+      if(++pages>1000 || size>20000000)throw new Error("chat_export_too_large");
+      const before=messages[0]?.id;if(!Number.isSafeInteger(before))throw new Error("chat_export_incomplete");
+      const page=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},signal:controller.signal,body:JSON.stringify({action:"older",id,before})});
+      if(page.conversation_id!==id || !Array.isArray(page.messages))throw new Error("chat_export_incomplete");
+      for(const message of page.messages){if(seen.has(message.id))throw new Error("chat_export_incomplete");seen.add(message.id);}
+      if(page.has_more && !page.messages.length)throw new Error("chat_export_incomplete");
+      messages=[...page.messages,...messages];more=page.has_more;size+=JSON.stringify(page.messages).length;
     }
-    (history.pending_actions || []).forEach((action) => {
-      appendMessage("assistant", "This action is still awaiting your decision.", Date.now(), { action, localized: true });
-    });
-    thread.dataset.loaded = "true";
-  } catch (_error) {
-    byId("chat-state").textContent = "History unavailable";
-    toast("Durable chat history is unavailable.", "error");
+    if(size>20000000)throw new Error("chat_export_too_large");
+    if(controller.signal.aborted)throw new DOMException("Cancelled","AbortError");
+    const content=[`# ${title}`,translatePhrase("Retained messages at the time of export."),...messages.map(message=>`## ${message.role==="user"?translatePhrase("You"):"Monique"}\n\n${message.content}`)].join("\n\n");
+    downloadChatMarkdown(content,"monique-conversation.md");status.textContent=translatePhrase("Conversation exported.");
+  }catch(error){
+    status.textContent=translatePhrase(controller.signal.aborted && !timedOut?"Export cancelled.":error.message==="chat_export_too_large"?"This conversation is too large to export here.":error.message==="chat_conversation_changed"?"The active conversation changed. Reload it before sending.":"Export could not finish. No partial file was downloaded.");
+  }finally{clearTimeout(timer);chatUi.exportController=null;byId("chat-export-all").textContent=translatePhrase("Export full conversation");updateChatComposer();}
+}
+function scrollToChatTarget(target) {
+  const thread=byId("chat-thread");chatUi.follow=false;
+  thread.scrollTop+=target.getBoundingClientRect().top-thread.getBoundingClientRect().top-24;
+  byId("chat-jump").hidden=chatAtBottom();
+}
+function toggleChatNavigation(mode) {
+  const open=Boolean(mode);byId("chat-navigator").hidden=!open;
+  byId("chat-find-toggle").setAttribute("aria-expanded",String(open));
+  if(!open){clearChatFindMarks();chatUi.findHits=[];byId("chat-find-toggle").focus();return;}
+  byId("chat-options").open=false;chatUi.navigationMode=mode;
+  for(const name of ["find","outline"]){
+    const selected=mode===name;byId(`chat-${name}-panel`).hidden=!selected;
+    byId(`chat-${name}-tab`).setAttribute("aria-selected",String(selected));byId(`chat-${name}-tab`).tabIndex=selected?0:-1;
   }
+  refreshChatNavigation();
+  (mode==="find"?byId("chat-find-input"):byId("chat-outline-tab")).focus();
+}
+function clearChatFindMarks() {
+  for(const mark of byId("chat-thread").querySelectorAll("mark.chat-find-mark")){
+    const parent=mark.parentNode;mark.replaceWith(document.createTextNode(mark.textContent));parent.normalize();
+  }
+}
+function refreshChatNavigation() {
+  byId("chat-navigation-older").hidden=!chatUi.hasMore;
+  byId("chat-navigation-scope").textContent=translatePhrase(chatUi.hasMore?"Loaded messages":"All retained messages loaded");
+  if(byId("chat-navigator").hidden)return;
+  if(chatUi.navigationMode==="find")findChatMatches(false);
+  else {clearChatFindMarks();renderChatOutline();}
+}
+function findChatMatches(jump=true) {
+  clearChatFindMarks();chatUi.findHits=[];
+  const query=byId("chat-find-input").value.trim();
+  if(query){
+    const pattern=new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"giu");
+    for(const markdown of byId("chat-thread").querySelectorAll(".message:not(.pending) .message-markdown")){
+      const walker=document.createTreeWalker(markdown,NodeFilter.SHOW_TEXT,{acceptNode:node=>node.parentElement.closest(".chat-code-head,button")?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT});
+      const nodes=[];let text="",node;
+      while((node=walker.nextNode())){nodes.push({node,start:text.length,end:text.length+node.length});text+=node.textContent;}
+      const matches=[];pattern.lastIndex=0;let match;
+      while((match=pattern.exec(text)) && chatUi.findHits.length<1000){const hit={start:match.index,end:match.index+match[0].length,marks:[]};matches.push(hit);chatUi.findHits.push(hit);}
+      for(const entry of nodes){
+        const intersections=matches.filter(hit=>hit.start<entry.end && hit.end>entry.start);if(!intersections.length)continue;
+        const fragment=document.createDocumentFragment();let offset=0;
+        for(const hit of intersections){
+          const start=Math.max(0,hit.start-entry.start),end=Math.min(entry.node.length,hit.end-entry.start);
+          fragment.append(document.createTextNode(entry.node.textContent.slice(offset,start)));
+          const mark=document.createElement("mark");mark.className="chat-find-mark";mark.textContent=entry.node.textContent.slice(start,end);fragment.append(mark);hit.marks.push(mark);offset=end;
+        }
+        fragment.append(document.createTextNode(entry.node.textContent.slice(offset)));entry.node.replaceWith(fragment);
+      }
+      if(chatUi.findHits.length>=1000)break;
+    }
+  }
+  chatUi.findIndex=chatUi.findHits.length?Math.max(0,Math.min(chatUi.findIndex,chatUi.findHits.length-1)):-1;
+  focusChatMatch(0,jump);
+}
+function focusChatMatch(direction,jump=true) {
+  const hits=chatUi.findHits;
+  if(hits.length)chatUi.findIndex=(chatUi.findIndex+direction+hits.length)%hits.length;
+  hits.forEach((hit,index)=>hit.marks.forEach(mark=>mark.classList.toggle("current",index===chatUi.findIndex)));
+  byId("chat-find-status").textContent=hits.length?`${chatUi.findIndex+1} / ${hits.length}${hits.length===1000?"+":""}`:byId("chat-find-input").value.trim()?translatePhrase("No matches"):"";
+  byId("chat-find-status").title=hits.length===1000?translatePhrase("First 1000 matches"):"";
+  byId("chat-find-prev").disabled=byId("chat-find-next").disabled=!hits.length;
+  if(jump && hits.length)scrollToChatTarget(hits[chatUi.findIndex].marks[0]);
+}
+function renderChatOutline() {
+  const root=byId("chat-outline-list");root.replaceChildren();
+  for(const message of byId("chat-thread").querySelectorAll(".message:not(.pending):not(.error)")){
+    const targets=message.classList.contains("user")?[message.querySelector(".message-markdown")]:[...message.querySelectorAll(".message-markdown h1,.message-markdown h2,.message-markdown h3")];
+    for(const target of targets){
+      if(!target)continue;const text=target.textContent.trim();if(!text)continue;
+      const button=controlButton("",()=>{scrollToChatTarget(target);target.tabIndex=-1;target.focus({preventScroll:true});});
+      button.className="chat-outline-item";button.classList.toggle("question",message.classList.contains("user"));
+      button.append(controlData("span",text.slice(0,160)));button.title=text.slice(0,500);root.append(button);
+    }
+  }
+  if(!root.children.length)root.append(controlNode("p","Questions and reply headings will appear here.","inline-hint"));
+}
+
+function updateChatComposer() {
+  const input=byId("chat-input");const bytes=new TextEncoder().encode(chatOutgoingMessage()).length;
+  renderChatQuote();
+  input.disabled=chatUi.loading;
+  if(!CSS.supports("field-sizing", "content")){input.rows=1;const lineHeight=parseFloat(getComputedStyle(input).lineHeight)||24;input.rows=Math.min(7,Math.max(1,Math.ceil((input.scrollHeight-24)/lineHeight)));}
+  byId("chat-count").textContent=bytes.toLocaleString(localeTag());byId("chat-limit").hidden=bytes<6000;
+  byId("chat-send").disabled=chatBusy || chatUi.loading || !chatUi.ready || !input.value.trim() || bytes>8192;
+  byId("chat-profile").disabled=chatBusy || chatUi.loading;
+  byId("voice-input").disabled=chatBusy || chatUi.loading || !voiceInputSupported;
+  byId("chat-thread").querySelectorAll(".action-card").forEach(card=>card.querySelectorAll("button").forEach(button=>button.disabled=chatBusy || chatUi.loading || Boolean(card.dataset.state)));
+  byId("new-chat").disabled=chatBusy || chatUi.loading || !chatUi.ready;
+  byId("chat-new-shortcut").disabled=byId("new-chat").disabled;
+  byId("chat-reload").disabled=chatBusy || chatUi.loading;
+  byId("chat-export-all").disabled=!chatUi.exportController && (chatBusy || chatUi.loading || !chatUi.id);
+  byId("chat-navigation-older").disabled=chatBusy || chatUi.loading;
+  byId("chat-quote-remove").disabled=chatUi.loading;
+  byId("chat-thread").querySelectorAll("[data-quote-message]").forEach(button=>button.disabled=chatUi.loading);
+  byId("chat-export").disabled=!byId("chat-thread").querySelector(".message:not(.pending)");
+  byId("chat-thread").setAttribute("aria-busy",String(chatBusy || chatUi.loading));
+  document.querySelectorAll(".chat-history-item").forEach(button=>button.disabled=chatBusy || chatUi.loading);
+  document.querySelectorAll(".message-actions [data-reuse-prompt]").forEach(button=>button.disabled=chatUi.loading);
+  if(bytes>8192)byId("chat-state").textContent=translatePhrase("Your message is too long. Shorten it before sending.");
+  else if(chatUi.tooLong)byId("chat-state").textContent=translatePhrase(chatBusy?"Monique is working…":"Ready");
+  chatUi.tooLong=bytes>8192;
+  if(byId("chat-older"))byId("chat-older").disabled=chatBusy || chatUi.loading;
+}
+function chatAtBottom() {const thread=byId("chat-thread");return thread.scrollHeight-thread.scrollTop-thread.clientHeight<100;}
+function scrollChatLatest() {const thread=byId("chat-thread");thread.scrollTop=thread.scrollHeight;chatUi.follow=true;byId("chat-jump").hidden=true;}
+function revealChatMessage(force=false) {
+  if(force || chatUi.follow)scrollChatLatest();else byId("chat-jump").hidden=false;
+}
+function toggleChatHistory(open) {
+  const root=byId("chat-workspace");const narrow=matchMedia("(max-width: 1000px)").matches;
+  const current=narrow?root.classList.contains("history-open"):!root.classList.contains("history-collapsed");
+  open=open===undefined?!current:open;
+  if(narrow)root.classList.toggle("history-open",open);else {root.classList.toggle("history-collapsed",!open);root.classList.remove("history-open");}
+  byId("chat-history-backdrop").hidden=!(narrow && open);
+  byId("chat-history-toggle").setAttribute("aria-expanded",String(open));
+  if(narrow){byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=open;}
+  else {byId("chat-history").inert=!open;byId("chat-workspace").querySelector(".chat-surface").inert=false;savePreference("monique-chat-history",open?"expanded":"collapsed");}
+  if(narrow && open)byId("chat-history-search").focus();
+}
+function renderChatConversations() {
+  const root=byId("chat-history-list"),top=root.scrollTop,query=byId("chat-history-search").value.trim().toLocaleLowerCase();root.replaceChildren();
+  const items=chatUi.items.filter(item=>String(item.title||"").toLocaleLowerCase().includes(query));
+  const groups=new Map(),today=new Date(),recent=new Date();recent.setDate(today.getDate()-7);recent.setHours(0,0,0,0);
+  for(const item of items){
+    const date=new Date(item.updated_at_ms),group=date.toDateString()===today.toDateString()?"Today":date>=recent?"Previous 7 days":"Earlier";
+    if(!groups.has(group))groups.set(group,[]);groups.get(group).push(item);
+  }
+  for(const [group,conversations] of groups){
+    const section=controlNode("details",undefined,"chat-history-group"),summary=controlNode("summary"),list=controlNode("div",undefined,"chat-history-group-items");
+    section.dataset.historyGroup=group;
+    section.open=Boolean(query) || (chatUi.historyGroups.get(group) ?? (group!=="Earlier" || conversations.some(item=>item.id===chatUi.id)));
+    const countLabel=controlData("b",String(conversations.length));countLabel.setAttribute("aria-hidden","true");summary.append(controlNode("span",group),countLabel);
+    summary.addEventListener("click",()=>{if(!query)chatUi.historyGroups.set(group,!section.open);});
+    for(const item of conversations){
+      const title=item.title || translatePhrase("New conversation"),button=controlButton("",()=>selectChatConversation(item.id));
+      button.className="chat-history-item";button.dataset.conversationId=item.id;button.setAttribute("aria-current",String(item.id===chatUi.id));
+      button.append(controlData("strong",title));button.title=`${title} · ${ticketDateLabel(new Date(item.updated_at_ms).toISOString())}`;button.disabled=chatBusy || chatUi.loading;list.append(button);
+    }
+    section.append(summary,list);root.append(section);
+  }
+  if(!items.length)root.append(controlNode("p",query?"No conversations match your search.":"Your conversations will appear here.","inline-hint"));
+  root.scrollTop=top;
+  const selected=chatUi.items.find(item=>item.id===chatUi.id);byId("chat-conversation-title").textContent=selected?.title || translatePhrase("New conversation");
+}
+async function loadChatConversations() {
+  try {const view=await api("/api/chat/conversations");chatUi.items=Array.isArray(view.items)?view.items:[];renderChatConversations();}
+  catch(_error){byId("chat-history-list").replaceChildren(controlNode("p","Conversation history is unavailable.","inline-hint"),controlButton("Try again",loadChatConversations));}
+}
+function rememberChatDraft() {chatUi.drafts.set(chatUi.id || "",byId("chat-input").value);}
+function applyChatHistory(history) {
+  stopSpeaking();chatUi.findIndex=-1;const thread=byId("chat-thread");thread.replaceChildren();chatUi.id=history.conversation_id || null;chatUi.follow=false;
+  for(const message of history.messages || [])appendMessage(message.role,message.content,message.created_at_ms,{id:message.id});
+  for(const action of history.pending_actions || [])appendMessage("assistant","This action is still awaiting your decision.",Date.now(),{action,localized:true});
+  if(!thread.children.length)thread.append(createWelcome());
+  chatUi.hasMore=Boolean(history.has_more);addOlderChatButton();thread.dataset.loaded="true";chatUi.ready=true;
+  byId("chat-input").value=chatUi.seededPrompt ?? chatUi.drafts.get(chatUi.id || "") ?? "";
+  chatUi.seededPrompt=null;
+  byId("chat-state").textContent=translatePhrase("Ready");
+  byId("chat-memory-count").textContent="-";byId("chat-source-count").textContent="0";byId("chat-latency").textContent="-";
+  renderChatConversations();scrollChatLatest();updateChatComposer();
+  loadConversationArtifacts();
+}
+function addOlderChatButton() {
+  refreshChatNavigation();
+  byId("chat-older")?.remove();if(!chatUi.hasMore)return;
+  const button=controlButton("Load earlier messages",loadOlderChatMessages);button.id="chat-older";byId("chat-thread").prepend(button);
+}
+async function selectChatConversation(id) {
+  if(chatBusy || chatUi.loading || id===chatUi.id)return;
+  rememberChatDraft();chatUi.loading=true;updateChatComposer();
+  try {const history=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"select",id,expected_conversation:chatUi.id || ""})});applyChatHistory(history);if(matchMedia("(max-width: 1000px)").matches)toggleChatHistory(false);}
+  catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+}
+async function loadOlderChatMessages() {
+  if(chatUi.loading || chatBusy || !chatUi.id)return;
+  const thread=byId("chat-thread"),first=thread.querySelector("[data-chat-message-id]");if(!first)return;
+  const id=chatUi.id;chatUi.loading=true;updateChatComposer();
+  try {
+    const page=await api("/api/chat/conversations/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"older",id,before:Number(first.dataset.chatMessageId)})});
+    if(chatUi.id!==id)return;
+    const height=thread.scrollHeight,top=thread.scrollTop;byId("chat-older")?.remove();const old=[...thread.children];chatUi.follow=false;
+    const nodes=(page.messages || []).map(message=>appendMessage(message.role,message.content,message.created_at_ms,{id:message.id}));thread.replaceChildren(...nodes,...old);chatUi.hasMore=Boolean(page.has_more);addOlderChatButton();thread.scrollTop=top+(thread.scrollHeight-height);
+  }catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+}
+async function loadChatHistory(force=false) {
+  const thread=byId("chat-thread");if(chatUi.loading || chatBusy || (!force && thread.dataset.loaded==="true"))return;
+  rememberChatDraft();if(force)chatUi.seededPrompt=byId("chat-input").value;chatUi.loading=true;updateChatComposer();
+  try {applyChatHistory(await api("/api/chat/history"));await loadChatConversations();}
+  catch(_error){byId("chat-state").textContent=translatePhrase("History unavailable");toast("Durable chat history is unavailable.","error");}
+  finally{chatUi.loading=false;updateChatComposer();}
 }
 
 function humanChatError(category) {
   const messages = {
+    artifact_prompt_too_long: "Your request is too long. Shorten it and try again.",
+    chat_conversation_changed: "The active conversation changed. Reload it before sending.",
+    chat_conversation_unavailable: "This conversation is no longer available.",
     chat_lane_busy: "Monique is finishing another contained turn. Try again in a moment.",
     slack_read_unavailable: "The configured Slack read is temporarily unavailable.",
     slack_tool_unavailable: "The Slack read surface is temporarily busy.",
@@ -6292,93 +7728,83 @@ function initializeVoiceSupport() {
 
 byId("chat-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (chatBusy) return;
-  stopVoiceInput();
-  const input = byId("chat-input");
-  const message = input.value.trim();
-  if (!message) return;
-  chatBusy = true;
-  appendMessage("user", message);
-  input.value = "";
-  byId("chat-count").textContent = "0";
-  byId("chat-send").disabled = true;
-  const pending = appendPendingMessage();
-  const started = performance.now();
-  const timer = window.setInterval(() => {
-    byId("chat-state").textContent = `Monique is working · ${Math.max(1, Math.round((performance.now() - started) / 1000))}s`;
-  }, 1000);
-  byId("chat-state").textContent = "Monique is working…";
+  if(chatBusy || chatUi.loading || !chatUi.ready)return;
+  stopVoiceInput();const input=byId("chat-input"),draft=input.value.trim(),quote=chatUi.quotes.get(chatUi.id || ""),message=chatOutgoingMessage(),originalId=chatUi.id;
+  if(!draft || new TextEncoder().encode(message).length>8192)return;
+  chatBusy=true;chatUi.quotes.delete(chatUi.id || "");chatUi.drafts.delete(chatUi.id || "");appendMessage("user",message);input.value="";updateChatComposer();scrollChatLatest();
+  const pending=appendPendingMessage(),started=performance.now();
+  const timer=setInterval(()=>{const seconds=Math.max(1,Math.round((performance.now()-started)/1000));const label=pending.querySelector(".chat-pending-label");if(label)label.textContent=`${translatePhrase("Thinking…")} ${seconds}s`;},1000);
+  byId("chat-state").textContent=translatePhrase("Monique is working…");
   try {
-    const answer = await api("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, profile: byId("chat-profile").value }),
-    });
-    pending.remove();
-    const sources = Array.isArray(answer.live_sources) ? answer.live_sources : [];
-    appendMessage("assistant", answer.answer, Date.now(), { sources, durationMs: answer.duration_ms, action: answer.action, speak: true });
-    byId("chat-memory-count").textContent = count(answer.memory_evidence);
-    byId("chat-source-count").textContent = count(sources.length);
-    byId("chat-latency").textContent = Number.isSafeInteger(answer.duration_ms) ? `${answer.duration_ms.toLocaleString(localeTag())} ms` : `${Math.round(performance.now() - started).toLocaleString(localeTag())} ms`;
-    byId("chat-state").textContent = `${words(answer.profile)} · retained`;
-  } catch (error) {
-    pending.remove();
-    appendMessage("assistant", humanChatError(error.message), Date.now(), { error: true });
-    byId("chat-state").textContent = "Turn refused";
-    toast("Monique could not complete that turn.", "error");
-  } finally {
-    window.clearInterval(timer);
-    chatBusy = false;
-    byId("chat-send").disabled = false;
-    input.focus();
-  }
+    const answer=await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message,profile:byId("chat-profile").value,expected_conversation:chatUi.id || ""})});
+    pending.remove();chatUi.id=answer.conversation_id || chatUi.id;
+    if(chatUi.id!==originalId && chatUi.quotes.has(originalId || "")){chatUi.quotes.set(chatUi.id,chatUi.quotes.get(originalId || ""));chatUi.quotes.delete(originalId || "");}
+    const sources=Array.isArray(answer.live_sources)?answer.live_sources:[];
+    appendMessage("assistant",answer.answer,Date.now(),{sources,durationMs:answer.duration_ms,action:answer.action,speak:true});
+    byId("chat-memory-count").textContent=count(answer.memory_evidence);byId("chat-source-count").textContent=count(sources.length);
+    byId("chat-latency").textContent=Number.isSafeInteger(answer.duration_ms)?`${(answer.duration_ms/1000).toFixed(1)} s`:"-";
+    byId("chat-state").textContent=translatePhrase("Ready");await loadChatConversations();
+  }catch(error){
+    pending.remove();appendMessage("assistant",humanChatError(error.message),Date.now(),{error:true});
+    if(!input.value.trim() && !chatUi.quotes.has(chatUi.id || "")){input.value=draft;if(quote)chatUi.quotes.set(chatUi.id || "",quote);}
+    byId("chat-state").textContent=translatePhrase("Reply unavailable · your draft is kept");
+  }finally{clearInterval(timer);chatBusy=false;updateChatComposer();}
 });
-
-byId("chat-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    byId("chat-form").requestSubmit();
-  }
+byId("chat-input").addEventListener("keydown",(event)=>{
+  if(event.key!=="Enter" || event.isComposing || event.keyCode===229)return;
+  const desktop=!matchMedia("(pointer: coarse)").matches;
+  if(!event.shiftKey && (desktop || event.ctrlKey || event.metaKey)){event.preventDefault();byId("chat-form").requestSubmit();}
 });
-byId("chat-input").addEventListener("input", (event) => {
-  byId("chat-count").textContent = event.target.value.length.toLocaleString(localeTag());
-});
+byId("chat-input").addEventListener("input",updateChatComposer);
 initializeVoiceSupport();
 
-function resetNewChatButton() {
-  window.clearTimeout(newChatTimer);
-  newChatArmed = false;
-  byId("new-chat").textContent = "New conversation";
-  byId("new-chat").removeAttribute("data-armed");
-}
-
-byId("new-chat").addEventListener("click", async () => {
-  if (chatBusy) {
-    toast("Wait for the current turn to finish before starting a new conversation.");
-    return;
-  }
-  if (!newChatArmed) {
-    newChatArmed = true;
-    byId("new-chat").textContent = "Confirm new conversation";
-    byId("new-chat").dataset.armed = "true";
-    newChatTimer = window.setTimeout(resetNewChatButton, 5000);
-    return;
-  }
-  byId("new-chat").disabled = true;
+byId("new-chat").addEventListener("click",async()=>{
+  if(chatBusy || chatUi.loading || !chatUi.ready)return;
+  rememberChatDraft();chatUi.loading=true;updateChatComposer();
   try {
-    await api("/api/chat/new", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    byId("chat-thread").replaceChildren(createWelcome("New conversation", "The previous durable conversation was archived. Long-term memory remains available."));
-    byId("chat-state").textContent = "New durable session";
-    byId("chat-memory-count").textContent = "-";
-    byId("chat-source-count").textContent = "0";
-    byId("chat-latency").textContent = "-";
-    toast("A new durable conversation is ready.");
-  } catch (error) {
-    byId("chat-state").textContent = `New chat refused · ${error.message}`;
-    toast("The current conversation was not changed.", "error");
-  } finally {
-    byId("new-chat").disabled = false;
-    resetNewChatButton();
+    const history=await api("/api/chat/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({expected_conversation:chatUi.id || ""})});
+    chatUi.drafts.delete("");chatUi.quotes.delete("");applyChatHistory(history);await loadChatConversations();
+    if(matchMedia("(max-width: 1000px)").matches)toggleChatHistory(false);byId("chat-input").focus();
+  }catch(error){toast(humanChatError(error.message),"error");}
+  finally{chatUi.loading=false;updateChatComposer();}
+});
+byId("chat-new-shortcut").addEventListener("click",()=>byId("new-chat").click());
+byId("chat-history-search").addEventListener("input",renderChatConversations);
+byId("chat-history-toggle").addEventListener("click",()=>toggleChatHistory());
+for(const id of ["chat-history-close","chat-history-backdrop"])byId(id).addEventListener("click",()=>{toggleChatHistory(false);byId("chat-history-toggle").focus();});
+byId("chat-jump").addEventListener("click",scrollChatLatest);
+byId("chat-thread").addEventListener("scroll",()=>{chatUi.follow=chatAtBottom();if(chatUi.follow)byId("chat-jump").hidden=true;});
+byId("chat-reload").addEventListener("click",()=>{byId("chat-options").open=false;loadChatHistory(true);});
+byId("chat-export-all").addEventListener("click",exportChatConversation);
+byId("chat-quote-remove").addEventListener("click",()=>{chatUi.quotes.delete(chatUi.id || "");updateChatComposer();byId("chat-input").focus();});
+byId("chat-find-toggle").addEventListener("click",()=>toggleChatNavigation(byId("chat-navigator").hidden?"find":null));
+byId("chat-outline-toggle").addEventListener("click",()=>toggleChatNavigation("outline"));
+byId("chat-navigator-close").addEventListener("click",()=>toggleChatNavigation(null));
+for(const mode of ["find","outline"])byId(`chat-${mode}-tab`).addEventListener("click",()=>toggleChatNavigation(mode));
+byId("chat-navigator").addEventListener("keydown",event=>{
+  if(event.key==="Escape"){event.preventDefault();event.stopPropagation();toggleChatNavigation(null);}
+  if(event.target.getAttribute("role")==="tab" && ["ArrowLeft","ArrowRight","Home","End"].includes(event.key)){
+    event.preventDefault();const mode=event.key==="Home"?"find":event.key==="End"?"outline":chatUi.navigationMode==="find"?"outline":"find";toggleChatNavigation(mode);byId(`chat-${mode}-tab`).focus();
+  }
+});
+byId("chat-find-input").addEventListener("input",()=>{chatUi.findIndex=0;findChatMatches();});
+byId("chat-find-input").addEventListener("keydown",event=>{if(event.key==="Enter" && !event.isComposing){event.preventDefault();focusChatMatch(event.shiftKey?-1:1);}});
+byId("chat-find-prev").addEventListener("click",()=>focusChatMatch(-1));
+byId("chat-find-next").addEventListener("click",()=>focusChatMatch(1));
+byId("chat-navigation-older").addEventListener("click",loadOlderChatMessages);
+byId("chat-export").addEventListener("click",()=>{
+  const messages=[...byId("chat-thread").querySelectorAll(".message:not(.pending)")].filter(node=>node._chatContent!==undefined);
+  const content=["# Monique",translatePhrase("Visible messages from this conversation."),...messages.map(node=>`## ${node.classList.contains("user")?translatePhrase("You"):"Monique"}\n\n${node._chatContent}`)].join("\n\n");
+  downloadChatMarkdown(content,"monique-conversation.md");byId("chat-options").open=false;
+});
+const chatNarrowMedia=matchMedia("(max-width: 1000px)");
+function restoreChatHistoryLayout(){toggleChatHistory(!chatNarrowMedia.matches && storedPreference("monique-chat-history",["expanded","collapsed"],"expanded")==="expanded");}
+chatNarrowMedia.addEventListener("change",restoreChatHistoryLayout);restoreChatHistoryLayout();
+document.addEventListener("keydown",event=>{
+  if(event.key==="Escape" && byId("chat-workspace").classList.contains("history-open")){event.preventDefault();toggleChatHistory(false);byId("chat-history-toggle").focus();}
+  if(event.key==="Tab" && byId("chat-workspace").classList.contains("history-open")){
+    const nodes=[...byId("chat-history").querySelectorAll("button:not(:disabled), input, summary")].filter(node=>node.getClientRects().length && !node.closest("details:not([open]) .chat-history-group-items"));const first=nodes[0],last=nodes[nodes.length-1];
+    if(event.shiftKey && document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey && document.activeElement===last){event.preventDefault();first.focus();}
   }
 });
 
@@ -6388,7 +7814,8 @@ function seedChatPrompt(prompt) {
   showView("chat");
   const input = byId("chat-input");
   input.value = prompt;
-  byId("chat-count").textContent = prompt.length.toLocaleString(localeTag());
+  if(chatUi.loading || !chatUi.ready)chatUi.seededPrompt=prompt;
+  updateChatComposer();
   input.focus();
 }
 
@@ -6401,6 +7828,7 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   const editing = event.target.matches("input, textarea, select, [contenteditable='true']");
   if (event.key === "Escape" && voiceListening) {
     stopVoiceInput();
@@ -6429,8 +7857,7 @@ document.addEventListener("keydown", (event) => {
     showView("sessions");
     // "New task" means ready to type, not just the right page.
     window.setTimeout(() => byId("platform-task-text").focus(), 0);
-  } else if (event.key === "Escape" && newChatArmed) {
-    resetNewChatButton();
+
   } else if (event.key === "Escape" && !byId("appearance-panel").hidden) {
     appearanceOpen(false);
     byId("theme-cycle").focus();
@@ -6722,6 +8149,7 @@ byId("pairing-copy").addEventListener("click", async () => {
   }
 });
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   if (event.key === "Escape" && !byId("pairing-panel").hidden) pairingOpen(false);
 });
 document.addEventListener("click", (event) => {
@@ -6880,6 +8308,7 @@ function consoleEditing(target) {
 }
 
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector(".memory-dialog[open], .agent-dialog[open]")) return;
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
     consolePaletteOpen(byId("command-palette").hidden);
@@ -7085,3 +8514,70 @@ byId("command-input").addEventListener("keydown", (event) => {
     consolePaletteOpen(false);
   }
 });
+
+// Infrastructure app access. Credentials are displayed once and never persisted in the browser.
+function integrationState(){return integrationState.value ||= {tab:"apps",data:null,loading:false};}
+async function integrationApi(body){return api("/api/integrations",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});}
+function integrationError(error){return ({projects_required:"Indiquez au moins un projet.",invalid_scopes:"Choisissez au moins une permission.",webhook_origin_not_allowed:"Cette destination n’est pas autorisée sur le serveur.",events_scope_required:"Activez la permission événements pour cette application.",job_not_cancellable:"La publication a déjà commencé ou la demande est terminée.",idempotency_conflict:"Cette demande a déjà été enregistrée avec un autre contenu.",revision_conflict:"Le livrable a changé. Rechargez la page.",artifacts_not_configured:"Le service Share n’est pas configuré.",service_unavailable:"Le service est temporairement indisponible."})[error.message]||"L’opération n’a pas abouti. Réessayez.";}
+async function loadIntegrations(){
+ const state=integrationState(),root=byId("integration-manager");if(!root||state.loading)return;state.loading=true;
+ try{state.data=await integrationApi({action:"overview"});renderIntegrations();}
+ catch(error){root.replaceChildren(controlNode("p",integrationError(error)));root.append(controlButton("Réessayer",loadIntegrations));}
+ finally{state.loading=false;}
+}
+function integrationDialog(title,build){
+ const dialog=document.createElement("dialog");dialog.className="integration-dialog";dialog.dataset.i18nSkip="";
+ const head=controlNode("div",undefined,"integration-toolbar");head.append(controlNode("h2",title));const close=controlButton("×",()=>dialog.close());close.setAttribute("aria-label","Fermer");head.append(close);dialog.append(head);document.body.append(dialog);build(dialog);dialog.addEventListener("close",()=>dialog.remove());dialog.showModal();return dialog;
+}
+function integrationSecret(title,secret){integrationDialog(title,dialog=>{
+ dialog.append(controlNode("p","Copiez cette clé maintenant. Elle ne sera plus affichée après fermeture."));
+ const input=document.createElement("textarea");input.readOnly=true;input.value=secret;input.setAttribute("aria-label","Clé à copier");dialog.append(input);
+ const copy=controlButton("Copier la clé",async()=>{try{await navigator.clipboard.writeText(input.value);copy.textContent="Copiée";}catch{input.select();}});dialog.append(copy);
+ dialog.addEventListener("close",()=>{input.value="";secret="";});
+});}
+function integrationField(form,label,type="text",value=""){
+ const row=controlNode("label",undefined,"integration-field");row.append(controlNode("span",label));const input=document.createElement(type==="textarea"?"textarea":"input");if(type!=="textarea")input.type=type;input.value=value;row.append(input);form.append(row);return input;
+}
+function integrationCreate(){integrationDialog("Connecter une application",dialog=>{
+ const form=document.createElement("form");const name=integrationField(form,"Nom de l’application");name.required=true;name.maxLength=80;
+ const projects=integrationField(form,"Projets autorisés (séparés par des virgules)");projects.required=true;projects.placeholder="Site client, Rapports";
+ form.append(controlNode("small","Les noms doivent correspondre aux projets des livrables. * donne accès à tous vos projets."));
+ const days=integrationField(form,"Expiration dans (jours)","number","90");days.min="1";days.max="365";
+ const scopes=controlNode("fieldset");scopes.append(controlNode("legend","Permissions"));
+ const labels={"artifacts:read":"Lire les livrables","artifacts:write":"Créer et modifier les versions","artifacts:visibility":"Changer la visibilité publique / privée","artifacts:delete":"Supprimer les livrables","jobs:read":"Suivre les demandes","jobs:write":"Demander des révisions","events:read":"Recevoir les événements"};
+ for(const scope of integrationState().data.scopes){const label=controlNode("label");const input=document.createElement("input");input.type="checkbox";input.value=scope;input.checked=["artifacts:read","jobs:read","events:read"].includes(scope);label.append(input,document.createTextNode(labels[scope]||scope));scopes.append(label);}form.append(scopes);
+ const error=controlNode("p",undefined,"integration-error");error.setAttribute("role","alert");form.append(error);const submit=controlButton("Créer la connexion",()=>{});submit.type="submit";form.append(submit);
+ form.addEventListener("submit",async event=>{event.preventDefault();submit.disabled=true;try{const result=await integrationApi({section:"apps",action:"create",name:name.value,projects:projects.value.split(",").map(x=>x.trim()).filter(Boolean),scopes:[...scopes.querySelectorAll("input:checked")].map(i=>i.value),expires_in_days:Number(days.value)});dialog.close();await loadIntegrations();integrationSecret("Clé de connexion",result.token);}catch(e){error.textContent=integrationError(e);}finally{submit.disabled=false;}});dialog.append(form);
+});}
+function integrationSubscribe(app){integrationDialog("Recevoir les événements",dialog=>{
+ const form=document.createElement("form");const url=integrationField(form,"URL HTTPS de réception","url");url.required=true;url.placeholder="https://votre-app.example/api/share-events";
+ const types=controlNode("fieldset");types.append(controlNode("legend","Événements"));for(const type of integrationState().data.event_types){const label=controlNode("label"),input=document.createElement("input");input.type="checkbox";input.value=type;input.checked=["job.succeeded","job.failed","artifact.version_published","artifact.visibility_changed"].includes(type);label.append(input,document.createTextNode(type));types.append(label);}form.append(types);
+ const error=controlNode("p",undefined,"integration-error");error.setAttribute("role","alert");form.append(error);const submit=controlButton("Enregistrer",()=>{});submit.type="submit";form.append(submit);
+ form.addEventListener("submit",async event=>{event.preventDefault();submit.disabled=true;try{const result=await integrationApi({section:"events",action:"subscribe",app_id:app.id,url:url.value,types:[...types.querySelectorAll("input:checked")].map(i=>i.value)});dialog.close();await loadIntegrations();integrationSecret("Secret de signature des événements",result.signing_secret);}catch(e){error.textContent=integrationError(e);}finally{submit.disabled=false;}});dialog.append(form);
+});}
+async function integrationAction(body,button){if(button)button.disabled=true;try{const result=await integrationApi(body);if(result.token)integrationSecret("Nouvelle clé",result.token);else if(body.action==="test")toast(result.ok?"Connexion valide · API et MCP disponibles":"Connexion expirée ou révoquée",result.ok?"info":"error");await loadIntegrations();}catch(error){toast(integrationError(error),"error");}finally{if(button)button.disabled=false;}}
+function integrationJobLabel(state){return ({queued:"En attente",running:"En cours",publishing:"Publication",succeeded:"Terminée",failed:"Échec",cancelled:"Annulée",interrupted:"Interrompue — à vérifier"})[state]||state;}
+function renderIntegrations(){
+ const state=integrationState(),data=state.data,root=byId("integration-manager");root.replaceChildren();
+ const head=controlNode("div",undefined,"integration-toolbar"),titles=controlNode("div");titles.append(controlNode("h2","Applications & API"),controlNode("p","Connectez vos applications aux livrables et aux agents Monique."));head.append(titles);
+ const actions=controlNode("div",undefined,"integration-actions");const docs=controlNode("a","Documentation ↗");docs.href="https://share.inklura.fr/developers";docs.target="_blank";docs.rel="noopener";actions.append(docs,controlButton("Actualiser",loadIntegrations),controlButton("Connecter une application",integrationCreate));head.append(actions);root.append(head);
+ const nav=controlNode("div",undefined,"integration-tabs");nav.setAttribute("role","tablist");for(const [key,label]of [["apps","Applications"],["activity","Activité"],["deliveries","Événements"],["jobs","Demandes"]]){const b=controlButton(label,()=>{state.tab=key;renderIntegrations();});b.setAttribute("role","tab");b.setAttribute("aria-selected",String(state.tab===key));nav.append(b);}root.append(nav);
+ const worker=data.worker,ready=worker?.ready&&Date.now()-Date.parse(worker.checked_at)<90000;root.append(controlNode("p",ready?`Agent de révision disponible · ${worker.provider}`:"Agent de révision indisponible · les demandes restent en attente", "integration-worker"));
+ const list=controlNode("div",undefined,"integration-list");root.append(list);
+ const row=(title,detail)=>{const r=controlNode("div",undefined,"integration-row"),main=controlNode("div");main.append(controlNode("strong",title),controlNode("small",detail));r.append(main);list.append(r);return r;};
+ const act=(r,label,body)=>{const b=controlButton(label,()=>integrationAction(body,b));r.append(b);return b;};
+ if(state.tab==="apps")for(const app of data.apps){
+  const u=app.usage,expired=app.revoked_at||Date.parse(app.expires_at)<Date.now();const r=row(app.name,`${expired?"Révoquée / expirée":"Active"} · ${app.projects.join(", ")} · ${u.calls} appels · ${u.errors} erreurs · ${u.calls?Math.round(u.latency_ms/u.calls):0} ms · ${(u.upload_bytes/1048576).toFixed(1)} Mo`);
+  const details=document.createElement("details");details.append(controlNode("summary","Permissions et accès"),controlNode("p",app.scopes.join(" · ")),controlNode("p","Expire le "+new Date(app.expires_at).toLocaleDateString()));r.firstChild.append(details);
+  act(r,"Tester",{action:"test",id:app.id});if(!expired){act(r,"Renouveler la clé",{section:"apps",action:"rotate",id:app.id});if(app.scopes.includes("events:read"))r.append(controlButton("Événements",()=>integrationSubscribe(app)));act(r,"Révoquer",{section:"apps",action:"revoke",id:app.id});}
+ }
+ if(state.tab==="activity"){
+  const entries=data.apps.flatMap(a=>(a.usage.recent||[]).map(e=>({...e,name:a.name}))).sort((a,b)=>b.at.localeCompare(a.at));for(const e of entries.slice(0,60))row(`${e.name} · ${e.operation}`,`${e.status} · ${e.duration_ms} ms · ${new Date(e.at).toLocaleString()}`);
+ }
+ if(state.tab==="deliveries"){
+  for(const s of data.subscriptions){const r=row(s.url,`${s.disabled?"Désactivé":"Abonné"} · ${s.types.join(", ")}`);if(!s.disabled)act(r,"Désactiver",{section:"events",action:"unsubscribe",id:s.id});}
+  for(const d of data.deliveries){const r=row(d.url,`${({delivered:"Livré",failed:"Échec",pending:"À envoyer",sending:"Envoi"})[d.state]} · ${d.attempts} tentative(s)${d.status?" · HTTP "+d.status:""}${d.error?" · "+d.error:""}`);if(d.state==="failed")act(r,"Réessayer",{section:"events",action:"retry",id:d.id});}
+ }
+ if(state.tab==="jobs")for(const j of data.jobs){const r=row(j.title,`${integrationJobLabel(j.state)} · ${j.project} · ${new Date(j.created_at).toLocaleString()}${j.usage?" · "+j.usage.provider+" · "+Math.round(j.usage.duration_ms/1000)+" s":""}${j.usage?.input_tokens!=null?" · "+j.usage.input_tokens+" tokens entrée / "+j.usage.output_tokens+" sortie":""}${j.error?" · "+j.error:""}`);if(j.result)r.append(controlButton("Voir la version "+j.result.version,()=>{showView("artifacts");mountArtifactLibrary(j.result.artifact_id);}));if(["queued","running"].includes(j.state))act(r,"Annuler",{section:"jobs",action:"cancel",id:j.id});}
+ if(!list.children.length)list.append(controlNode("p",({apps:"Aucune application connectée. Créez une connexion et choisissez ses projets et permissions.",activity:"Les appels API et MCP apparaîtront ici.",deliveries:"Aucun événement à livrer. Configurez une URL depuis une application.",jobs:"Les demandes de création et de révision apparaîtront ici."})[state.tab],"integration-empty"));
+}

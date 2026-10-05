@@ -1,0 +1,18 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; media-src data: blob:; font-src data: blob:; frame-src blob: 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'"><style>html,body,iframe{width:100%;height:100%;margin:0;border:0}html,body{overflow:hidden}iframe{display:block}body{background:white}</style></head><body><script>
+'use strict';
+addEventListener('message',function(event){
+ if(event.source!==parent || !event.data || event.data.type!=='artifact-preview' || typeof event.data.html!=='string')return;
+ const payload=event.data,doc=new DOMParser().parseFromString(payload.html,'text/html');
+ doc.querySelectorAll('base,meta[http-equiv],iframe,object,embed').forEach(n=>n.remove());
+ const map=new Map((payload.files||[]).map(f=>[f.path,f]));
+ function pathFor(ref,base){try{const u=new URL(ref,'https://artifact.invalid/'+base);return u.origin==='https://artifact.invalid'?decodeURIComponent(u.pathname.slice(1)):null;}catch{return null;}}
+ function resolve(ref,base){if(!ref||ref.startsWith('#')||ref.startsWith('data:'))return ref;return map.get(pathFor(ref,base))?.url||'';}
+ function css(text,base){return text.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi,(_,q,ref)=>'url("'+resolve(ref,base)+'")').replace(/@import[^;]+;/gi,'');}
+ for(const node of doc.querySelectorAll('script[src],link[rel=stylesheet][href]')){const attr=node.tagName==='SCRIPT'?'src':'href',path=pathFor(node.getAttribute(attr),payload.entry),item=map.get(path);if(!item){node.remove();continue;}if(attr==='src'){node.removeAttribute('src');node.textContent=item.text;}else{const style=doc.createElement('style');style.textContent=css(item.text,path);node.replaceWith(style);}}
+ doc.querySelectorAll('[src],[href],[poster]').forEach(n=>{for(const attr of ['src','href','poster'])if(n.hasAttribute(attr)){const ref=n.getAttribute(attr);if(n.tagName==='A'){if(ref.startsWith('#'))continue;n.removeAttribute(attr);n.setAttribute('title','Lien externe désactivé dans l’aperçu isolé. Utilisez le rapport original ou téléchargez le bundle.');n.setAttribute('aria-disabled','true');}else n.setAttribute(attr,resolve(ref,payload.entry));}});
+ doc.querySelectorAll('[srcset]').forEach(n=>n.removeAttribute('srcset'));
+ doc.querySelectorAll('style').forEach(n=>{n.textContent=css(n.textContent,payload.entry);});
+ doc.querySelectorAll('[style]').forEach(n=>n.setAttribute('style',css(n.getAttribute('style'),payload.entry)));
+ const frame=document.createElement('iframe');frame.setAttribute('sandbox','allow-scripts');frame.title='Aperçu isolé du livrable';frame.srcdoc='<!doctype html>'+doc.documentElement.outerHTML;document.body.replaceChildren(frame);
+});
+</script></body></html>

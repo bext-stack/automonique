@@ -241,6 +241,16 @@ fn drive(
             viewport_params(request.width, request.height),
         )
         .map_err(opening)?;
+    if let Some(cookie) = request.cookie.as_ref() {
+        let set = devtools
+            .call("Network.setCookie", cookie_params(cookie, navigation))
+            .map_err(opening)?;
+        if set["success"] != true {
+            return Err(String::from(
+                "the browser refused the session cookie for this URL (a secure cookie needs https)",
+            ));
+        }
+    }
     devtools.load_fired = false;
     let navigated = devtools
         .call("Page.navigate", json!({ "url": navigation }))
@@ -707,6 +717,23 @@ fn locate_params(object: &str, selector: &str, mode: Mode) -> Value {
     })
 }
 
+/// The session cookie, scoped to the origin being captured and to nothing
+/// else: `url` gives the browser the host, never a `domain` from the service.
+fn cookie_params(cookie: &crate::shot_login::SessionCookie, navigation: &str) -> Value {
+    let mut params = json!({
+        "name": cookie.name,
+        "value": cookie.value.as_str(),
+        "url": navigation,
+        "path": cookie.path,
+        "secure": cookie.secure,
+        "httpOnly": cookie.http_only,
+    });
+    if let Some(same_site) = cookie.same_site {
+        params["sameSite"] = json!(same_site);
+    }
+    params
+}
+
 fn viewport_params(width: u32, height: u32) -> Value {
     json!({ "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false })
 }
@@ -891,6 +918,40 @@ mod tests {
 
         let browser_level = command(1, None, "Target.getTargets", json!({}));
         assert!(browser_level.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn the_session_cookie_is_scoped_to_the_captured_origin() {
+        let cookie = crate::shot_login::SessionCookie {
+            name: String::from("__Secure-authjs.session-token"),
+            value: zeroize::Zeroizing::new(String::from("aaa.bbb.ccc")),
+            path: String::from("/"),
+            secure: true,
+            http_only: true,
+            same_site: Some("Lax"),
+        };
+        let params = cookie_params(&cookie, "https://manage.example/manage/crm?tab=apercu");
+        assert_eq!(
+            params,
+            json!({
+                "name": "__Secure-authjs.session-token",
+                "value": "aaa.bbb.ccc",
+                "url": "https://manage.example/manage/crm?tab=apercu",
+                "path": "/",
+                "secure": true,
+                "httpOnly": true,
+                "sameSite": "Lax",
+            })
+        );
+        assert!(params.get("domain").is_none());
+        let bare = cookie_params(
+            &crate::shot_login::SessionCookie {
+                same_site: None,
+                ..cookie
+            },
+            "https://manage.example/",
+        );
+        assert!(bare.get("sameSite").is_none());
     }
 
     #[test]

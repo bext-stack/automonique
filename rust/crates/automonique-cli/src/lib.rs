@@ -1686,6 +1686,15 @@ fn typed_check(
     .expect("constant non-healthy check is coherent")
 }
 
+/// Send a typed automation request through the authenticated local daemon socket.
+pub fn dashboard_automation_request(
+    runtime: &std::path::Path,
+    request: &automonique_protocol::automation_api::AutomationRequest,
+) -> Result<automonique_protocol::automation_api::AutomationResponse, &'static str> {
+    admin_client::automation_request(Some(runtime.as_os_str()), request)
+        .map_err(|_| "automation_unavailable")
+}
+
 /// Inspect only `$XDG_RUNTIME_DIR/automonique` without following links or mutating it.
 pub fn inspect_runtime(runtime: Option<&OsStr>) -> Result<DoctorReportV1, DoctorReportError> {
     let check = runtime_check(runtime);

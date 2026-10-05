@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::os::fd::AsFd;
 
+#[path = "agent_probe.rs"]
+mod probe;
+#[path = "agent_usage.rs"]
+mod usage;
+
 const REGISTRY_SCHEMA: &str = "automonique.agent-accounts/v1";
 const HEALTH_SCHEMA: &str = "automonique.provider-account-health/v1";
 const VIEW_SCHEMA: &str = "automonique.dashboard.agent-accounts/v1";
@@ -324,6 +329,8 @@ pub(crate) struct AccountView {
     evidence: String,
     observed_at_ms: Option<u64>,
     last_verified_at_ms: Option<u64>,
+    usage: usage::UsageView,
+    response_test: Option<Value>,
 }
 
 impl AccountView {
@@ -415,6 +422,13 @@ pub(crate) enum AgentAuthAction {
     Refresh {
         account_id: String,
     },
+    TestResponse {
+        account_id: String,
+    },
+    Rename {
+        account_id: String,
+        label: String,
+    },
     CancelLogin {
         session_id: String,
     },
@@ -435,6 +449,8 @@ pub(crate) enum AgentAuthAction {
 pub(crate) struct AgentAuthManager {
     config: AgentAuthConfig,
     registry_lock: Mutex<()>,
+    response_tests: Arc<Mutex<BTreeMap<String, Value>>>,
+    usage: Arc<Mutex<usage::UsageCache>>,
     sessions: Arc<Mutex<BTreeMap<String, LoginSession>>>,
 }
 
@@ -447,6 +463,8 @@ impl AgentAuthManager {
         let manager = Self {
             config,
             registry_lock: Mutex::new(()),
+            response_tests: Arc::new(Mutex::new(BTreeMap::new())),
+            usage: Arc::new(Mutex::new(usage::UsageCache::default())),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
         };
         if manager.registry_path().is_file() {
@@ -479,6 +497,12 @@ impl AgentAuthManager {
                 selected,
                 worker_selected: selected
                     && registry.worker_provider.as_deref() == Some(account.provider.as_str()),
+                usage: usage::UsageView::unavailable("sign_in_required"),
+                response_test: self
+                    .response_tests
+                    .lock()
+                    .ok()
+                    .and_then(|tests| tests.get(&account.id).cloned()),
                 status: health.status,
                 method: health.method,
                 evidence: health.reason,
@@ -486,6 +510,7 @@ impl AgentAuthManager {
                 last_verified_at_ms: health.last_verified_at_ms,
             });
         }
+        usage::project(&self.config, &self.usage, &mut accounts)?;
         accounts.sort_by(|left, right| {
             left.provider
                 .cmp(&right.provider)
@@ -534,8 +559,10 @@ impl AgentAuthManager {
                 label,
                 account_id,
             } => self.start_login(&provider, &label, account_id.as_deref())?,
+            AgentAuthAction::Rename { account_id, label } => self.rename(&account_id, &label)?,
             AgentAuthAction::Select { account_id } => self.select(&account_id)?,
             AgentAuthAction::Refresh { account_id } => self.refresh(&account_id)?,
+            AgentAuthAction::TestResponse { account_id } => self.test_response(&account_id)?,
             AgentAuthAction::CancelLogin { session_id } => self.cancel_login(&session_id)?,
             AgentAuthAction::SubmitAuthorizationCode { session_id, code } => {
                 self.submit_authorization_code(&session_id, &code)?;
@@ -550,6 +577,24 @@ impl AgentAuthManager {
             } => self.remove(&account_id, confirm)?,
         }
         self.view()
+    }
+
+    fn rename(&self, account_id: &str, label: &str) -> Result<(), &'static str> {
+        let label = label.trim();
+        if !valid_label(label) {
+            return Err("account_label_invalid");
+        }
+        let _guard = self.registry_lock.lock().map_err(|_| "agent_auth_busy")?;
+        let mut registry = self.read_registry_unlocked()?;
+        let account = registry
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+            .ok_or("account_not_found")?;
+        account.label = label.to_owned();
+        account.updated_at_ms = now_ms().max(account.created_at_ms);
+        registry.revision = registry.revision.saturating_add(1);
+        self.write_registry_unlocked(&registry)
     }
 
     fn start_login(
@@ -1125,10 +1170,10 @@ fn probe_native_subscription(provider: Provider, binary: &Path, profile: &Path) 
 }
 
 /// What one bounded provider CLI call produced, once it has certainly ended.
-struct BoundedCall {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(super) struct BoundedCall {
+    pub(super) success: bool,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 /// Run one provider CLI call under `timeout`, killing it if it outlives that.
@@ -1149,7 +1194,10 @@ struct BoundedCall {
 /// unbounded wait this function exists to remove. Whatever a reader has not
 /// delivered by the deadline is simply absent, which the callers read as an
 /// unverified account.
-fn bounded_provider_call(command: &mut Command, timeout: Duration) -> Option<BoundedCall> {
+pub(super) fn bounded_provider_call(
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<BoundedCall> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1671,6 +1719,47 @@ mod tests {
             &claude_out,
             &profile
         ));
+    }
+
+    #[test]
+    fn rename_preserves_account_selection_and_rejects_invalid_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = AgentAuthConfig::new(
+            temporary.path().join("auth"),
+            PathBuf::from("/bin/true"),
+            PathBuf::from("/bin/true"),
+        )
+        .unwrap();
+        let manager = AgentAuthManager::open(config).unwrap();
+        let id = "acct-000000000000000000000000";
+        let mut registry = Registry::empty();
+        registry.accounts.push(AccountRecord {
+            id: id.into(),
+            provider: "codex".into(),
+            label: "Original".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        });
+        registry.worker_provider = Some("codex".into());
+        registry.selected.insert("codex".into(), id.into());
+        manager.write_registry_unlocked(&registry).unwrap();
+        assert!(manager.rename(id, "  Renamed  ").is_ok());
+        let saved = manager.read_registry().unwrap();
+        assert_eq!(saved.accounts[0].label, "Renamed");
+        assert_eq!(saved.selected, registry.selected);
+        assert_eq!(saved.worker_provider, registry.worker_provider);
+        assert_eq!(saved.accounts[0].created_at_ms, 1);
+        assert_eq!(saved.revision, 1);
+        assert_eq!(manager.rename(id, "  "), Err("account_label_invalid"));
+        assert_eq!(
+            manager.rename(id, &"a".repeat(49)),
+            Err("account_label_invalid")
+        );
+        assert_eq!(
+            manager.rename(id, "bad\nlabel"),
+            Err("account_label_invalid")
+        );
+        assert_eq!(manager.rename("missing", "Name"), Err("account_not_found"));
     }
 
     #[test]

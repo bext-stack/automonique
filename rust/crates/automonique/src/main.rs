@@ -644,6 +644,11 @@ fn ask_command(values: Vec<std::ffi::OsString>) -> ExitCode {
 /// runs in the order written), then captured whole or as one element with
 /// `--selector`; `--wait-ms` settles after the last action and `--timeout-ms`
 /// bounds each wait. A failed action is named in the failure line.
+///
+/// `--login` captures a screen behind a sign-in: for a host configured in
+/// `shot/logins/<host>.conf` in the state directory, one short-lived session
+/// is obtained and presented to that host only. `--login-site <id>` opens it
+/// on one site's space for an application that keeps several.
 fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
     use automonique_daemon::shot::{FAIL_MARKER, OK_MARKER, capture, find_browser, parse};
     let stamp = SystemTime::now()
@@ -651,12 +656,12 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     let default_out = std::env::temp_dir().join(format!("monique-shot-{stamp}.png"));
-    let request = match parse(&values, default_out) {
+    let mut request = match parse(&values, default_out) {
         Ok(request) => request,
         Err(reason) => {
             println!("{FAIL_MARKER} {reason}");
             eprintln!(
-                "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S]"
+                "usage: automonique shot <url> [--out PNG] [--host VHOST] [--width N] [--height N] [--full] [--timeout S] [--login] [--login-site ID]"
             );
             eprintln!(
                 "       interactions, applied in the order given: [--wait-for CSS] [--click CSS] [--hover CSS] [--scroll-to CSS]"
@@ -674,6 +679,27 @@ fn shot_command(values: Vec<std::ffi::OsString>) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    if request.login {
+        use automonique_daemon::shot_login::{MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, sign_in};
+        use automonique_daemon::worker_verb::{LivePost, state_dir_from_environment};
+        let Some(host) = request.login_host().map(str::to_owned) else {
+            println!("{FAIL_MARKER} the URL has no host to sign in to");
+            return ExitCode::from(2);
+        };
+        let transport = LivePost::https(REQUEST_TIMEOUT, MAX_RESPONSE_BYTES);
+        match sign_in(
+            state_dir_from_environment().as_deref(),
+            &host,
+            request.login_site.as_deref(),
+            &transport,
+        ) {
+            Ok(cookie) => request.cookie = Some(cookie),
+            Err(reason) => {
+                println!("{FAIL_MARKER} {reason}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match capture(&request, &browser) {
         Ok(outcome) => {
             println!("{OK_MARKER} {}", outcome.png.display());
